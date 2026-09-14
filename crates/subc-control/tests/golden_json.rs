@@ -807,6 +807,11 @@ fn supervisor_entry() -> SupervisorEntry {
         // The pre-window shape: a daemon that never had a window omits the key,
         // and this golden is what pins that omission.
         restart_window_secs: None,
+        // This golden represents an older daemon and must keep all additive
+        // policy fields absent.
+        drain_timeout_ms: None,
+        restart_backoff_ms: None,
+        restart_max_backoff_ms: None,
     }
 }
 
@@ -818,6 +823,12 @@ fn supervisor_entry() -> SupervisorEntry {
 fn supervisor_entry_with_restart_window() -> SupervisorEntry {
     SupervisorEntry {
         restart_window_secs: Some(600),
+        // Deliberately unlike the built-in 30_000/100/30_000 policy so this
+        // golden cannot be satisfied by reporting defaults instead of the
+        // parsed policy the supervisor is running.
+        drain_timeout_ms: Some(4_321),
+        restart_backoff_ms: Some(257),
+        restart_max_backoff_ms: Some(9_876),
         ..supervisor_entry()
     }
 }
@@ -843,6 +854,38 @@ fn supervisor_entry_lifetime_restarts_round_trips_and_old_wire_stays_unknown() {
     }"#;
     let old_entry: SupervisorEntry = serde_json::from_str(old_wire).expect("old wire decodes");
     assert_eq!(old_entry.lifetime_restarts, None);
+}
+
+/// Effective timing policy is additive: new peers preserve each value, while
+/// an older payload keeps all three values honestly unknown and omits their keys.
+#[test]
+fn supervisor_entry_policy_fields_round_trip_and_old_wire_stays_unknown() {
+    let entry = supervisor_entry_with_restart_window();
+
+    let encoded = serde_json::to_value(&entry).expect("supervisor entry serializes");
+    assert_eq!(encoded["drain_timeout_ms"], 4_321);
+    assert_eq!(encoded["restart_backoff_ms"], 257);
+    assert_eq!(encoded["restart_max_backoff_ms"], 9_876);
+    let decoded: SupervisorEntry = serde_json::from_value(encoded).expect("new wire decodes");
+    assert_eq!(decoded.drain_timeout_ms, Some(4_321));
+    assert_eq!(decoded.restart_backoff_ms, Some(257));
+    assert_eq!(decoded.restart_max_backoff_ms, Some(9_876));
+
+    let old_wire = serde_json::to_value(supervisor_entry()).expect("old wire serializes");
+    for field in [
+        "drain_timeout_ms",
+        "restart_backoff_ms",
+        "restart_max_backoff_ms",
+    ] {
+        assert!(
+            old_wire.get(field).is_none(),
+            "older-daemon shape must omit {field}: {old_wire}"
+        );
+    }
+    let decoded: SupervisorEntry = serde_json::from_value(old_wire).expect("old wire decodes");
+    assert_eq!(decoded.drain_timeout_ms, None);
+    assert_eq!(decoded.restart_backoff_ms, None);
+    assert_eq!(decoded.restart_max_backoff_ms, None);
 }
 
 /// A daemon that predates the windowed budget must stay decodable, and its

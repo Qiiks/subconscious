@@ -24,7 +24,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse};
-use subc_core::{fleet_lint, read_frame, write_frame, Frame};
+use subc_core::{fleet_lint, read_frame, write_frame, Frame, DEFAULT_DRAIN_TIMEOUT};
 use subc_protocol::{BindIdentity, Flags, FrameType, Priority, RouteTarget};
 use subc_transport::{
     authenticate_client, connection_file, ConnectionInfo, DiscoveryError, TriedCandidate,
@@ -34,7 +34,11 @@ use tokio::{net::TcpStream, time};
 const AUTH_DEADLINE: Duration = Duration::from_secs(2);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const DASHBOARD_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Time for the daemon to finish post-drain process teardown, publish the
+/// response, and absorb scheduler jitter after the configured drain budget.
+const DRAIN_RESPONSE_MARGIN: Duration = Duration::from_secs(2);
+const OUTCOME_UNKNOWN_EXIT_CODE: i32 = 4;
 use subc_transport::CONNECTION_FILE_NAME;
 const TRIAGE_LOG_MAX_BYTES: u64 = 64 * 1024;
 const TRIAGE_LOG_TAIL_LINES: usize = 20;
@@ -336,7 +340,7 @@ fn write_domain_probe_cache(path: &Path, cache: &DomainProbeCache) -> Result<(),
 }
 
 const MODULE_HELP: &str = "ck module — inspect and control supervised modules\n\nusage: ck [--json] [--verbose] module <verb> [<args>]\n\nverbs:\n  ck module list            all modules with state and health\n  ck module status <id>     one module in detail
-  ck module stderr <id>     retained stderr for a module (-n <count> to limit)\n  ck module terminals <id>  retained terminal exits for a module\n  ck module restart <id>    drain-restart a module\n    --now                   restart without waiting for in-flight requests\n    --drain-ms <n>          wait up to <n> ms for in-flight requests (this restart only)\n  ck module stop <id>       disable and stop a module (persists until start)\n  ck module start <id>      enable and spawn a module\n  ck module rescan          re-read subc.jsonc and reconcile the module set\n  ck module rescan --dry-run  show what a rescan would change, without changing it\n  ck module release <id>    forget a removed module's reserved id so another module may use it";
+  ck module stderr <id>     retained stderr for a module (-n <count> to limit)\n  ck module terminals <id>  retained terminal exits for a module\n  ck module restart <id>    drain-restart a module\n    --now                   restart without waiting for in-flight requests\n    --drain-ms <n>          wait up to <n> ms for in-flight requests (this restart only)\n  ck module stop <id>       disable and stop a module (persists until start)\n  ck module start <id>      enable and spawn a module\n  ck module rescan          re-read subc.jsonc and reconcile the module set\n  ck module rescan --dry-run  show what a rescan would change, without changing it\n  ck module release <id>    forget a removed module's reserved id so another module may use it\n\nexit codes:\n  1  operation refused or failed (including read-only timeout)\n  4  mutating operation timed out; outcome unknown, verify before retrying";
 
 const ROUTES_HELP: &str = "ck routes — inspect live route consumers\n\nusage: ck [--json] routes [<module-id>]\n\n  ck routes          live consumers for every connected module\n  ck routes <id>     live consumers for one connected module";
 
@@ -1101,7 +1105,18 @@ impl CkClient {
     }
 
     async fn rpc_value(&mut self, request: ClientControlRequest) -> Result<Value, CkError> {
-        let frame = self.rpc_frame(request).await?;
+        self.rpc_value_with_timeout(request, CONTROL_RESPONSE_TIMEOUT)
+            .await
+    }
+
+    async fn rpc_value_with_timeout(
+        &mut self,
+        request: ClientControlRequest,
+        response_timeout: Duration,
+    ) -> Result<Value, CkError> {
+        let frame = self
+            .rpc_frame_with_timeout(request, response_timeout)
+            .await?;
         match frame.header.ty {
             FrameType::Response => Ok(serde_json::from_slice(&frame.body)?),
             FrameType::Error => Err(CkError::Rejected(decode_error_body(&frame.body))),
@@ -1111,7 +1126,28 @@ impl CkClient {
         }
     }
 
-    async fn rpc_frame(&mut self, request: ClientControlRequest) -> Result<Frame, CkError> {
+    async fn mutating_rpc_value(
+        &mut self,
+        request: ClientControlRequest,
+        response_timeout: Duration,
+        operation: String,
+        verify_command: String,
+    ) -> Result<Value, CkError> {
+        match self.rpc_value_with_timeout(request, response_timeout).await {
+            Err(CkError::ResponseTimeout { timeout }) => Err(CkError::OutcomeUnknown {
+                operation,
+                verify_command,
+                timeout,
+            }),
+            result => result,
+        }
+    }
+
+    async fn rpc_frame_with_timeout(
+        &mut self,
+        request: ClientControlRequest,
+        response_timeout: Duration,
+    ) -> Result<Frame, CkError> {
         let corr = self.next_corr;
         self.next_corr = self.next_corr.saturating_add(1);
         let body = serde_json::to_vec(&request)?;
@@ -1128,25 +1164,34 @@ impl CkClient {
             .await
             .map_err(|source| CkError::Message(source.to_string()))?;
 
-        loop {
-            let reply = self.next_frame().await?;
-            if reply.header.channel == 0
-                && reply.header.corr == corr
-                && matches!(reply.header.ty, FrameType::Response | FrameType::Error)
-            {
-                return Ok(reply);
+        time::timeout(response_timeout, async {
+            loop {
+                let reply = read_frame(&mut self.stream)
+                    .await
+                    .map_err(|source| CkError::Message(format!("read frame: {source}")))?
+                    .ok_or_else(|| CkError::Message("subc closed the connection".into()))?;
+                if reply.header.channel == 0
+                    && reply.header.corr == corr
+                    && matches!(reply.header.ty, FrameType::Response | FrameType::Error)
+                {
+                    return Ok(reply);
+                }
             }
-        }
+        })
+        .await
+        .map_err(|_| CkError::ResponseTimeout {
+            timeout: response_timeout,
+        })?
     }
 
     async fn next_frame(&mut self) -> Result<Frame, CkError> {
-        match time::timeout(RESPONSE_TIMEOUT, read_frame(&mut self.stream)).await {
+        match time::timeout(CONTROL_RESPONSE_TIMEOUT, read_frame(&mut self.stream)).await {
             Ok(Ok(Some(frame))) => Ok(frame),
             Ok(Ok(None)) => Err(CkError::Message("subc closed the connection".into())),
             Ok(Err(source)) => Err(CkError::Message(format!("read frame: {source}"))),
-            Err(_) => Err(CkError::Message(format!(
-                "timed out after {RESPONSE_TIMEOUT:?} waiting for a frame"
-            ))),
+            Err(_) => Err(CkError::ResponseTimeout {
+                timeout: CONTROL_RESPONSE_TIMEOUT,
+            }),
         }
     }
 
@@ -1248,6 +1293,43 @@ impl CkClient {
         };
         let _ = write_frame(&mut self.stream, &frame).await;
     }
+}
+
+/// Resolve a module's control wait from the policy attested by the daemon.
+/// Older daemons omit `drain_timeout_ms`, so their configured override cannot
+/// be discovered. The daemon's built-in 30-second `DEFAULT_DRAIN_TIMEOUT` is
+/// the only policy this client can name for that wire shape; use it plus margin
+/// rather than the old flat 10-second RPC wait.
+async fn module_drain_response_timeout(
+    client: &mut CkClient,
+    module_id: &str,
+) -> Result<Duration, CkError> {
+    let modules = supervisor_list(client).await?;
+    let drain_timeout = find_module(&modules, module_id)
+        .and_then(|module| module.get("drain_timeout_ms"))
+        .and_then(Value::as_u64)
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_DRAIN_TIMEOUT);
+    Ok(drain_timeout.saturating_add(DRAIN_RESPONSE_MARGIN))
+}
+
+/// A rescan can retire or disable several modules sequentially before replying.
+/// Sum every running module's attested drain budget; an older daemon contributes
+/// the same built-in fallback as a targeted stop. Keep at least the ordinary RPC
+/// window for a rescan that has nothing to drain.
+async fn fleet_drain_response_timeout(client: &mut CkClient) -> Result<Duration, CkError> {
+    let modules = supervisor_list(client).await?;
+    let drain_budget = modules_array(&modules)
+        .iter()
+        .map(|module| {
+            module
+                .get("drain_timeout_ms")
+                .and_then(Value::as_u64)
+                .map(Duration::from_millis)
+                .unwrap_or(DEFAULT_DRAIN_TIMEOUT)
+        })
+        .fold(Duration::ZERO, Duration::saturating_add);
+    Ok(CONTROL_RESPONSE_TIMEOUT.max(drain_budget.saturating_add(DRAIN_RESPONSE_MARGIN)))
 }
 
 async fn module_list(
@@ -1569,10 +1651,15 @@ async fn module_restart(
     json_output: bool,
 ) -> Result<(), CkError> {
     let ack = client
-        .rpc_value(ClientControlRequest::SupervisorRestart {
-            module_id: module_id.to_string(),
-            drain_timeout_ms,
-        })
+        .mutating_rpc_value(
+            ClientControlRequest::SupervisorRestart {
+                module_id: module_id.to_string(),
+                drain_timeout_ms,
+            },
+            CONTROL_RESPONSE_TIMEOUT,
+            format!("ck module restart {module_id}"),
+            format!("ck module status {module_id}"),
+        )
         .await?;
     print_ack_with_state(client, module_id, ack, "restart", json_output).await?;
     if !json_output {
@@ -1590,9 +1677,20 @@ async fn module_rescan(
     json_output: bool,
     preview: bool,
 ) -> Result<(), CkError> {
-    let result = client
-        .rpc_value(ClientControlRequest::SupervisorRescan { preview })
-        .await?;
+    let request = ClientControlRequest::SupervisorRescan { preview };
+    let result = if preview {
+        client.rpc_value(request).await?
+    } else {
+        let response_timeout = fleet_drain_response_timeout(client).await?;
+        client
+            .mutating_rpc_value(
+                request,
+                response_timeout,
+                "ck module rescan".to_string(),
+                "ck module list".to_string(),
+            )
+            .await?
+    };
 
     // A daemon predating the preview field IGNORES it -- serde drops unknown
     // fields -- and runs a REAL rescan, retiring modules the operator was told
@@ -1632,9 +1730,14 @@ async fn module_release_reserved(
     json_output: bool,
 ) -> Result<(), CkError> {
     let ack = client
-        .rpc_value(ClientControlRequest::SupervisorReleaseReserved {
-            module_id: module_id.to_string(),
-        })
+        .mutating_rpc_value(
+            ClientControlRequest::SupervisorReleaseReserved {
+                module_id: module_id.to_string(),
+            },
+            CONTROL_RESPONSE_TIMEOUT,
+            format!("ck module release {module_id}"),
+            format!("ck module release {module_id}"),
+        )
         .await?;
     print_ack_with_state(client, module_id, ack, "release", json_output).await
 }
@@ -1645,13 +1748,19 @@ async fn module_set_enabled(
     enabled: bool,
     json_output: bool,
 ) -> Result<(), CkError> {
-    let ack = client
-        .rpc_value(ClientControlRequest::SupervisorSetEnabled {
-            module_id: module_id.to_string(),
-            enabled,
-        })
-        .await?;
     let verb = if enabled { "start" } else { "stop" };
+    let response_timeout = module_drain_response_timeout(client, module_id).await?;
+    let ack = client
+        .mutating_rpc_value(
+            ClientControlRequest::SupervisorSetEnabled {
+                module_id: module_id.to_string(),
+                enabled,
+            },
+            response_timeout,
+            format!("ck module {verb} {module_id}"),
+            format!("ck module status {module_id}"),
+        )
+        .await?;
     print_ack_with_state(client, module_id, ack, verb, json_output).await
 }
 
@@ -4331,8 +4440,9 @@ fn print_status_table(
         .map(format_age_from_epoch_ms_now)
         .unwrap_or_else(|| "unknown".to_string());
     println!(
-        "  pid {pid} · started {started} · restarts {}",
-        format_restart_budget(module)
+        "  pid {pid} · started {started} · restarts {} · {}",
+        format_restart_budget(module),
+        format_effective_policy(module)
     );
     println!("  last exit: {}", format_last_exit(module));
 
@@ -4512,6 +4622,22 @@ fn format_restart_budget(module: &Value) -> String {
         (Some(used), Some(allowed), _) => format!("{used} of {allowed}{window}"),
         _ => "unknown".to_string(),
     }
+}
+
+fn format_effective_policy(module: &Value) -> String {
+    let duration = |field| {
+        module
+            .get(field)
+            .and_then(Value::as_u64)
+            .map(format_milliseconds)
+            .unwrap_or_else(|| "unknown".to_string())
+    };
+    format!(
+        "drain {} · restart backoff {} to {}",
+        duration("drain_timeout_ms"),
+        duration("restart_backoff_ms"),
+        duration("restart_max_backoff_ms")
+    )
 }
 
 fn format_last_exit(module: &Value) -> String {
@@ -5843,6 +5969,14 @@ enum CkError {
         footer: String,
     },
     Message(String),
+    ResponseTimeout {
+        timeout: Duration,
+    },
+    OutcomeUnknown {
+        operation: String,
+        verify_command: String,
+        timeout: Duration,
+    },
     FleetLintConfig(String),
     UpdateCheck(setup::UpdateCheckError),
     /// The report was written to stdout; exit silently with lint's classification.
@@ -5873,7 +6007,12 @@ impl CkError {
         match self {
             Self::Usage(_) | Self::Discovery { .. } => 2,
             Self::Connection { .. } => 3,
-            Self::Rejected(_) | Self::Message(_) | Self::Json(_) | Self::UpdateCheck(_) => 1,
+            Self::Rejected(_)
+            | Self::Message(_)
+            | Self::ResponseTimeout { .. }
+            | Self::Json(_)
+            | Self::UpdateCheck(_) => 1,
+            Self::OutcomeUnknown { .. } => OUTCOME_UNKNOWN_EXIT_CODE,
             Self::ModuleNotCommand { .. } => 1,
             Self::FleetLintConfig(_) => 2,
             Self::FleetLintExit { exit_code }
@@ -5909,6 +6048,17 @@ impl fmt::Display for CkError {
                 "'{command}' is a module, not a command. Try: ck module status {module_id}"
             ),
             Self::Message(message) => write!(f, "{message}"),
+            Self::ResponseTimeout { timeout } => {
+                write!(f, "timed out after {timeout:?} waiting for a frame")
+            }
+            Self::OutcomeUnknown {
+                operation,
+                verify_command,
+                timeout,
+            } => write!(
+                f,
+                "outcome unknown: `{operation}` timed out after {timeout:?} waiting for the daemon reply; it may have completed\nverify with: {verify_command}"
+            ),
             Self::FleetLintConfig(message) => write!(f, "ck daemon lint: {message}"),
             Self::UpdateCheck(error) => error.fmt(f),
             Self::FleetLintExit { .. } | Self::TriageExit { .. } | Self::RenderedExit { .. } => {

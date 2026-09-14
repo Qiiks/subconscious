@@ -1570,6 +1570,19 @@ pub struct SupervisorEntry {
     /// was a lifetime total.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart_window_secs: Option<u64>,
+    /// Effective drain budget for this module, in milliseconds. This is the
+    /// resolved policy the running supervisor uses, not a config-file reread.
+    /// Absent on older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_timeout_ms: Option<u64>,
+    /// Effective base delay before a crash restart, in milliseconds. Absent on
+    /// older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_backoff_ms: Option<u64>,
+    /// Effective maximum delay before a crash restart, in milliseconds. Absent
+    /// on older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_max_backoff_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

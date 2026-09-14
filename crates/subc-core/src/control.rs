@@ -2061,6 +2061,9 @@ impl ControlHandler {
                     max_restarts: Some(status.max_restarts),
                     lifetime_restarts: Some(status.lifetime_restarts),
                     restart_window_secs: Some(status.restart_window.as_secs()),
+                    drain_timeout_ms: Some(status.drain_timeout.as_millis() as u64),
+                    restart_backoff_ms: Some(status.restart_backoff.as_millis() as u64),
+                    restart_max_backoff_ms: Some(status.restart_max_backoff.as_millis() as u64),
                 })
             })
             .collect::<Result<Vec<_>, RouterError>>()?;

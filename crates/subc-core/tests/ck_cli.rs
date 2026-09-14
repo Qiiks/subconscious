@@ -19,7 +19,7 @@ use subc_core::{
     read_frame, test_support::TestTempDir as TempDir, write_frame, Frame, HealthConfig, ModuleSpec,
     RestartPolicy, SupervisedModule, Supervisor, SupervisorHandle, SupervisorProcessLiveness,
 };
-use subc_protocol::{Flags, FrameType, Priority, PROTOCOL_VERSION};
+use subc_protocol::{BindIdentity, Flags, FrameType, Priority, RouteTarget, PROTOCOL_VERSION};
 use subc_transport::{
     generate_daemon_id, generate_key, write_atomic, ConnectionInfo, Endpoint, SCHEMA_VERSION,
 };
@@ -30,7 +30,9 @@ use tokio::{
 
 mod common;
 use common::{
-    connect_authed_client, start_test_daemon_with_process_liveness_and_supervisor, TestDaemon,
+    connect_authed_client,
+    scripted_daemon::{ScriptedControlAction, ScriptedControlStep, ScriptedDaemon},
+    start_test_daemon_with_process_liveness_and_supervisor, TestDaemon,
 };
 
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1884,7 +1886,7 @@ async fn module_status_renders_key_value_block_byte_for_byte() {
     assert_eq!(
         rest,
         format!(
-            "0 of 1 in 10m\n  last exit: none\n  binary: {binary} ({image})\nmetrics: run `ck health aft`\n"
+            "0 of 1 in 10m · drain 25 ms · restart backoff 10 ms to 30s\n  last exit: none\n  binary: {binary} ({image})\nmetrics: run `ck health aft`\n"
         )
     );
 
@@ -1995,6 +1997,135 @@ async fn module_restart_stop_start_json_drive_supervisor() {
     .await;
 
     module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_stop_waits_past_ten_seconds_within_running_drain_budget() {
+    let server = TestServer::start().await;
+    let module_id = "ck-long-real-drain";
+    let drain_timeout = Duration::from_millis(14_000);
+    let supervisor = Supervisor::new(
+        Arc::clone(&server.registry),
+        RestartPolicy::new(3, Duration::from_millis(137))
+            .with_max_backoff(Duration::from_millis(7_321)),
+    )
+    .with_process_liveness(Arc::clone(&server.process_liveness))
+    .with_forwarding(Arc::clone(&server.forwarding))
+    .with_handle(server.supervisor_handle.clone())
+    .with_drain_timeout(drain_timeout)
+    .with_connection_file_path(server.connection_file_path.clone());
+    let events_path = server.temp_dir.join("ck-long-real-drain-events.jsonl");
+    let module = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        module_id,
+        vec![
+            ("FAKE_AFT_DELAY_FROM_BODY", "1"),
+            ("FAKE_AFT_EVENTS_PATH", events_path.to_str().unwrap()),
+        ],
+    )
+    .await;
+    let entry = wait_for_supervisor_entry(&server.connection_file_path, module_id, |_| true).await;
+    assert_eq!(entry.drain_timeout_ms, Some(14_000));
+
+    let mut route_client = wait_for_client(&server.connection_file_path).await;
+    let route = open_tool_route(&mut route_client, module_id, 45_000).await;
+    let request_corr = 45_001;
+    let request = serde_json::to_vec(&json!({
+        "uncancellable": true,
+        "delay_ms": 12_500
+    }))
+    .unwrap();
+    write_frame(
+        &mut route_client,
+        &data_request(route, request_corr, &request),
+    )
+    .await
+    .unwrap();
+    route_client.flush().await.unwrap();
+    wait_for_stub_request(&events_path, route.channel, request_corr).await;
+
+    let started = Instant::now();
+    let stop = assert_json_success(ck_with_subc(
+        &server.connection_file_path,
+        ["module", "stop", module_id, "--json"],
+    ));
+    assert!(
+        started.elapsed() > Duration::from_secs(10),
+        "the real drain must cross the former flat 10s deadline"
+    );
+    assert_eq!(stop["module_id"], module_id);
+    assert_eq!(stop["applied"], true);
+    let status = module.status().unwrap();
+    assert!(!status.enabled && !status.live);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mutating_timeout_exits_outcome_unknown_and_names_status_verification() {
+    let module_id = "scripted-stop-timeout";
+    let daemon = ScriptedDaemon::start(
+        "ck-mutating-timeout",
+        vec![
+            ScriptedControlStep {
+                expected: ClientControlRequest::SupervisorList {},
+                action: ScriptedControlAction::Reply(Box::new(
+                    ClientControlResponse::SupervisorList {
+                        generation: 1,
+                        modules: vec![scripted_supervisor_entry(module_id, Some(0))],
+                    },
+                )),
+            },
+            ScriptedControlStep {
+                expected: ClientControlRequest::SupervisorSetEnabled {
+                    module_id: module_id.to_string(),
+                    enabled: false,
+                },
+                action: ScriptedControlAction::NeverReply,
+            },
+        ],
+    )
+    .await;
+
+    let output = ck_with_subc(&daemon.connection_file_path, ["module", "stop", module_id]);
+    assert_exit(&output, 4);
+    assert!(output.stdout.is_empty());
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.contains(&format!("outcome unknown: `ck module stop {module_id}`")),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("verify with: ck module status {module_id}")),
+        "stderr:\n{stderr}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_only_timeout_remains_failure_not_outcome_unknown() {
+    let daemon = ScriptedDaemon::start(
+        "ck-read-only-timeout",
+        vec![ScriptedControlStep {
+            expected: ClientControlRequest::SupervisorList {},
+            action: ScriptedControlAction::NeverReply,
+        }],
+    )
+    .await;
+
+    let output = ck_with_subc(&daemon.connection_file_path, ["module", "list"]);
+    assert_exit(&output, 1);
+    assert!(output.stdout.is_empty());
+    let stderr = text(&output.stderr);
+    assert_eq!(stderr, "timed out after 10s waiting for a frame\n");
+    assert!(!stderr.contains("outcome unknown"));
+}
+
+#[test]
+fn module_help_documents_failed_and_outcome_unknown_exit_codes() {
+    let output = ck_command().args(["module"]).output().unwrap();
+    assert_exit(&output, 0);
+    let stdout = text(&output.stdout);
+    assert!(stdout.contains("1  operation refused or failed"));
+    assert!(stdout.contains("4  mutating operation timed out; outcome unknown"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2735,6 +2866,108 @@ fn stub_spec_with_env(module_id: &str, env: Vec<(&str, &str)>) -> ModuleSpec {
             .collect(),
         reserved: false,
         reserved_prefixes: Vec::new(),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CliTestRoute {
+    channel: u16,
+    epoch: u32,
+}
+
+async fn open_tool_route<S>(stream: &mut S, module_id: &str, corr: u64) -> CliTestRoute
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let response = control_rpc_on_stream(
+        stream,
+        corr,
+        ClientControlRequest::RouteOpen {
+            target: RouteTarget::ToolProvider {
+                module_id: module_id.to_string(),
+            },
+            identity: BindIdentity {
+                project_root: std::env::current_dir().unwrap(),
+                harness: "ck-deadline-test".to_string(),
+                session: format!("session-{corr}"),
+            },
+            consumer_identity: None,
+            consumer_capabilities: None,
+            admission_facts: None,
+        },
+    )
+    .await;
+    match response {
+        ClientControlResponse::RouteOpen {
+            route_channel,
+            route_epoch,
+        } => CliTestRoute {
+            channel: route_channel,
+            epoch: route_epoch,
+        },
+        other => panic!("unexpected route.open response: {other:?}"),
+    }
+}
+
+fn data_request(route: CliTestRoute, corr: u64, body: &[u8]) -> Frame {
+    Frame::build(
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        route.channel,
+        route.epoch,
+        corr,
+        body.to_vec(),
+    )
+    .unwrap()
+}
+
+async fn wait_for_stub_request(path: &Path, channel: u16, corr: u64) {
+    let deadline = Instant::now() + SETUP_TIMEOUT;
+    loop {
+        let received = fs::read_to_string(path)
+            .ok()
+            .into_iter()
+            .flat_map(|contents| {
+                contents
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .collect::<Vec<_>>()
+            })
+            .any(|event| {
+                event["kind"] == "request_received"
+                    && event["channel"].as_u64() == Some(u64::from(channel))
+                    && event["corr"].as_u64() == Some(corr)
+            });
+        if received {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "stub did not receive channel {channel} corr {corr} within {SETUP_TIMEOUT:?}"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn scripted_supervisor_entry(module_id: &str, drain_timeout_ms: Option<u64>) -> SupervisorEntry {
+    SupervisorEntry {
+        module_id: module_id.to_string(),
+        state: "running".to_string(),
+        enabled: true,
+        live: true,
+        health: SupervisorHealthStatus::Ok,
+        last_probe_ms: None,
+        last_exit_code: None,
+        last_exit_signal: None,
+        last_exit_ms: None,
+        last_exit_kind: None,
+        restart_count: Some(0),
+        max_restarts: Some(3),
+        lifetime_restarts: Some(0),
+        restart_window_secs: Some(600),
+        drain_timeout_ms,
+        restart_backoff_ms: Some(100),
+        restart_max_backoff_ms: Some(30_000),
     }
 }
 
