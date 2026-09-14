@@ -8,6 +8,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use cortexkit_log::Retention;
 use serde_json::Value;
 use subc_control::{
     ClientControlPush, RouteCloseReason, SupervisorHealthStatus, TerminalDisposition,
@@ -26,13 +27,17 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 
 use crate::{
+    daemon_config::{CAPTURE_KEEP_ENV, CAPTURE_MAX_AGE_DAYS_ENV, CAPTURE_MAX_FILE_MB_ENV},
     forwarding::{
         CloseReason, ForwardingError, ForwardingTable, GoodbyeTarget, ModuleControlRpcOutcome,
         ModuleDrainTarget, PendingModuleControlRpc,
     },
     provenance::{spawned_file_identity, ExecutableIdentityProbe, SpawnedFileIdentity},
     registry::RegistryError,
-    stderr_tail::{pump_stderr, StderrRing, StderrTailConfig, StderrTailSnapshot},
+    stderr_tail::{
+        pump_stderr_to, pump_stdout_to, ChildOutputSink, StderrRing, StderrTailConfig,
+        StderrTailSnapshot,
+    },
     terminal_ring::{TerminalHistorySnapshot, TerminalRecord, TerminalRing, TerminalRingConfig},
     Frame, Registry,
 };
@@ -68,6 +73,7 @@ const STDERR_PUMP_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 
 struct SupervisedChild {
     child: Child,
+    stdout_pump: Option<JoinHandle<()>>,
     stderr_pump: Option<JoinHandle<()>>,
     stderr_ring: Arc<Mutex<StderrRing>>,
     spawned_at_ms: u64,
@@ -95,6 +101,23 @@ impl SupervisedChild {
     }
 
     async fn drain_stderr(&mut self, module_id: &str) {
+        if let Some(mut pump) = self.stdout_pump.take() {
+            match timeout(STDERR_PUMP_DRAIN_TIMEOUT, &mut pump).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    warn!(module_id, error = %error, "stdout pump ended unexpectedly");
+                }
+                Err(_) => {
+                    pump.abort();
+                    warn!(
+                        module_id,
+                        waited = ?STDERR_PUMP_DRAIN_TIMEOUT,
+                        "stdout pump did not drain before restart; stopped it before the next process"
+                    );
+                }
+            }
+        }
+
         let Some(mut pump) = self.stderr_pump.take() else {
             return;
         };
@@ -659,6 +682,7 @@ struct SupervisorRuntimeConfig {
     default_drain_timeout: Duration,
     health: HealthConfig,
     connection_file_path: Option<PathBuf>,
+    capture_logs_dir: Option<PathBuf>,
     forwarding: Option<Arc<ForwardingTable>>,
     /// The shared handle, so every spawn path (initial, restart, reload) records the
     /// reserved-module launch nonce the HELLO verifier checks against.
@@ -1039,6 +1063,7 @@ pub struct Supervisor {
     restart_policy: RestartPolicy,
     drain_timeout: Duration,
     connection_file_path: Option<PathBuf>,
+    capture_logs_dir: Option<PathBuf>,
     forwarding: Option<Arc<ForwardingTable>>,
     process_liveness: Arc<SupervisorProcessLiveness>,
     supervisor_handle: Option<SupervisorHandle>,
@@ -1054,6 +1079,7 @@ impl Supervisor {
             restart_policy,
             drain_timeout: DEFAULT_DRAIN_TIMEOUT,
             connection_file_path: None,
+            capture_logs_dir: None,
             forwarding: None,
             process_liveness: Arc::new(SupervisorProcessLiveness::default()),
             supervisor_handle: None,
@@ -1078,6 +1104,12 @@ impl Supervisor {
 
     pub fn with_connection_file_path(mut self, connection_file_path: impl Into<PathBuf>) -> Self {
         self.connection_file_path = Some(connection_file_path.into());
+        self
+    }
+
+    /// Enables daemon-owned capture files for supervised stdout and stderr.
+    pub fn with_capture_logs_dir(mut self, logs_dir: impl Into<PathBuf>) -> Self {
+        self.capture_logs_dir = Some(logs_dir.into());
         self
     }
 
@@ -1111,6 +1143,7 @@ impl Supervisor {
             runtime.connection_file_path.as_deref(),
             self.supervisor_handle.as_ref(),
             &runtime.stderr_ring,
+            runtime.capture_logs_dir.as_deref(),
         )?;
         set_running(&snapshot, &child)?;
         self.process_liveness
@@ -1143,6 +1176,7 @@ impl Supervisor {
             runtime.connection_file_path.as_deref(),
             self.supervisor_handle.as_ref(),
             &runtime.stderr_ring,
+            runtime.capture_logs_dir.as_deref(),
         ) {
             Ok(child) => {
                 set_running(&snapshot, &child)?;
@@ -1199,6 +1233,7 @@ impl Supervisor {
             runtime.connection_file_path.as_deref(),
             self.supervisor_handle.as_ref(),
             &runtime.stderr_ring,
+            runtime.capture_logs_dir.as_deref(),
         ) {
             Ok(child) => {
                 set_running(&snapshot, &child)?;
@@ -1236,6 +1271,7 @@ impl Supervisor {
             default_drain_timeout: self.drain_timeout,
             health: self.health,
             connection_file_path: self.connection_file_path.clone(),
+            capture_logs_dir: self.capture_logs_dir.clone(),
             forwarding: self.forwarding.clone(),
             supervisor_handle: self.supervisor_handle.clone(),
             stderr_ring: Arc::new(Mutex::new(StderrRing::new(StderrTailConfig::default()))),
@@ -3672,13 +3708,31 @@ fn spawn_child(
     connection_file_path: Option<&std::path::Path>,
     handle: Option<&SupervisorHandle>,
     ring: &Arc<Mutex<StderrRing>>,
+    capture_logs_dir: Option<&std::path::Path>,
 ) -> Result<SupervisedChild, SuperviseError> {
     let mut command = Command::new(&spec.program);
     command.args(&spec.args);
+    // Supervised modules run with a service-manager-minimal environment. In
+    // particular, an operator's ambient CK_LOG must not leak into an otherwise
+    // unconfigured module.
+    command.env_clear();
+    #[cfg(windows)]
+    if let Some(system_root) = std::env::var_os("SystemRoot") {
+        command.env("SystemRoot", system_root);
+    }
     if let Some(connection_file_path) = connection_file_path {
         command.arg(SUBC_ARG).arg(connection_file_path);
     }
     for (key, value) in &spec.env {
+        // cortexkit-log currently exposes retention only as a Rust struct, not
+        // environment names. These values are daemon-private sink metadata and
+        // must never become a public child-process contract by being inherited.
+        if matches!(
+            key.as_str(),
+            CAPTURE_MAX_FILE_MB_ENV | CAPTURE_KEEP_ENV | CAPTURE_MAX_AGE_DAYS_ENV
+        ) {
+            continue;
+        }
         command.env(key, value);
     }
     command.env(SUBC_MODULE_ID_ENV, &spec.module_id);
@@ -3695,41 +3749,25 @@ fn spawn_child(
     }
     command.env(SUBC_LAUNCH_NONCE_ENV, nonce);
 
-    // STDOUT STAYS INHERITED; STDERR IS PIPED. The asymmetry is the whole design,
-    // so it is worth saying why rather than leaving it to be inferred.
-    //
-    // Inheriting both was the original choice: every child wrote to the daemon's
-    // own descriptors, which put all module output in one log with no per-child
-    // reader task. That was correct about interleaving and silent about DURABILITY,
-    // and durability is the axis that decides whether a crash can be diagnosed.
-    // A module's stderr is the only diagnostic input with no in-memory path --
-    // `last_exit` survives a respawn because the supervisor holds it, while the
-    // text explaining that exit went to a sink that rotates or fills. Measured on
-    // two hosts: a systemd journal at its size cap retaining ~3.2 hours, and a
-    // plain log file reaching 908 MB with one module accounting for 98% of it. In
-    // both, the noisiest module sets everyone else's retention and the victim has
-    // no way to know its window shrank.
-    //
-    // So stderr is piped into a bounded in-memory ring the supervisor owns, and
-    // every line is forwarded on so the daemon log keeps its current content. That
-    // forwarding is MANDATORY rather than courteous: the log is overwhelmingly
-    // module output (4727 of 5000 sampled lines carried a module tag), so a tap
-    // that captured without forwarding would leave it nearly empty and every
-    // existing reader would report clean on nothing -- an absence that reads as
-    // calm, which is worse than the interleaving it replaces.
-    //
-    // THE TAP MAKES LINE ATOMICITY THIS DAEMON'S PROBLEM. Previously a module's
-    // own write reached the fd in one syscall and the splicing came from emitters
-    // that formatted incrementally: two processes on one inherited fd, 1500 lines
-    // each, produced 212 spliced lines of 3000 with an incremental emitter and 0
-    // of 3000 when each line was formatted first and written once. Reading a pipe
-    // and re-emitting can split a line that WAS atomic, so the reader reassembles
-    // to a complete line and writes it in a single call -- otherwise this change
-    // introduces a defect the previous design did not have.
-    //
-    // Stdout is left inherited: modules use it for ordinary output rather than
-    // diagnostics, and piping it would double the reader tasks for no diagnostic
-    // gain.
+    let output_sink = if let Some(logs_dir) = capture_logs_dir {
+        let path = logs_dir.join(format!("{}.stderr.log", spec.module_id));
+        match ChildOutputSink::open(&path, capture_retention(spec)) {
+            Ok(sink) => sink,
+            Err(error) => {
+                warn!(
+                    module_id = %spec.module_id,
+                    path = %path.display(),
+                    error = %error,
+                    "could not open child output capture file; forwarding to stderr"
+                );
+                ChildOutputSink::Stderr
+            }
+        }
+    } else {
+        ChildOutputSink::Stderr
+    };
+
+    command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     command.kill_on_drop(true);
     let mut child = command.spawn().map_err(|source| SuperviseError::Spawn {
@@ -3745,12 +3783,26 @@ fn spawn_child(
         .zip(process_start_time)
         .map(|(pid, start_time)| ProcessIdentity { pid, start_time });
 
+    let stdout_pump = match child.stdout.take() {
+        Some(stdout) => Some(tokio::spawn(pump_stdout_to(stdout, output_sink.clone()))),
+        None => {
+            warn!(
+                module_id = %spec.module_id,
+                "spawned child exposed no stdout pipe; file capture will be incomplete"
+            );
+            None
+        }
+    };
     let stderr_pump = match child.stderr.take() {
         Some(stderr) => {
             ring.lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push_process_start();
-            Some(tokio::spawn(pump_stderr(stderr, Arc::clone(ring))))
+            Some(tokio::spawn(pump_stderr_to(
+                stderr,
+                Arc::clone(ring),
+                output_sink,
+            )))
         }
         None => {
             // Spawning succeeded but the pipe did not materialise. Recording it as
@@ -3769,6 +3821,7 @@ fn spawn_child(
 
     Ok(SupervisedChild {
         child,
+        stdout_pump,
         stderr_pump,
         stderr_ring: Arc::clone(ring),
         spawned_at_ms,
@@ -3777,6 +3830,27 @@ fn spawn_child(
         process_start_time,
         process_identity,
     })
+}
+
+fn capture_retention(spec: &ModuleSpec) -> Retention {
+    let defaults = Retention::default();
+    let value = |name: &str| {
+        spec.env
+            .iter()
+            .rev()
+            .find_map(|(key, value)| (key == name).then_some(value.as_str()))
+    };
+    Retention {
+        max_file_mb: value(CAPTURE_MAX_FILE_MB_ENV)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(defaults.max_file_mb),
+        keep: value(CAPTURE_KEEP_ENV)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(defaults.keep),
+        max_age_days: value(CAPTURE_MAX_AGE_DAYS_ENV)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(defaults.max_age_days),
+    }
 }
 
 /// A fresh 256-bit CSPRNG launch nonce, lowercase hex. Used to bind a reserved
@@ -3817,6 +3891,7 @@ fn spawn_and_mark_running(
         runtime.connection_file_path.as_deref(),
         runtime.supervisor_handle.as_ref(),
         &runtime.stderr_ring,
+        runtime.capture_logs_dir.as_deref(),
     )?;
     set_running(snapshot, &child)?;
     Ok(child)

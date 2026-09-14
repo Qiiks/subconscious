@@ -21,6 +21,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use cortexkit_log::{
+    parse_line as parse_log_line, Config as FleetLogConfig, Lane as FleetLane, ParsedLevel,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse};
@@ -340,6 +343,13 @@ fn write_domain_probe_cache(path: &Path, cache: &DomainProbeCache) -> Result<(),
 }
 
 const MODULE_HELP: &str = "ck module — inspect and control supervised modules\n\nusage: ck [--json] [--verbose] module <verb> [<args>]\n\nverbs:\n  ck module list            all modules with state and health\n  ck module status <id>     one module in detail
+  ck module logs [<id>]     merged module, plugin, stderr, and daemon logs
+    -n <lines>              show the newest lines (default 200)
+    -f                      follow all sources across rotation
+    --since <dur>           show events newer than a duration such as 10m or 2h
+    --tag <tag>             show one canonical tag
+    --level <level>         show this level and more severe levels
+    --lane <source>         select module, stderr, daemon, or a harness lane
   ck module stderr <id>     retained stderr for a module (-n <count> to limit)\n  ck module terminals <id>  retained terminal exits for a module\n  ck module restart <id>    drain-restart a module\n    --now                   restart without waiting for in-flight requests\n    --drain-ms <n>          wait up to <n> ms for in-flight requests (this restart only)\n  ck module stop <id>       disable and stop a module (persists until start)\n  ck module start <id>      enable and spawn a module\n  ck module rescan          re-read subc.jsonc and reconcile the module set\n  ck module rescan --dry-run  show what a rescan would change, without changing it\n  ck module release <id>    forget a removed module's reserved id so another module may use it\n\nexit codes:\n  1  operation refused or failed (including read-only timeout)\n  4  mutating operation timed out; outcome unknown, verify before retrying";
 
 const ROUTES_HELP: &str = "ck routes — inspect live route consumers\n\nusage: ck [--json] routes [<module-id>]\n\n  ck routes          live consumers for every connected module\n  ck routes <id>     live consumers for one connected module";
@@ -472,6 +482,9 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
         }
         Command::Module(ModuleCommand::Status { module_id }) => {
             module_status(&mut client, &module_id, args.json, args.verbose).await
+        }
+        Command::Module(ModuleCommand::Logs { module_id, options }) => {
+            module_logs(&mut client, module_id.as_deref(), &options, args.json).await
         }
         Command::Module(ModuleCommand::StderrTail {
             module_id,
@@ -1009,6 +1022,16 @@ enum Command {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ModuleLogsOptions {
+    lines: usize,
+    follow: bool,
+    since: Option<Duration>,
+    tag: Option<String>,
+    level: Option<ParsedLevel>,
+    lane: Option<String>,
+}
+
 enum ModuleCommand {
     List,
     Status {
@@ -1031,6 +1054,10 @@ enum ModuleCommand {
     },
     Start {
         module_id: String,
+    },
+    Logs {
+        module_id: Option<String>,
+        options: ModuleLogsOptions,
     },
     StderrTail {
         module_id: String,
@@ -1358,6 +1385,527 @@ async fn module_list(
     Ok(())
 }
 
+#[derive(Clone, Debug)]
+struct LogSource {
+    lane: String,
+    path: PathBuf,
+    daemon: bool,
+}
+
+#[derive(Clone, Debug)]
+struct LogEntry {
+    lane: String,
+    line: String,
+    timestamp: Option<SystemTime>,
+    level: Option<ParsedLevel>,
+    tag: Option<String>,
+    source_order: usize,
+}
+
+#[derive(Default)]
+struct LogFilterCounts {
+    total: usize,
+    below_level: usize,
+    wrong_tag: usize,
+    wrong_lane: usize,
+    before_since: usize,
+    daemon_hidden: usize,
+    unparsed: usize,
+}
+
+async fn module_logs(
+    client: &mut CkClient,
+    module_id: Option<&str>,
+    options: &ModuleLogsOptions,
+    json_output: bool,
+) -> Result<(), CkError> {
+    let roster = supervisor_list(client).await?;
+    let modules = modules_array(&roster);
+    let Some(module_id) = module_id else {
+        return module_log_census(modules, json_output);
+    };
+    if find_module(&roster, module_id).is_none() {
+        println!("no module named '{}'. Run ck module list.", module_id);
+        return Ok(());
+    }
+
+    let sources = discover_log_sources(module_id, true)?;
+    let (mut entries, counts) = collect_log_entries(module_id, &sources, options)?;
+    entries.sort_by(|left, right| {
+        left.timestamp
+            .cmp(&right.timestamp)
+            .then_with(|| left.lane.cmp(&right.lane))
+            .then_with(|| left.source_order.cmp(&right.source_order))
+    });
+    if entries.is_empty() && counts.total == 0 {
+        println!("no log yet for {module_id}");
+        return Ok(());
+    }
+
+    let start = entries.len().saturating_sub(options.lines);
+    let shown = &entries[start..];
+    print_log_entries(shown, json_output)?;
+    print_log_filter_summary(shown.len(), &counts);
+
+    if options.follow {
+        follow_module_logs(module_id, options, sources, json_output).await?;
+    }
+    Ok(())
+}
+
+fn module_log_census(modules: &[Value], json_output: bool) -> Result<(), CkError> {
+    let mut rows = Vec::new();
+    for module in modules {
+        let Some(module_id) = module.get("module_id").and_then(Value::as_str) else {
+            continue;
+        };
+        for source in discover_log_sources(module_id, true)?
+            .into_iter()
+            .filter(|source| !source.daemon)
+        {
+            let metadata = fs::metadata(&source.path)
+                .map_err(|error| CkError::Message(format!("{}: {error}", source.path.display())))?;
+            rows.push(json!({
+                "module_id": module_id,
+                "lane": source.lane,
+                "path": source.path.display().to_string(),
+                "size": metadata.len(),
+                "last_timestamp": last_log_timestamp(&source.path),
+            }));
+        }
+    }
+    if json_output {
+        print_json(&json!({ "files": rows }))?;
+    } else {
+        let table_rows = rows
+            .iter()
+            .map(|row| {
+                vec![
+                    display_field(row, "path"),
+                    format_bytes(row["size"].as_u64().unwrap_or(0)),
+                    row["last_timestamp"].as_str().unwrap_or("-").to_string(),
+                ]
+            })
+            .collect();
+        print_table(&["path", "size", "last timestamp"], table_rows);
+    }
+    Ok(())
+}
+
+fn last_log_timestamp(path: &Path) -> String {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| {
+            contents.lines().rev().find_map(|line| {
+                parse_log_line(line).ok().map(|parsed| {
+                    line.split_once(' ')
+                        .map(|(timestamp, _)| timestamp.to_string())
+                        .unwrap_or_else(|| format_system_time(parsed.timestamp))
+                })
+            })
+        })
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn discover_log_sources(module_id: &str, include_rotated: bool) -> Result<Vec<LogSource>, CkError> {
+    let module_logs = FleetLogConfig::for_module(module_id, FleetLane::Module).logs_dir;
+    let run_logs = subc_core::daemon_config::daemon_run_dir().join("logs");
+    let mut sources = Vec::new();
+    collect_sources_in_dir(
+        &module_logs,
+        module_id,
+        include_rotated,
+        false,
+        &mut sources,
+    )?;
+    collect_sources_in_dir(&run_logs, module_id, include_rotated, true, &mut sources)?;
+    sources.sort_by(|left, right| {
+        left.lane
+            .cmp(&right.lane)
+            .then_with(|| rotation_generation(&right.path).cmp(&rotation_generation(&left.path)))
+    });
+    Ok(sources)
+}
+
+fn collect_sources_in_dir(
+    directory: &Path,
+    module_id: &str,
+    include_rotated: bool,
+    daemon_directory: bool,
+    output: &mut Vec<LogSource>,
+) -> Result<(), CkError> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(CkError::Message(format!(
+                "{}: {error}",
+                directory.display()
+            )))
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| CkError::Message(error.to_string()))?;
+        let path = entry.path();
+        if !entry
+            .file_type()
+            .map_err(|error| CkError::Message(error.to_string()))?
+            .is_file()
+        {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+            continue;
+        };
+        let generation = rotation_generation(&path);
+        if !include_rotated && generation != 0 {
+            continue;
+        }
+        let base = if generation == 0 {
+            name
+        } else {
+            name.rsplit_once('.').map_or(name, |(base, _)| base)
+        };
+        let (lane, daemon) = if daemon_directory && base == "subc.log" {
+            ("daemon".to_string(), true)
+        } else if daemon_directory && base == format!("{module_id}.stderr.log") {
+            ("stderr".to_string(), false)
+        } else if !daemon_directory && base == format!("{module_id}.log") {
+            ("mod".to_string(), false)
+        } else if !daemon_directory {
+            let prefix = format!("{module_id}.");
+            let Some(harness) = base
+                .strip_prefix(&prefix)
+                .and_then(|value| value.strip_suffix(".log"))
+            else {
+                continue;
+            };
+            if harness.is_empty() {
+                continue;
+            }
+            (harness.to_string(), false)
+        } else {
+            continue;
+        };
+        output.push(LogSource { lane, path, daemon });
+    }
+    Ok(())
+}
+
+fn rotation_generation(path: &Path) -> u32 {
+    path.file_name()
+        .and_then(OsStr::to_str)
+        .and_then(|name| name.rsplit_once('.'))
+        .and_then(|(_, suffix)| suffix.parse().ok())
+        .unwrap_or(0)
+}
+
+fn collect_log_entries(
+    module_id: &str,
+    sources: &[LogSource],
+    options: &ModuleLogsOptions,
+) -> Result<(Vec<LogEntry>, LogFilterCounts), CkError> {
+    let mut counts = LogFilterCounts::default();
+    let mut output = Vec::new();
+    let mut source_order = 0;
+    for source in sources {
+        let contents = fs::read_to_string(&source.path)
+            .map_err(|error| CkError::Message(format!("{}: {error}", source.path.display())))?;
+        collect_log_text(
+            module_id,
+            source,
+            &contents,
+            options,
+            &mut counts,
+            &mut output,
+            &mut source_order,
+        );
+    }
+    Ok((output, counts))
+}
+
+fn collect_log_text(
+    module_id: &str,
+    source: &LogSource,
+    contents: &str,
+    options: &ModuleLogsOptions,
+    counts: &mut LogFilterCounts,
+    output: &mut Vec<LogEntry>,
+    source_order: &mut usize,
+) {
+    let since = options
+        .since
+        .and_then(|duration| SystemTime::now().checked_sub(duration));
+    for line in contents.lines() {
+        counts.total += 1;
+        let parsed = parse_log_line(line).ok();
+        if source.daemon
+            && parsed
+                .as_ref()
+                .is_some_and(|parsed| !body_has_module_id(parsed.body, module_id))
+        {
+            counts.daemon_hidden += 1;
+            continue;
+        }
+        if options
+            .lane
+            .as_ref()
+            .is_some_and(|lane| !lane_matches(lane, &source.lane))
+        {
+            counts.wrong_lane += 1;
+            continue;
+        }
+        if let Some(parsed) = &parsed {
+            if options
+                .level
+                .is_some_and(|minimum| log_level_rank(parsed.level) < log_level_rank(minimum))
+            {
+                counts.below_level += 1;
+                continue;
+            }
+            if options
+                .tag
+                .as_deref()
+                .is_some_and(|tag| parsed.tag != Some(tag))
+            {
+                counts.wrong_tag += 1;
+                continue;
+            }
+            if since.is_some_and(|since| parsed.timestamp < since) {
+                counts.before_since += 1;
+                continue;
+            }
+        } else {
+            counts.unparsed += 1;
+        }
+        output.push(LogEntry {
+            lane: source.lane.clone(),
+            line: line.to_string(),
+            timestamp: parsed.as_ref().map(|parsed| parsed.timestamp),
+            level: parsed.as_ref().map(|parsed| parsed.level),
+            tag: parsed.and_then(|parsed| parsed.tag.map(str::to_string)),
+            source_order: *source_order,
+        });
+        *source_order += 1;
+    }
+}
+
+fn body_has_module_id(body: &str, module_id: &str) -> bool {
+    let needle = format!("module_id={module_id}");
+    body.split_ascii_whitespace().any(|field| field == needle)
+}
+
+fn lane_matches(requested: &str, actual: &str) -> bool {
+    (requested == "module" && actual == "mod") || requested == actual
+}
+
+fn log_level_rank(level: ParsedLevel) -> u8 {
+    match level {
+        ParsedLevel::Trace => 0,
+        ParsedLevel::Debug => 1,
+        ParsedLevel::Info => 2,
+        ParsedLevel::Warn => 3,
+        ParsedLevel::Error => 4,
+    }
+}
+
+fn print_log_entries(entries: &[LogEntry], json_output: bool) -> Result<(), CkError> {
+    if json_output {
+        let lines = entries
+            .iter()
+            .map(|entry| {
+                json!({
+                    "source": entry.lane,
+                    "line": entry.line,
+                    "timestamp": entry.timestamp.map(format_system_time),
+                    "level": entry.level.map(log_level_name),
+                    "tag": entry.tag,
+                })
+            })
+            .collect::<Vec<_>>();
+        return print_json(&json!({ "lines": lines }));
+    }
+    let color = ansi_color_enabled();
+    for entry in entries {
+        let lane = fixed_lane(&entry.lane);
+        if color {
+            println!("\x1b[2m{lane}\x1b[0m {}", entry.line);
+        } else {
+            println!("{lane} {}", entry.line);
+        }
+    }
+    Ok(())
+}
+
+fn fixed_lane(lane: &str) -> String {
+    let lane = lane.chars().take(12).collect::<String>();
+    format!("{lane:<12}")
+}
+
+fn log_level_name(level: ParsedLevel) -> &'static str {
+    match level {
+        ParsedLevel::Trace => "TRACE",
+        ParsedLevel::Debug => "DEBUG",
+        ParsedLevel::Info => "INFO",
+        ParsedLevel::Warn => "WARN",
+        ParsedLevel::Error => "ERROR",
+    }
+}
+
+fn format_system_time(time: SystemTime) -> String {
+    time.duration_since(UNIX_EPOCH)
+        .map(|duration| format!("{}.{:03}Z", duration.as_secs(), duration.subsec_millis()))
+        .unwrap_or_else(|_| "-".to_string())
+}
+
+fn print_log_filter_summary(shown: usize, counts: &LogFilterCounts) {
+    let mut removed = Vec::new();
+    if counts.below_level != 0 {
+        removed.push(format!("{} below requested level", counts.below_level));
+    }
+    if counts.wrong_tag != 0 {
+        removed.push(format!("{} other tags", counts.wrong_tag));
+    }
+    if counts.wrong_lane != 0 {
+        removed.push(format!("{} other lanes", counts.wrong_lane));
+    }
+    if counts.before_since != 0 {
+        removed.push(format!("{} before --since", counts.before_since));
+    }
+    if counts.daemon_hidden != 0 {
+        removed.push(format!("{} daemon lines hidden", counts.daemon_hidden));
+    }
+    if counts.unparsed != 0 {
+        removed.push(format!("{} unparsed lines shown", counts.unparsed));
+    }
+    if removed.is_empty() {
+        eprintln!("showing {shown} of {} lines", counts.total);
+    } else {
+        eprintln!(
+            "showing {shown} of {} lines ({})",
+            counts.total,
+            removed.join(", ")
+        );
+    }
+}
+
+async fn follow_module_logs(
+    module_id: &str,
+    options: &ModuleLogsOptions,
+    initial_sources: Vec<LogSource>,
+    json_output: bool,
+) -> Result<(), CkError> {
+    struct Cursor {
+        offset: u64,
+        created: Option<SystemTime>,
+        prefix: Vec<u8>,
+    }
+
+    let mut offsets = HashMap::new();
+    for source in initial_sources
+        .into_iter()
+        .filter(|source| rotation_generation(&source.path) == 0)
+    {
+        if let Ok(metadata) = fs::metadata(&source.path) {
+            offsets.insert(
+                source.path.clone(),
+                Cursor {
+                    offset: metadata.len(),
+                    created: metadata.created().ok(),
+                    prefix: read_log_prefix(&source.path, metadata.len().min(64) as usize)?,
+                },
+            );
+        }
+    }
+
+    loop {
+        time::sleep(Duration::from_millis(250)).await;
+        for source in discover_log_sources(module_id, false)? {
+            let metadata =
+                fs::metadata(&source.path).map_err(|error| CkError::Message(error.to_string()))?;
+            let length = metadata.len();
+            let cursor = offsets.entry(source.path.clone()).or_insert(Cursor {
+                offset: 0,
+                created: metadata.created().ok(),
+                prefix: Vec::new(),
+            });
+            let current_prefix = read_log_prefix(&source.path, cursor.prefix.len())?;
+            let rotated = length < cursor.offset
+                || metadata.created().ok() != cursor.created
+                || current_prefix != cursor.prefix;
+            if rotated {
+                // A rotation may move bytes appended after the previous poll into
+                // `.1`. Drain that old inode's unseen tail before switching the
+                // cursor to the replacement active file.
+                let mut rotated_name = source.path.as_os_str().to_os_string();
+                rotated_name.push(".1");
+                let rotated_path = PathBuf::from(rotated_name);
+                if let Ok(rotated_length) = fs::metadata(&rotated_path).map(|meta| meta.len()) {
+                    if rotated_length > cursor.offset {
+                        let text = read_log_range(&rotated_path, cursor.offset)?;
+                        print_follow_text(module_id, options, &source, &text, json_output)?;
+                    }
+                }
+                cursor.offset = 0;
+                cursor.created = metadata.created().ok();
+                cursor.prefix = read_log_prefix(&source.path, length.min(64) as usize)?;
+            } else if cursor.prefix.is_empty() && length != 0 {
+                cursor.prefix = read_log_prefix(&source.path, length.min(64) as usize)?;
+            }
+            if length == cursor.offset {
+                continue;
+            }
+            let text = read_log_range(&source.path, cursor.offset)?;
+            cursor.offset = length;
+            print_follow_text(module_id, options, &source, &text, json_output)?;
+        }
+        use std::io::Write as _;
+        io::stdout()
+            .flush()
+            .map_err(|error| CkError::Message(error.to_string()))?;
+    }
+}
+
+fn read_log_prefix(path: &Path, length: usize) -> Result<Vec<u8>, CkError> {
+    let mut file = fs::File::open(path).map_err(|error| CkError::Message(error.to_string()))?;
+    let mut prefix = vec![0; length];
+    file.read_exact(&mut prefix)
+        .map_err(|error| CkError::Message(error.to_string()))?;
+    Ok(prefix)
+}
+
+fn read_log_range(path: &Path, offset: u64) -> Result<String, CkError> {
+    let mut file = fs::File::open(path).map_err(|error| CkError::Message(error.to_string()))?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|error| CkError::Message(error.to_string()))?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .map_err(|error| CkError::Message(error.to_string()))?;
+    Ok(text)
+}
+
+fn print_follow_text(
+    module_id: &str,
+    options: &ModuleLogsOptions,
+    source: &LogSource,
+    text: &str,
+    json_output: bool,
+) -> Result<(), CkError> {
+    let mut entries = Vec::new();
+    let mut counts = LogFilterCounts::default();
+    let mut order = 0;
+    collect_log_text(
+        module_id,
+        source,
+        text,
+        options,
+        &mut counts,
+        &mut entries,
+        &mut order,
+    );
+    print_log_entries(&entries, json_output)
+}
+
 async fn module_status(
     client: &mut CkClient,
     module_id: &str,
@@ -1443,6 +1991,104 @@ fn parse_drain_override(tail: &[std::ffi::OsString]) -> Result<Option<u64>, CkEr
         ))),
         (true, None) => Ok(Some(0)),
         (false, value) => Ok(value),
+    }
+}
+
+fn parse_module_logs(tail: &[OsString]) -> Result<(Option<String>, ModuleLogsOptions), CkError> {
+    let mut module_id = None;
+    let mut options = ModuleLogsOptions {
+        lines: 200,
+        follow: false,
+        since: None,
+        tag: None,
+        level: None,
+        lane: None,
+    };
+    let mut index = 0;
+    while index < tail.len() {
+        let argument = tail[index].to_string_lossy();
+        match argument.as_ref() {
+            "-f" => options.follow = true,
+            "-n" | "--since" | "--tag" | "--level" | "--lane" => {
+                index += 1;
+                let value = tail.get(index).ok_or_else(|| {
+                    CkError::Usage(format!("{argument} needs a value\n\n{MODULE_HELP}"))
+                })?;
+                let value = value.to_string_lossy().into_owned();
+                match argument.as_ref() {
+                    "-n" => {
+                        options.lines =
+                            value
+                                .parse::<usize>()
+                                .ok()
+                                .filter(|n| *n > 0)
+                                .ok_or_else(|| {
+                                    CkError::Usage(format!(
+                                        "-n '{value}' is not a positive line count"
+                                    ))
+                                })?;
+                    }
+                    "--since" => options.since = Some(parse_log_duration(&value)?),
+                    "--tag" => options.tag = Some(value),
+                    "--level" => options.level = Some(parse_log_level(&value)?),
+                    "--lane" => options.lane = Some(value),
+                    _ => unreachable!(),
+                }
+            }
+            value if value.starts_with('-') => {
+                return Err(CkError::Usage(format!(
+                    "unknown ck module logs flag '{value}'\n\n{MODULE_HELP}"
+                )))
+            }
+            value if module_id.is_none() => module_id = Some(value.to_string()),
+            value => {
+                return Err(CkError::Usage(format!(
+                    "ck module logs accepts at most one module id; got '{value}'"
+                )))
+            }
+        }
+        index += 1;
+    }
+    Ok((module_id, options))
+}
+
+fn parse_log_duration(value: &str) -> Result<Duration, CkError> {
+    let split = value
+        .find(|character: char| !character.is_ascii_digit())
+        .ok_or_else(|| {
+            CkError::Usage(format!(
+                "--since '{value}' needs a unit (ms, s, m, h, d, w)"
+            ))
+        })?;
+    let amount = value[..split]
+        .parse::<u64>()
+        .map_err(|_| CkError::Usage(format!("invalid --since duration '{value}'")))?;
+    let multiplier = match &value[split..] {
+        "ms" => 1,
+        "s" => 1_000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        "w" => 604_800_000,
+        _ => {
+            return Err(CkError::Usage(format!(
+                "invalid --since duration '{value}'"
+            )))
+        }
+    };
+    Ok(Duration::from_millis(amount.saturating_mul(multiplier)))
+}
+
+fn parse_log_level(value: &str) -> Result<ParsedLevel, CkError> {
+    match value.to_ascii_lowercase().as_str() {
+        "trace" => Ok(ParsedLevel::Trace),
+        "debug" => Ok(ParsedLevel::Debug),
+        "info" => Ok(ParsedLevel::Info),
+        "warn" => Ok(ParsedLevel::Warn),
+        "error" => Ok(ParsedLevel::Error),
+        _ => Err(CkError::Usage(format!(
+            "invalid log level '{value}'; expected trace, debug, info, warn, or error"
+        ))),
     }
 }
 
@@ -5756,6 +6402,10 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
                 // `-n <count>` narrows the tail daemon-side rather than here, so
                 // a caller asking for 20 lines is not shipped the whole ring to
                 // discard most of it.
+                "logs" => {
+                    let (module_id, options) = parse_module_logs(&tail[1..])?;
+                    ModuleCommand::Logs { module_id, options }
+                }
                 "stderr" => ModuleCommand::StderrTail {
                     module_id: id(1)?,
                     max_lines: parse_tail_count(tail)?,

@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+use cortexkit_log::Retention;
 use serde::Deserialize;
 use subc_jsonc::jsonc_to_json;
 use subc_protocol::manifest::is_valid_capability_identifier;
@@ -16,6 +17,10 @@ use crate::{HealthAction, HealthConfig, ModuleSpec, RestartPolicy};
 
 const DAEMON_CONFIG_RELATIVE_PATH: &str = "cortexkit/subc.jsonc";
 const SUPPORTED_CONFIG_VERSION: u32 = 1;
+const CK_LOG_ENV: &str = "CK_LOG";
+pub(crate) const CAPTURE_MAX_FILE_MB_ENV: &str = "__SUBC_CAPTURE_LOG_MAX_FILE_MB";
+pub(crate) const CAPTURE_KEEP_ENV: &str = "__SUBC_CAPTURE_LOG_KEEP";
+pub(crate) const CAPTURE_MAX_AGE_DAYS_ENV: &str = "__SUBC_CAPTURE_LOG_MAX_AGE_DAYS";
 
 /// Top-level daemon config sections that rescan cannot apply. The daemon
 /// snapshots these sections at start and reports later rescan changes as
@@ -68,6 +73,29 @@ const ROUTE_BIND_RELAY_ZERO_MESSAGE: &str = "route_bind_relay_timeout_ms must be
 /// is "unlimited restarts", and anyone choosing it must say so by name rather
 /// than by writing a zero that reads like "no delay".
 const RESTART_WINDOW_ZERO_MESSAGE: &str = "restart.window_secs must be greater than 0 (a zero window holds no crash, so the budget can never be spent; for effectively unlimited restarts set a deliberately large window_secs, and to stop restarting entirely set restart.max_restarts: 0)";
+
+/// Logging policy parsed from `subc.jsonc`.
+///
+/// Retention is kept as the shared crate's type so the daemon's own file and
+/// captured child files cannot drift from the fleet policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoggingConfig {
+    pub level: String,
+    pub tags: BTreeMap<String, String>,
+    pub retention: Retention,
+}
+
+impl LoggingConfig {
+    pub fn filter_spec(&self) -> String {
+        let mut directives = vec![self.level.clone()];
+        directives.extend(
+            self.tags
+                .iter()
+                .map(|(tag, level)| format!("{tag}={level}")),
+        );
+        directives.join(",")
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonConfig {
@@ -168,6 +196,10 @@ pub struct ConfiguredModule {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    /// Effective module logging policy. An absent module block inherits the
+    /// daemon-wide logging block; when neither exists this stays absent so
+    /// `CK_LOG` is genuinely absent from the service-manager-minimal child env.
+    pub log: Option<LoggingConfig>,
     pub enabled: bool,
     /// When true, only the daemon-spawned process for this `module_id` may register
     /// it: subc injects a one-time launch nonce on spawn and rejects any HELLO for
@@ -203,11 +235,34 @@ pub struct ConfiguredModule {
 
 impl ConfiguredModule {
     pub fn module_spec(&self) -> ModuleSpec {
+        let mut env = self.env.clone();
+        if let Some(log) = &self.log {
+            env.retain(|(key, _)| {
+                key != CK_LOG_ENV
+                    && key != CAPTURE_MAX_FILE_MB_ENV
+                    && key != CAPTURE_KEEP_ENV
+                    && key != CAPTURE_MAX_AGE_DAYS_ENV
+            });
+            env.push((CK_LOG_ENV.to_string(), log.filter_spec()));
+            // cortexkit-log does not yet define retention environment names.
+            // These private entries are supervisor metadata and are removed
+            // before spawn; they let capture retention follow config changes at
+            // the next spawn without inventing a child-process env contract.
+            env.push((
+                CAPTURE_MAX_FILE_MB_ENV.to_string(),
+                log.retention.max_file_mb.to_string(),
+            ));
+            env.push((CAPTURE_KEEP_ENV.to_string(), log.retention.keep.to_string()));
+            env.push((
+                CAPTURE_MAX_AGE_DAYS_ENV.to_string(),
+                log.retention.max_age_days.to_string(),
+            ));
+        }
         ModuleSpec {
             module_id: self.module_id.clone(),
             program: self.program.clone(),
             args: self.args.clone(),
-            env: self.env.clone(),
+            env,
             reserved: self.reserved,
             reserved_prefixes: self.reserved_prefixes.clone(),
         }
@@ -248,6 +303,8 @@ struct RawDaemonConfig {
     #[serde(default)]
     route_bind_relay_timeout_ms: Option<u64>,
     #[serde(default)]
+    log: Option<RawLoggingConfig>,
+    #[serde(default)]
     modules: BTreeMap<String, RawModuleConfig>,
     #[serde(default)]
     storage: Option<RawStorageConfig>,
@@ -277,6 +334,8 @@ struct RawModuleConfig {
     args: Vec<String>,
     #[serde(default)]
     env: BTreeMap<String, String>,
+    #[serde(default)]
+    log: Option<RawLoggingConfig>,
     #[serde(default = "default_enabled")]
     enabled: bool,
     #[serde(default)]
@@ -291,6 +350,20 @@ struct RawModuleConfig {
     route_bind_relay_timeout_ms: Option<u64>,
     #[serde(default)]
     restart: Option<RawRestartConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawLoggingConfig {
+    #[serde(default)]
+    level: Option<String>,
+    #[serde(default)]
+    tags: BTreeMap<String, String>,
+    #[serde(default)]
+    max_file_mb: Option<u32>,
+    #[serde(default)]
+    keep: Option<u8>,
+    #[serde(default)]
+    max_age_days: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -359,18 +432,63 @@ pub fn default_config_path() -> PathBuf {
 
 pub fn load(path: impl AsRef<Path>) -> Result<Option<DaemonConfig>, DaemonConfigError> {
     let path = path.as_ref();
-    let doc = match fs::read_to_string(path) {
-        Ok(doc) => doc,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => {
-            return Err(DaemonConfigError::Read {
-                path: path.to_path_buf(),
-                source,
-            })
-        }
+    let Some(doc) = read_config_doc(path)? else {
+        return Ok(None);
     };
-
     parse_doc(&doc, path).map(Some)
+}
+
+/// Loads only the daemon-wide logging block for tracing initialization.
+///
+/// The daemon installs its global subscriber before bootstrap parses the full
+/// configuration. A malformed full config is still reported by bootstrap after
+/// the file sink is live; this early read only chooses its filter and retention.
+pub fn load_logging(path: impl AsRef<Path>) -> Result<Option<LoggingConfig>, DaemonConfigError> {
+    let path = path.as_ref();
+    let Some(doc) = read_config_doc(path)? else {
+        return Ok(None);
+    };
+    let json = jsonc_to_json(&doc).map_err(|message| DaemonConfigError::InvalidJsonc {
+        path: path.to_path_buf(),
+        message,
+    })?;
+    let raw: RawDaemonConfig =
+        serde_json::from_str(&json).map_err(|source| DaemonConfigError::InvalidJson {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if raw.version != SUPPORTED_CONFIG_VERSION {
+        return Err(DaemonConfigError::UnsupportedVersion {
+            path: path.to_path_buf(),
+            version: raw.version,
+        });
+    }
+    raw.log
+        .map(|log| parse_logging_config(log, path, "daemon log"))
+        .transpose()
+}
+
+/// Existing per-user daemon run directory (`<data-home>/cortexkit/run`).
+pub fn daemon_run_dir() -> PathBuf {
+    let path = default_data_home().join("cortexkit").join("run");
+    if path.is_absolute() {
+        path
+    } else {
+        env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
+}
+
+fn read_config_doc(path: &Path) -> Result<Option<String>, DaemonConfigError> {
+    match fs::read_to_string(path) {
+        Ok(doc) => Ok(Some(doc)),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(DaemonConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> {
@@ -391,6 +509,10 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
         });
     }
 
+    let daemon_logging = raw
+        .log
+        .map(|log| parse_logging_config(log, path, "daemon log"))
+        .transpose()?;
     let default_drain_timeout_ms = raw.drain_timeout_ms;
     // `0` here would turn every bind to a slow module into an instant failure;
     // "off is not a budget" so refuse the key at parse time. Operators who
@@ -444,11 +566,17 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
                 None => default_route_bind_relay_timeout_ms,
             };
             let restart = parse_restart_config(module.restart, path, &module_id)?;
+            let log = module
+                .log
+                .map(|log| parse_logging_config(log, path, &format!("module '{module_id}' log")))
+                .transpose()?
+                .or_else(|| daemon_logging.clone());
             Ok(ConfiguredModule {
                 module_id,
                 program: module.program,
                 args: module.args,
                 env: module.env.into_iter().collect(),
+                log,
                 enabled: module.enabled,
                 reserved: module.reserved,
                 reserved_prefixes: module.reserved_prefixes,
@@ -491,6 +619,65 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
         admission_facts_carrier_module_id: raw.admission_facts_carrier_module_id,
         admission_facts_targets: raw.admission_facts_targets,
         reserved_capabilities: raw.reserved_capabilities,
+    })
+}
+
+fn parse_logging_config(
+    raw: RawLoggingConfig,
+    path: &Path,
+    owner: &str,
+) -> Result<LoggingConfig, DaemonConfigError> {
+    fn valid_level(level: &str) -> bool {
+        matches!(level, "off" | "error" | "warn" | "info" | "debug" | "trace")
+    }
+
+    let level = raw.level.unwrap_or_else(|| "info".to_string());
+    if !valid_level(&level) {
+        return Err(DaemonConfigError::InvalidValue {
+            path: path.to_path_buf(),
+            message: format!(
+                "{owner}.level must be one of off, error, warn, info, debug, trace; got {level:?}"
+            ),
+        });
+    }
+    for (tag, tag_level) in &raw.tags {
+        if tag.is_empty()
+            || tag
+                .chars()
+                .any(|character| character.is_whitespace() || character == ',' || character == '=')
+        {
+            return Err(DaemonConfigError::InvalidValue {
+                path: path.to_path_buf(),
+                message: format!("{owner}.tags contains an invalid tag name {tag:?}"),
+            });
+        }
+        if !valid_level(tag_level) {
+            return Err(DaemonConfigError::InvalidValue {
+                path: path.to_path_buf(),
+                message: format!(
+                    "{owner}.tags.{tag} must be one of off, error, warn, info, debug, trace; got {tag_level:?}"
+                ),
+            });
+        }
+    }
+
+    let defaults = Retention::default();
+    let retention = Retention {
+        max_file_mb: raw.max_file_mb.unwrap_or(defaults.max_file_mb),
+        keep: raw.keep.unwrap_or(defaults.keep),
+        max_age_days: raw.max_age_days.unwrap_or(defaults.max_age_days),
+    };
+    if retention.max_file_mb == 0 {
+        return Err(DaemonConfigError::InvalidValue {
+            path: path.to_path_buf(),
+            message: format!("{owner}.max_file_mb must be greater than 0"),
+        });
+    }
+
+    Ok(LoggingConfig {
+        level,
+        tags: raw.tags,
+        retention,
     })
 }
 

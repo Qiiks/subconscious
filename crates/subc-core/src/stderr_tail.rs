@@ -19,8 +19,12 @@
 //! doing its job; this exists because that job has a time limit.
 
 use std::collections::VecDeque;
-use std::io::Write;
-use std::sync::{Arc, Mutex};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 
 use tokio::io::AsyncReadExt;
 
@@ -312,28 +316,8 @@ impl StderrRing {
 /// reassembly restarts.
 const MAX_PENDING_LINE_BYTES: usize = 1024 * 1024;
 
-/// Read a child's stderr to EOF: retain a bounded tail, and forward every line on.
-///
-/// # Forwarding is mandatory, not a courtesy
-///
-/// Measured on the live daemon log: 4727 of the last 5000 lines carried a module
-/// tag. That file is a module log with some daemon lines in it, not the reverse.
-/// A tap that captured without forwarding would leave it nearly empty, and every
-/// existing reader -- including fleet scripts -- would report clean on nothing.
-/// An absence that reads as calm is worse than the interleaving this replaces.
-///
-/// # Bytes are forwarded verbatim
-///
-/// The ring stores lossy UTF-8 because it renders into JSON; the forward writes
-/// the ORIGINAL bytes. Anything else silently rewrites a log other tools parse.
-///
-/// # One write per complete line
-///
-/// Inheriting the daemon's fd gave line atomicity for free: a module's own write
-/// reached the fd in one syscall. Reading a pipe and re-emitting can split a line
-/// that used to be atomic, so this reassembles first and writes each complete
-/// line in a single call -- otherwise the fix introduces a defect the previous
-/// design did not have.
+/// Read a child's stderr to EOF, retaining the bounded crash tail and forwarding
+/// every complete line to the selected capture sink.
 pub async fn pump_stderr<R>(source: R, ring: Arc<Mutex<StderrRing>>)
 where
     R: AsyncReadExt + Unpin,
@@ -341,86 +325,157 @@ where
     pump_stderr_into(source, ring, &mut StderrSink).await
 }
 
-/// Where forwarded lines go. Exists so tests can assert that forwarding HAPPENS
-/// and that each line arrives in one write -- the property that makes this a
-/// replacement for inherited stdio rather than a regression from it.
-pub trait LineSink {
+/// Shared destination for a child's stdout and stderr pumps.
+///
+/// The file keeps the historical `.stderr.log` name even though it carries both
+/// streams; the stable name is part of the operator contract. Both pumps share
+/// one mutex, and cortexkit-log writes each framed line in one call, so partial
+/// lines from the two pipes cannot interleave.
+#[derive(Clone)]
+pub(crate) enum ChildOutputSink {
+    File {
+        sink: Arc<Mutex<cortexkit_log::LineSink>>,
+        path: Arc<PathBuf>,
+        failure_reported: Arc<AtomicBool>,
+    },
+    Stderr,
+}
+
+impl ChildOutputSink {
+    pub(crate) fn open(path: &Path, retention: cortexkit_log::Retention) -> io::Result<Self> {
+        Ok(Self::File {
+            sink: Arc::new(Mutex::new(cortexkit_log::LineSink::open(path, retention)?)),
+            path: Arc::new(path.to_path_buf()),
+            failure_reported: Arc::new(AtomicBool::new(false)),
+        })
+    }
+}
+
+/// Where forwarded complete lines go. It exists so tests can observe framing
+/// and so production can serialize the two child pipes through one file sink.
+pub trait OutputSink {
     fn write_line(&mut self, line: &[u8]);
 }
 
 struct StderrSink;
 
-impl LineSink for StderrSink {
+impl OutputSink for StderrSink {
     fn write_line(&mut self, line: &[u8]) {
         let stderr = std::io::stderr();
         let mut handle = stderr.lock();
-        // Best-effort: a failed forward must not stop capture. Losing a log line
-        // is recoverable; losing the tail that explains a crash is the thing
-        // being fixed.
         let _ = handle.write_all(line);
     }
 }
 
-async fn pump_stderr_into<R, S>(mut source: R, ring: Arc<Mutex<StderrRing>>, sink: &mut S)
+impl OutputSink for ChildOutputSink {
+    fn write_line(&mut self, line: &[u8]) {
+        match self {
+            Self::File {
+                sink,
+                path,
+                failure_reported,
+            } => {
+                let result = sink
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .write_line(line);
+                if let Err(error) = result {
+                    if !failure_reported.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %error,
+                            "child output capture write failed; later failures are suppressed"
+                        );
+                    }
+                }
+            }
+            Self::Stderr => StderrSink.write_line(line),
+        }
+    }
+}
+
+pub(crate) async fn pump_stderr_to<R>(
+    source: R,
+    ring: Arc<Mutex<StderrRing>>,
+    mut sink: ChildOutputSink,
+) where
+    R: AsyncReadExt + Unpin,
+{
+    pump_stderr_into(source, ring, &mut sink).await;
+}
+
+pub(crate) async fn pump_stdout_to<R>(source: R, mut sink: ChildOutputSink)
 where
     R: AsyncReadExt + Unpin,
-    S: LineSink,
 {
-    {
-        let mut guard = lock_ring(&ring);
-        guard.mark_captured();
+    pump_lines_into(source, None, &mut sink, "stdout").await;
+}
+
+async fn pump_stderr_into<R, S>(source: R, ring: Arc<Mutex<StderrRing>>, sink: &mut S)
+where
+    R: AsyncReadExt + Unpin,
+    S: OutputSink,
+{
+    pump_lines_into(source, Some(&ring), sink, "stderr").await;
+}
+
+async fn pump_lines_into<R, S>(
+    mut source: R,
+    ring: Option<&Arc<Mutex<StderrRing>>>,
+    sink: &mut S,
+    stream_name: &str,
+) where
+    R: AsyncReadExt + Unpin,
+    S: OutputSink,
+{
+    if let Some(ring) = ring {
+        lock_ring(ring).mark_captured();
     }
 
     let mut pending: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 8192];
-
     loop {
         let read = match source.read(&mut chunk).await {
             Ok(0) => break,
             Ok(n) => n,
-            Err(err) => {
-                let mut guard = lock_ring(&ring);
-                // The tail up to this point stays valid and readable; what changes
-                // is that it is no longer complete, and saying so beats letting a
-                // truncated capture read as a module that stopped talking.
-                guard.mark_incomplete(format!("stderr read failed: {err}"));
+            Err(error) => {
+                if let Some(ring) = ring {
+                    lock_ring(ring).mark_incomplete(format!("{stream_name} read failed: {error}"));
+                } else {
+                    tracing::warn!(stream = stream_name, error = %error, "child output capture read failed");
+                }
                 return;
             }
         };
-
         pending.extend_from_slice(&chunk[..read]);
 
         while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
             let line: Vec<u8> = pending.drain(..=newline).collect();
-            emit_line(&ring, sink, &line[..line.len() - 1], true);
+            emit_line(ring, sink, &line[..line.len() - 1], true);
         }
-
         if pending.len() >= MAX_PENDING_LINE_BYTES {
             let line = std::mem::take(&mut pending);
-            emit_line(&ring, sink, &line, false);
+            emit_line(ring, sink, &line, false);
         }
     }
 
-    // A process that dies mid-line still wrote the bytes, and on a crash that
-    // fragment is disproportionately likely to be the message worth reading.
     if !pending.is_empty() {
-        emit_line(&ring, sink, &pending, false);
+        emit_line(ring, sink, &pending, false);
     }
 }
 
-fn emit_line<S: LineSink>(
-    ring: &Arc<Mutex<StderrRing>>,
+fn emit_line<S: OutputSink>(
+    ring: Option<&Arc<Mutex<StderrRing>>>,
     sink: &mut S,
     raw: &[u8],
     terminated: bool,
 ) {
-    {
-        let mut guard = lock_ring(ring);
-        guard.push_line(&String::from_utf8_lossy(raw));
+    if let Some(ring) = ring {
+        lock_ring(ring).push_line(&String::from_utf8_lossy(raw));
     }
 
-    // Framed and written in ONE call. Two writes -- body then newline -- would
-    // reintroduce exactly the interleaving that inheriting the fd avoided.
+    // Framed and written in ONE call. Two writes would let the other pipe land
+    // between the body and newline.
     if terminated {
         let mut framed = Vec::with_capacity(raw.len() + 1);
         framed.extend_from_slice(raw);
@@ -721,7 +776,7 @@ mod tests {
         writes: Vec<Vec<u8>>,
     }
 
-    impl LineSink for RecordingSink {
+    impl OutputSink for RecordingSink {
         fn write_line(&mut self, line: &[u8]) {
             self.writes.push(line.to_vec());
         }

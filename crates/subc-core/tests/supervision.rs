@@ -1000,6 +1000,72 @@ async fn a_wedged_old_stderr_pump_is_stopped_before_the_next_restart_boundary() 
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn child_stdout_and_stderr_reach_the_capture_file_while_only_stderr_reaches_the_ring() {
+    let server = TestServer::start().await;
+    let capture = TestTempDir::new("child-output-capture");
+    let logs_dir = capture.join("logs");
+    let supervisor =
+        supervisor(&server, 0, Duration::from_millis(10)).with_capture_logs_dir(&logs_dir);
+    let module = supervisor
+        .spawn(ModuleSpec {
+            module_id: "two-pipe-capture".to_string(),
+            program: PathBuf::from(env!("CARGO_BIN_EXE_log-child-fixture")),
+            args: Vec::new(),
+            env: vec![
+                (
+                    "LOG_CHILD_STDOUT".to_string(),
+                    "stdout-complete-line".to_string(),
+                ),
+                (
+                    "LOG_CHILD_STDERR".to_string(),
+                    "stderr-complete-line".to_string(),
+                ),
+            ],
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+        })
+        .unwrap();
+
+    let tail = wait_for_tail(&module, Duration::from_secs(5), |tail| {
+        matches!(tail.capture, CaptureState::Captured)
+            && tail.entries.iter().any(
+                |entry| matches!(entry, TailEntry::Line { text, .. } if text == "stderr-complete-line"),
+            )
+    })
+    .await;
+    let path = logs_dir.join("two-pipe-capture.stderr.log");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let contents = loop {
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            if contents.contains("stdout-complete-line")
+                && contents.contains("stderr-complete-line")
+            {
+                break contents;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "capture file did not receive both pipes"
+        );
+        sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(
+        contents.lines().collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["stderr-complete-line", "stdout-complete-line"]),
+        "each complete source line must remain intact"
+    );
+    let ring_lines = tail
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            TailEntry::Line { text, .. } => Some(text.as_str()),
+            TailEntry::ProcessStart => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ring_lines, ["stderr-complete-line"]);
+}
+
 async fn wait_for_tail(
     module: &SupervisedModule,
     wait: Duration,

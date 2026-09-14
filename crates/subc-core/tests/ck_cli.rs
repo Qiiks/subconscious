@@ -1733,6 +1733,124 @@ fn mc_hint_names_the_daemon_module_id() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_logs_merges_sources_by_timestamp_and_reports_real_filter_counts() {
+    let module_id = "merged-logs";
+    let data_home = unique_temp_dir("ck-module-logs-data");
+    let module_logs = data_home.join("cortexkit").join(module_id).join("logs");
+    let run_logs = data_home.join("cortexkit").join("run").join("logs");
+    fs::create_dir_all(&module_logs).unwrap();
+    fs::create_dir_all(&run_logs).unwrap();
+    fs::write(
+        module_logs.join(format!("{module_id}.log")),
+        format!(
+            "2026-09-05T10:00:00.000Z DEBUG {module_id} hidden debug\n2026-09-05T10:00:03.000Z INFO  {module_id} module line\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        module_logs.join(format!("{module_id}.opencode.log")),
+        format!("2026-09-05T10:00:01.000Z INFO  {module_id} plugin line\n"),
+    )
+    .unwrap();
+    fs::write(
+        run_logs.join(format!("{module_id}.stderr.log")),
+        format!("2026-09-05T10:00:04.000Z ERROR {module_id} captured line\n"),
+    )
+    .unwrap();
+    fs::write(
+        run_logs.join("subc.log"),
+        format!(
+            "2026-09-05T10:00:02.000Z WARN  subc daemon line module_id={module_id}\n2026-09-05T10:00:05.000Z INFO  subc unrelated module_id=other\n"
+        ),
+    )
+    .unwrap();
+    let daemon = ScriptedDaemon::start(
+        "ck-module-logs-merge",
+        vec![ScriptedControlStep {
+            expected: ClientControlRequest::SupervisorList {},
+            action: ScriptedControlAction::Reply(Box::new(ClientControlResponse::SupervisorList {
+                generation: 1,
+                modules: vec![scripted_supervisor_entry(module_id, None)],
+            })),
+        }],
+    )
+    .await;
+
+    let output = ck_command()
+        .args([
+            "module", "logs", module_id, "-n", "20", "--level", "info", "--subc",
+        ])
+        .arg(&daemon.connection_file_path)
+        .env("XDG_DATA_HOME", &*data_home)
+        .output()
+        .unwrap();
+    assert_exit(&output, 0);
+    assert_eq!(
+        text(&output.stdout),
+        concat!(
+            "opencode     2026-09-05T10:00:01.000Z INFO  merged-logs plugin line\n",
+            "daemon       2026-09-05T10:00:02.000Z WARN  subc daemon line module_id=merged-logs\n",
+            "mod          2026-09-05T10:00:03.000Z INFO  merged-logs module line\n",
+            "stderr       2026-09-05T10:00:04.000Z ERROR merged-logs captured line\n"
+        )
+    );
+    assert_eq!(
+        text(&output.stderr),
+        "showing 4 of 6 lines (1 below requested level, 1 daemon lines hidden)\n"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_logs_empty_states_are_verbatim() {
+    let data_home = unique_temp_dir("ck-module-logs-empty");
+    let known = "quiet-module";
+    let known_daemon = ScriptedDaemon::start(
+        "ck-module-logs-known-empty",
+        vec![ScriptedControlStep {
+            expected: ClientControlRequest::SupervisorList {},
+            action: ScriptedControlAction::Reply(Box::new(ClientControlResponse::SupervisorList {
+                generation: 1,
+                modules: vec![scripted_supervisor_entry(known, None)],
+            })),
+        }],
+    )
+    .await;
+    let known_output = ck_command()
+        .args(["module", "logs", known, "--subc"])
+        .arg(&known_daemon.connection_file_path)
+        .env("XDG_DATA_HOME", &*data_home)
+        .output()
+        .unwrap();
+    assert_exit(&known_output, 0);
+    assert_eq!(text(&known_output.stdout), "no log yet for quiet-module\n");
+    assert!(known_output.stderr.is_empty());
+
+    let unknown_daemon = ScriptedDaemon::start(
+        "ck-module-logs-unknown",
+        vec![ScriptedControlStep {
+            expected: ClientControlRequest::SupervisorList {},
+            action: ScriptedControlAction::Reply(Box::new(ClientControlResponse::SupervisorList {
+                generation: 1,
+                modules: Vec::new(),
+            })),
+        }],
+    )
+    .await;
+    let unknown_output = ck_command()
+        .args(["module", "logs", "missing", "--subc"])
+        .arg(&unknown_daemon.connection_file_path)
+        .env("XDG_DATA_HOME", &*data_home)
+        .output()
+        .unwrap();
+    assert_exit(&unknown_output, 0);
+    assert_eq!(
+        text(&unknown_output.stdout),
+        "no module named 'missing'. Run ck module list.\n"
+    );
+    assert!(unknown_output.stderr.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn module_list_json_uses_subc_override_and_shows_stub() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server);

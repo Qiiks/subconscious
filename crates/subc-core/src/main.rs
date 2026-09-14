@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
-use std::process;
+use std::{path::PathBuf, process};
 
-use tracing_subscriber::EnvFilter;
+use cortexkit_log::{Config, Lane, Retention};
 
 #[tokio::main]
 async fn main() {
@@ -63,7 +63,10 @@ async fn main() {
         return;
     }
 
-    init_tracing();
+    if let Err(err) = init_tracing() {
+        eprintln!("ck-subc: failed to initialize logging: {err}");
+        process::exit(1);
+    }
 
     if let Err(err) = subc_core::bootstrap::run().await {
         tracing::error!(error = %err, "subc-core failed");
@@ -72,10 +75,88 @@ async fn main() {
     }
 }
 
-fn init_tracing() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+fn init_tracing() -> Result<(), cortexkit_log::InitError> {
+    let config_path = subc_core::daemon_config::default_config_path();
+    let logging = subc_core::daemon_config::load_logging(&config_path)
+        .map_err(|error| {
+            eprintln!(
+                "ck-subc: could not read daemon logging config from {}: {error}; using defaults",
+                config_path.display()
+            );
+        })
+        .ok()
+        .flatten();
+    let logs_dir = subc_core::daemon_config::daemon_run_dir().join("logs");
+    install_tracing(daemon_logger_config(logs_dir, logging.as_ref()))
+}
+
+fn daemon_logger_config(
+    logs_dir: PathBuf,
+    logging: Option<&subc_core::daemon_config::LoggingConfig>,
+) -> Config {
+    let path = logs_dir.join("subc.log");
+    Config {
+        module_id: "subc".to_string(),
+        logs_dir,
+        lane: Lane::Custom(path),
+        spec: logging.map(subc_core::daemon_config::LoggingConfig::filter_spec),
+        retention: logging.map_or_else(Retention::default, |config| config.retention),
+        redactor: None,
+        clock: None,
+    }
+}
+
+fn install_tracing(config: Config) -> Result<(), cortexkit_log::InitError> {
+    // cortexkit-log owns one process-global file sink and does not expose a
+    // cheap tee layer. The daemon therefore writes directly to subc.log only;
+    // stdout is intentionally not a second logging destination.
+    cortexkit_log::init(config).map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        sync::Arc,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+
+    use super::*;
+
+    #[test]
+    fn daemon_log_line_matches_the_authority_fixture_byte_for_byte_without_ansi() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let logs_dir =
+            std::env::temp_dir().join(format!("subc-daemon-log-format-{}-{unique}", process::id()));
+        let mut config = daemon_logger_config(logs_dir.clone(), None);
+        config.module_id = "fusiform".to_string();
+        config.clock = Some(Arc::new(|| {
+            UNIX_EPOCH + Duration::from_millis(1_788_604_863_123)
+        }));
+        install_tracing(config).unwrap();
+
+        tracing::info!(
+            version = 1_788_526_509_641_u64,
+            eras = 22_u64,
+            facts_changed = 0_u64,
+            arrived = 2_u64,
+            "poll changed"
+        );
+        let line = fs::read_to_string(logs_dir.join("subc.log")).unwrap();
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/log_format_golden.json")).unwrap();
+        let expected = fixture["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["name"] == "plain-info-no-session")
+            .unwrap()["line"]
+            .as_str()
+            .unwrap();
+        assert_eq!(line, format!("{expected}\n"));
+        assert!(!line.contains('\u{1b}'));
+    }
 }

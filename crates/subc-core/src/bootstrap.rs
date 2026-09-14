@@ -472,7 +472,8 @@ async fn serve_bound_daemon(
         .with_process_liveness(process_liveness.clone())
         .with_forwarding(Arc::clone(&forwarding))
         .with_handle(supervisor_handle.clone())
-        .with_connection_file_path(bound.connection_file_path.clone());
+        .with_connection_file_path(bound.connection_file_path.clone())
+        .with_capture_logs_dir(daemon_config::daemon_run_dir().join("logs"));
     // Collect per-module route.bind relay overrides BEFORE handing the
     // `configured_modules` vector to the supervisor (which only needs each
     // module's `drain_timeout_ms`). Each entry was filled in by parse-time
