@@ -1111,10 +1111,15 @@ async fn concurrent_child_pipes_never_tear_a_line_in_the_capture_file() {
         // one. Checked structurally rather than by counting characters, since
         // the lane names themselves contain the padding letters.
         let intact = match line.split_once('-') {
-            Some(("out", rest)) => rest.strip_prefix(&format!("{:04}-", &rest[..4].parse::<usize>().unwrap_or(usize::MAX)))
-                .is_some_and(|pad| pad.len() == 64 && pad.bytes().all(|b| b == b'o')),
-            Some(("err", rest)) => rest.strip_prefix(&format!("{:04}-", &rest[..4].parse::<usize>().unwrap_or(usize::MAX)))
-                .is_some_and(|pad| pad.len() == 64 && pad.bytes().all(|b| b == b'e')),
+            Some((lane @ ("out" | "err"), rest)) => {
+                let padding = if lane == "out" { b'o' } else { b'e' };
+                rest.split_once('-').is_some_and(|(index, pad)| {
+                    index.len() == 4
+                        && index.bytes().all(|b| b.is_ascii_digit())
+                        && pad.len() == 64
+                        && pad.bytes().all(|b| b == padding)
+                })
+            }
             _ => false,
         };
         assert!(
