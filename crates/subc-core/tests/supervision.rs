@@ -1066,6 +1066,71 @@ async fn child_stdout_and_stderr_reach_the_capture_file_while_only_stderr_reache
     assert_eq!(ring_lines, ["stderr-complete-line"]);
 }
 
+/// The two lines above arrive one after the other, so they cannot tear however
+/// the forwarder is written: that test proves DELIVERY. Tearing needs both pipes
+/// writing at once, which is the shape a supervisor merging stdout and stderr
+/// into one file actually meets, so the framing property needs its own arm.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_child_pipes_never_tear_a_line_in_the_capture_file() {
+    const BURST: usize = 150;
+    let server = TestServer::start().await;
+    let capture = TestTempDir::new("child-output-burst");
+    let logs_dir = capture.join("logs");
+    let supervisor =
+        supervisor(&server, 0, Duration::from_millis(10)).with_capture_logs_dir(&logs_dir);
+    let module = supervisor
+        .spawn(ModuleSpec {
+            module_id: "two-pipe-burst".to_string(),
+            program: PathBuf::from(env!("CARGO_BIN_EXE_log-child-fixture")),
+            args: Vec::new(),
+            env: vec![("LOG_CHILD_BURST".to_string(), BURST.to_string())],
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+        })
+        .unwrap();
+
+    let capture_path = logs_dir.join("two-pipe-burst.stderr.log");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let contents = loop {
+        if let Ok(contents) = std::fs::read_to_string(&capture_path) {
+            if contents.lines().count() >= BURST * 2 {
+                break contents;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "capture file never received {} lines from the two pipes",
+            BURST * 2
+        );
+        sleep(Duration::from_millis(20)).await;
+    };
+
+    for line in contents.lines() {
+        // A whole line is `<lane>-<4 digits>-` followed by 64 identical
+        // padding characters; any split leaves a short line or two prefixes in
+        // one. Checked structurally rather than by counting characters, since
+        // the lane names themselves contain the padding letters.
+        let intact = match line.split_once('-') {
+            Some(("out", rest)) => rest.strip_prefix(&format!("{:04}-", &rest[..4].parse::<usize>().unwrap_or(usize::MAX)))
+                .is_some_and(|pad| pad.len() == 64 && pad.bytes().all(|b| b == b'o')),
+            Some(("err", rest)) => rest.strip_prefix(&format!("{:04}-", &rest[..4].parse::<usize>().unwrap_or(usize::MAX)))
+                .is_some_and(|pad| pad.len() == 64 && pad.bytes().all(|b| b == b'e')),
+            _ => false,
+        };
+        assert!(
+            intact,
+            "a torn line proves the forwarder split a write between the two pipes: {line:?}"
+        );
+    }
+    assert_eq!(
+        contents.lines().count(),
+        BURST * 2,
+        "every line from both pipes must arrive exactly once"
+    );
+
+    module.stop().await.unwrap();
+}
+
 async fn wait_for_tail(
     module: &SupervisedModule,
     wait: Duration,
