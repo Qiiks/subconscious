@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# Place a staged module binary with every gate arm that has caught a real defect.
+#
+# Each arm exists because it failed once, and each failure was a TRUE statement about
+# the wrong object rather than a missing check:
+#   which          a --version read from the file you placed is true about that file,
+#                  while PATH resolves an older one the operator actually runs
+#                  (ck-models, 2026-09-14: new CLI on disk at a path nothing resolves).
+#   sidecar verify a rollback nobody can verify is not a rollback, and an incident is
+#                  the wrong moment to find the sidecar was written for another file.
+#   marker + control  a discriminator that reads 0/0 proves nothing (it may have been
+#                  dead-code-eliminated); a control that reads 1/1 proves the reader works.
+#   inode          proc-vs-disk is the only proof the restarted process runs these bytes;
+#                  `cp` in place preserves the inode and makes the check a tautology,
+#                  so placement is always copy-to-tmp then atomic mv.
+#   warm-exec      macOS first-exec assessment is per-inode and does not transfer from
+#                  the staging path, so it must run on the destination before the restart.
+#
+# Usage:
+#   place-module.sh --module <id> --staged <path> [--dest <path>] [--path-face <name>]
+#                   --marker <string> [--control <string>] [--no-restart]
+#
+# Refuses (exit 2) before touching the destination if any pre-arm fails.
+set -euo pipefail
+
+STAGING="${CK_STAGING:-$HOME/.local/share/cortexkit/staging}"
+BIN_DIR="${CK_BIN_DIR:-$HOME/.local/share/cortexkit/bin}"
+MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; RESTART=1
+
+while (($# > 0)); do
+  case "$1" in
+    --module) MODULE="$2"; shift 2 ;;
+    --staged) STAGED="$2"; shift 2 ;;
+    --dest) DEST="$2"; shift 2 ;;
+    --path-face) PATH_FACE="$2"; shift 2 ;;
+    --marker) MARKER="$2"; shift 2 ;;
+    --control) CONTROL="$2"; shift 2 ;;
+    --no-restart) RESTART=0; shift ;;
+    *) echo "refusal: unknown argument '$1'" >&2; exit 2 ;;
+  esac
+done
+
+[ -n "$MODULE" ] || { echo "refusal: --module is required" >&2; exit 2; }
+[ -n "$STAGED" ] || { echo "refusal: --staged is required" >&2; exit 2; }
+[ -n "$MARKER" ] || { echo "refusal: --marker is required (a discriminator that separates this build from the running one)" >&2; exit 2; }
+DEST="${DEST:-$BIN_DIR/ck-$MODULE}"
+[ -f "$STAGED" ] || { echo "refusal: staged artifact not found: $STAGED" >&2; exit 2; }
+[ -f "$DEST" ] || { echo "refusal: destination does not exist, so this is an install rather than a placement: $DEST" >&2; exit 2; }
+
+say() { printf '%s\n' "$*"; }
+refuse() { printf 'REFUSED: %s\n' "$*" >&2; exit 2; }
+
+say "=== gate"
+
+# Staged sidecar, verified the way a consumer verifies it.
+staged_dir=$(cd "$(dirname "$STAGED")" && pwd); staged_base=$(basename "$STAGED")
+sidecar=""
+for cand in "$staged_base.sha256.postsign" "$staged_base.sha256"; do
+  [ -f "$staged_dir/$cand" ] && { sidecar="$cand"; break; }
+done
+[ -n "$sidecar" ] || refuse "no sidecar beside the staged artifact (bare-binary staging directories are refused)"
+(cd "$staged_dir" && shasum -c "$sidecar" >/dev/null 2>&1) || refuse "staged sidecar does not verify its own artifact: $sidecar"
+say "staged sidecar $sidecar: OK"
+
+# Signing posture must match the running image: an ad-hoc re-sign of a Developer ID
+# binary silently revokes its macOS TCC grants, and the reverse is a surprise too.
+if command -v codesign >/dev/null; then
+  staged_sig=$(codesign -dvv "$STAGED" 2>&1 | grep -E '^(Signature|Authority)=' | head -1 || true)
+  live_sig=$(codesign -dvv "$DEST" 2>&1 | grep -E '^(Signature|Authority)=' | head -1 || true)
+  [ "$staged_sig" = "$live_sig" ] || refuse "signing posture differs: staged [$staged_sig] vs running [$live_sig]"
+  say "signing posture: $staged_sig (matches running)"
+fi
+
+# Marker differential. A marker that reads 0 on the staged file proves nothing about
+# this build; a control that does not read on both proves the reader is broken.
+m_staged=$(strings "$STAGED" | grep -cF "$MARKER" || true)
+m_live=$(strings "$DEST" | grep -cF "$MARKER" || true)
+say "marker str:\"$MARKER\" staged $m_staged / live $m_live"
+[ "$m_staged" -gt 0 ] || refuse "marker absent from the staged artifact: it may have been dead-code-eliminated, so it cannot discriminate"
+[ "$m_live" -eq 0 ] || refuse "marker also present in the running image: it does not separate the two builds"
+if [ -n "$CONTROL" ]; then
+  c_staged=$(strings "$STAGED" | grep -cF "$CONTROL" || true)
+  c_live=$(strings "$DEST" | grep -cF "$CONTROL" || true)
+  say "control str:\"$CONTROL\" staged $c_staged / live $c_live"
+  { [ "$c_staged" -gt 0 ] && [ "$c_live" -gt 0 ]; } || refuse "control must read on BOTH images, else the marker's 0 is uninformative"
+fi
+
+say "=== rollback"
+ts=$(date -u +%Y%m%dT%H%M%SZ)
+rb="$STAGING/ck-$MODULE.rollback-$ts"
+mkdir -p "$STAGING"
+cp "$DEST" "$rb"
+(cd "$STAGING" && shasum -a 256 "$(basename "$rb")" > "$(basename "$rb").sha256")
+(cd "$STAGING" && shasum -c "$(basename "$rb").sha256" >/dev/null 2>&1) \
+  || refuse "rollback sidecar does not verify its own snapshot; nothing has been placed"
+say "rollback $(basename "$rb") verified, holds: $("$rb" --version 2>&1 | head -1)"
+
+say "=== place"
+cp "$STAGED" "$DEST.tmp" && mv "$DEST.tmp" "$DEST"
+say "placed sha $(shasum -a 256 "$DEST" | cut -c1-8)"
+say "warm-exec at destination: $("$DEST" --version 2>&1 | head -1)"
+
+# PATH face: the operator may invoke this by name, and that resolution is what decides
+# which bytes run — not the path we just wrote.
+if [ -n "$PATH_FACE" ]; then
+  resolved=$(command -v "$PATH_FACE" || true)
+  if [ -z "$resolved" ]; then
+    say "which $PATH_FACE: not on PATH -- nothing resolves it by name"
+  elif [ "$(shasum -a 256 "$resolved" | cut -d' ' -f1)" = "$(shasum -a 256 "$DEST" | cut -d' ' -f1)" ]; then
+    say "which $PATH_FACE: $resolved (same bytes as the placed file)"
+  else
+    say "WARNING: $PATH_FACE resolves to $resolved, which is NOT the file just placed."
+    say "         An operator invoking it by name runs something other than what was verified."
+    say "         Place it there too, or say why the divergence is intended."
+  fi
+fi
+
+if [ "$RESTART" -eq 1 ]; then
+  say "=== restart"
+  ck module restart "$MODULE" 2>&1 | tail -1
+  say "$(date -u +%FT%TZ) restart initiated -- verify on a lane opened AFTER this point:"
+  say "  ck module status $MODULE   # then inode proc-vs-disk, which is the only proof it runs these bytes"
+fi
