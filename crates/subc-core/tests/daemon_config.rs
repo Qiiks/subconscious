@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -12,9 +13,9 @@ use subc_control::{
 };
 use subc_core::{
     bootstrap::{run_with_config, run_with_daemon_config_path, BootstrapConfig},
-    read_frame,
+    daemon_config, read_frame,
     test_support::TestTempDir,
-    write_frame, Frame,
+    write_frame, Frame, Registry, RestartPolicy, Supervisor,
 };
 use subc_protocol::{
     manifest::ModuleManifest, BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloBody, Priority,
@@ -77,6 +78,55 @@ impl Drop for RunningDaemon {
         // The temp dir is owned by the `TestTempDir` guard, whose `Drop` removes
         // the tree (or preserves it on panic).
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configured_ck_log_is_present_in_the_spawned_child_and_unconfigured_is_absent() {
+    let temp = unique_temp_dir("logging-env-spawn");
+    let configured_env = temp.join("configured-env.txt");
+    let absent_env = temp.join("absent-env.txt");
+    let config_path = temp.join("subc.jsonc");
+    let program = env!("CARGO_BIN_EXE_log-child-fixture");
+    fs::write(
+        &config_path,
+        serde_json::to_string(&json!({
+            "version": 1,
+            "modules": {
+                "configured-log": {
+                    "program": program,
+                    "env": { "LOG_CHILD_ENV_PATH": configured_env },
+                    "log": { "level": "warn", "tags": { "perf": "debug" } }
+                },
+                "absent-log": {
+                    "program": program,
+                    "env": { "LOG_CHILD_ENV_PATH": absent_env }
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let config = daemon_config::load(&config_path).unwrap().unwrap();
+    let supervisor = Supervisor::new(
+        Arc::new(Registry::default()),
+        RestartPolicy::new(0, Duration::from_millis(1)),
+    );
+    let modules = config
+        .modules
+        .iter()
+        .map(|configured| supervisor.spawn(configured.module_spec()).unwrap())
+        .collect::<Vec<_>>();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while (!configured_env.exists() || !absent_env.exists()) && Instant::now() < deadline {
+        sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        fs::read_to_string(configured_env).unwrap(),
+        "present:warn,perf=debug"
+    );
+    assert_eq!(fs::read_to_string(absent_env).unwrap(), "absent");
+    drop(modules);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
