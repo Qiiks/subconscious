@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod scripted_daemon;
+
 use std::{
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},

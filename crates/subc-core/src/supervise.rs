@@ -466,6 +466,12 @@ pub struct ModuleStatus {
     /// the same reason they are carried together: "2 of 3" means one thing for a
     /// ten-minute window and something else entirely for a lifetime.
     pub restart_window: Duration,
+    /// Effective drain and restart timing policy used by this running module.
+    /// These values are carried together with the restart budget so status
+    /// readers can compare configured intent with what the supervisor applied.
+    pub drain_timeout: Duration,
+    pub restart_backoff: Duration,
+    pub restart_max_backoff: Duration,
     pub pid: Option<u32>,
     pub spawned_at_ms: Option<u64>,
     pub spawned_from: Option<PathBuf>,
@@ -645,6 +651,9 @@ struct SupervisorRuntimeConfig {
     /// This module's RESOLVED drain budget: per-module config when present,
     /// else `default_drain_timeout`.
     drain_timeout: Duration,
+    /// Shared with the status handle so the attested value changes atomically
+    /// when a rescan updates the running drain policy.
+    effective_drain_timeout: Arc<Mutex<Duration>>,
     /// The supervisor-wide fallback, kept so a configuration update that
     /// REMOVES the per-module override can re-resolve to it.
     default_drain_timeout: Duration,
@@ -1174,6 +1183,10 @@ impl Supervisor {
         runtime.restart_policy = restart_policy;
         if let Some(ms) = drain_timeout_ms {
             runtime.drain_timeout = Duration::from_millis(ms);
+            *runtime
+                .effective_drain_timeout
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = runtime.drain_timeout;
         }
         if !enabled {
             let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::disabled()));
@@ -1219,6 +1232,7 @@ impl Supervisor {
         SupervisorRuntimeConfig {
             restart_policy: self.restart_policy,
             drain_timeout: self.drain_timeout,
+            effective_drain_timeout: Arc::new(Mutex::new(self.drain_timeout)),
             default_drain_timeout: self.drain_timeout,
             health: self.health,
             connection_file_path: self.connection_file_path.clone(),
@@ -1251,6 +1265,7 @@ impl Supervisor {
         // the supervisor-wide one; status must report the budget the supervise
         // loop actually enforces.
         let restart_policy = runtime.restart_policy;
+        let effective_drain_timeout = Arc::clone(&runtime.effective_drain_timeout);
         let (tx, rx) = mpsc::channel(4);
         let monitor = tokio::spawn(supervise_loop(
             spec.clone(),
@@ -1274,6 +1289,7 @@ impl Supervisor {
                 commands: tx,
                 monitor: Mutex::new(Some(monitor)),
                 restart_policy,
+                effective_drain_timeout,
                 provenance_probe: self.provenance_probe.clone(),
             }),
         };
@@ -1310,6 +1326,7 @@ struct SupervisedModuleInner {
     /// report the restart budget without reaching back into the supervisor. The
     /// policy is fixed for the process's lifetime, so a copy cannot drift.
     restart_policy: RestartPolicy,
+    effective_drain_timeout: Arc<Mutex<Duration>>,
     provenance_probe: ExecutableIdentityProbe,
 }
 
@@ -1419,6 +1436,11 @@ impl SupervisedModule {
             guard.crash_restarts_in_window(self.inner.restart_policy.window, Instant::now());
         let snapshot = guard.clone();
         drop(guard);
+        let drain_timeout = *self.inner.effective_drain_timeout.lock().map_err(|_| {
+            SuperviseError::StatePoisoned {
+                module_id: Some(self.inner.module_id.clone()),
+            }
+        })?;
         let registration_active = self
             .inner
             .registry
@@ -1441,6 +1463,9 @@ impl SupervisedModule {
             lifetime_restarts: snapshot.lifetime_restarts,
             max_restarts: self.inner.restart_policy.max_restarts,
             restart_window: self.inner.restart_policy.window,
+            drain_timeout,
+            restart_backoff: self.inner.restart_policy.backoff,
+            restart_max_backoff: self.inner.restart_policy.max_backoff,
             pid: snapshot.pid,
             spawned_at_ms: snapshot.spawned_at_ms,
             spawned_from: snapshot.spawned_from,
@@ -3116,6 +3141,10 @@ async fn handle_supervisor_command(
             runtime.drain_timeout = drain_timeout_ms
                 .map(Duration::from_millis)
                 .unwrap_or(runtime.default_drain_timeout);
+            *runtime
+                .effective_drain_timeout
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = runtime.drain_timeout;
             let _ = reply.send(());
             true
         }

@@ -122,6 +122,37 @@ async fn config_spawns_supervises_registers_and_routes_stub_module() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervisor_list_reports_effective_policy_from_running_config() {
+    let module_id = "reported-running-policy";
+    let mut configured = stub_module(module_id, true, []);
+    let configured = configured.as_object_mut().unwrap();
+    configured.insert("drain_timeout_ms".to_string(), json!(4_321));
+    configured.insert(
+        "restart".to_string(),
+        json!({
+            "backoff_ms": 257,
+            "max_backoff_ms": 9_876
+        }),
+    );
+    let daemon = RunningDaemon::start(
+        "daemon-reported-running-policy",
+        Some(config_doc([Value::Object(configured.clone())])),
+    )
+    .await;
+
+    let entry = wait_for_supervisor_entry(
+        &daemon.connection_file_path,
+        module_id,
+        |_| true,
+        STATE_TIMEOUT,
+    )
+    .await;
+    assert_eq!(entry.drain_timeout_ms, Some(4_321));
+    assert_eq!(entry.restart_backoff_ms, Some(257));
+    assert_eq!(entry.restart_max_backoff_ms, Some(9_876));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn disabled_configured_module_is_listed_then_enable_spawns_and_registers() {
     let module_id = "disabled-aft";
     let daemon = RunningDaemon::start(

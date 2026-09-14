@@ -1,4 +1,5 @@
 {
+  "drain_timeout_ms": 4321,
   "enabled": true,
   "health": "degraded",
   "last_exit_ms": 1700000000123,
@@ -6,7 +7,9 @@
   "live": true,
   "max_restarts": 3,
   "module_id": "aft-tools",
+  "restart_backoff_ms": 257,
   "restart_count": 2,
+  "restart_max_backoff_ms": 9876,
   "restart_window_secs": 600,
   "state": "running"
 }
