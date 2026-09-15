@@ -73,16 +73,37 @@ fi
 
 # Marker differential. A marker that reads 0 on the staged file proves nothing about
 # this build; a control that does not read on both proves the reader is broken.
-m_staged=$(strings "$STAGED" | grep -cF "$MARKER" || true)
-m_live=$(strings "$DEST" | grep -cF "$MARKER" || true)
-say "marker str:\"$MARKER\" staged $m_staged / live $m_live"
-[ "$m_staged" -gt 0 ] || refuse "marker absent from the staged artifact: it may have been dead-code-eliminated, so it cannot discriminate"
-[ "$m_live" -eq 0 ] || refuse "marker also present in the running image: it does not separate the two builds"
+#
+# BOTH TABLES ARE READ, and the table is named in every line, because A MARKER COUNT
+# IS SILENTLY READER-RELATIVE WITHOUT IT. A control-flow-only change adds no string
+# literal, so `strings` cannot see it at all and reports a truthful 0 that means
+# "wrong reader", not "wrong build" -- while a message literal is invisible to `nm`.
+# Reading one table and reporting a bare count is how a valid placement gets refused
+# and how an invalid one gets waved through; the pair plus the table name is decidable.
+count_in() {  # count_in <table> <file> <needle>
+  case "$1" in
+    nm) nm -a "$2" 2>/dev/null | grep -cF "$3" || true ;;
+    *)  strings "$2" | grep -cF "$3" || true ;;
+  esac
+}
+marker_table=""
+for t in strings nm; do
+  ms=$(count_in "$t" "$STAGED" "$MARKER")
+  ml=$(count_in "$t" "$DEST" "$MARKER")
+  say "marker $t:\"$MARKER\" staged $ms / live $ml"
+  if [ "$ms" -gt 0 ] && [ "$ml" -eq 0 ]; then marker_table="$t"; fi
+  if [ "$ms" -gt 0 ] && [ "$ml" -gt 0 ]; then
+    refuse "marker reads on BOTH images in the $t table: it does not separate the two builds"
+  fi
+done
+[ -n "$marker_table" ] || refuse "marker discriminates in NEITHER table: absent from the staged artifact (dead-code-eliminated, or a phrase from a comment, or a string belonging to a different binary)"
+say "marker discriminates in the $marker_table table"
 if [ -n "$CONTROL" ]; then
-  c_staged=$(strings "$STAGED" | grep -cF "$CONTROL" || true)
-  c_live=$(strings "$DEST" | grep -cF "$CONTROL" || true)
-  say "control str:\"$CONTROL\" staged $c_staged / live $c_live"
-  { [ "$c_staged" -gt 0 ] && [ "$c_live" -gt 0 ]; } || refuse "control must read on BOTH images, else the marker's 0 is uninformative"
+  c_staged=$(count_in "$marker_table" "$STAGED" "$CONTROL")
+  c_live=$(count_in "$marker_table" "$DEST" "$CONTROL")
+  say "control $marker_table:\"$CONTROL\" staged $c_staged / live $c_live"
+  { [ "$c_staged" -gt 0 ] && [ "$c_live" -gt 0 ]; } \
+    || refuse "control must read on BOTH images in the SAME table the marker used, else the marker's count is uninformative"
 fi
 
 say "=== rollback"
