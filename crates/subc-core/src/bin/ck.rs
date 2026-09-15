@@ -57,7 +57,8 @@ const CK_BUILD_SHAPE: &str = "test-support: off";
 // production baseline data; then calibrate whether every window minute is needed.
 const FRAME_DROP_ALERT_REQUIRED_NONZERO_MINUTES: u64 = 10;
 
-const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  setup     plan and apply the managed CortexKit installation\n  upgrade   plan managed component upgrades\n  module    supervised modules: list, status, stderr, terminals, restart, stop, start, rescan, release\n  routes    live consumers for one module or the whole daemon\n  provenance daemon-attested and module-declared build/process facts\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, connection info, offline triage, and CI lint";
+const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  setup     plan and apply the managed CortexKit installation\n  upgrade   plan managed component upgrades\n  module    supervised modules: list, status, stderr, terminals, restart, stop, start, rescan, release\n  catalog   what is registered on the wire (not the supervised roster)
+  routes    live consumers for one module or the whole daemon\n  provenance daemon-attested and module-declared build/process facts\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, connection info, offline triage, and CI lint";
 
 const TOP_HELP_TAIL: &str = "flags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n  --verbose       include diagnostic detail and complete metrics\n\nrun 'ck <domain>' with no verb to see that domain's commands";
 
@@ -352,6 +353,8 @@ const MODULE_HELP: &str = "ck module — inspect and control supervised modules\
     --lane <source>         select module, stderr, daemon, or a harness lane
   ck module stderr <id>     retained stderr for a module (-n <count> to limit)\n  ck module terminals <id>  retained terminal exits for a module\n  ck module restart <id>    drain-restart a module\n    --now                   restart without waiting for in-flight requests\n    --drain-ms <n>          wait up to <n> ms for in-flight requests (this restart only)\n  ck module stop <id>       disable and stop a module (persists until start)\n  ck module start <id>      enable and spawn a module\n  ck module rescan          re-read subc.jsonc and reconcile the module set\n  ck module rescan --dry-run  show what a rescan would change, without changing it\n  ck module release <id>    forget a removed module's reserved id so another module may use it\n\nexit codes:\n  1  operation refused or failed (including read-only timeout)\n  4  mutating operation timed out; outcome unknown, verify before retrying";
 
+const CATALOG_HELP: &str = "ck catalog — what is registered with the daemon right now\n\nusage: ck [--json] catalog [<module-id>]\n\n  ck catalog         every module registered on the wire\n  ck catalog <id>    one module, exit 1 if it is not registered\n\nThis is the REGISTRY, not the supervisor roster: a module that connected and\nregistered itself appears here even though the daemon did not spawn it, so\n'ck module list' will not show it. Harnesses waiting for a module to come up\nshould poll this.";
+
 const ROUTES_HELP: &str = "ck routes — inspect live route consumers\n\nusage: ck [--json] routes [<module-id>]\n\n  ck routes          live consumers for every connected module\n  ck routes <id>     live consumers for one connected module";
 
 const PROVENANCE_HELP: &str = "ck provenance — inspect source-tagged module provenance\n\nusage: ck [--json] [--verbose] provenance <module-id>\n\n  ck provenance <id>  daemon-attested process facts beside module declarations";
@@ -511,6 +514,9 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
         }
         Command::Routes { module_id } => {
             supervisor_routes(&mut client, module_id.as_deref(), args.json).await
+        }
+        Command::Catalog { module_id } => {
+            catalog_report(&mut client, module_id.as_deref(), args.json).await
         }
         Command::Provenance { module_id } => {
             provenance(&mut client, &module_id, args.json, args.verbose).await
@@ -991,6 +997,9 @@ enum Command {
     },
     Module(ModuleCommand),
     Routes {
+        module_id: Option<String>,
+    },
+    Catalog {
         module_id: Option<String>,
     },
     Provenance {
@@ -2408,6 +2417,66 @@ async fn module_set_enabled(
         )
         .await?;
     print_ack_with_state(client, module_id, ack, verb, json_output).await
+}
+
+/// `ck catalog` — the REGISTRY, which is a different question from the supervisor
+/// roster that `ck module list` answers.
+///
+/// A module that connects and registers itself over the wire is in the catalog and
+/// is NOT in the roster, because the roster lists what the daemon spawned. Hermetic
+/// test harnesses run exactly that shape, and before this verb existed the only way
+/// to ask "is my module registered" from a shell was to grep the daemon's log — a
+/// coupling to log format that broke a consumer's whole lane when the daemon stopped
+/// writing to stdout. This is the same fact as a versioned wire call.
+///
+/// Naming one module exits 1 when it is absent, so a harness can poll it directly
+/// without parsing anything.
+async fn catalog_report(
+    client: &mut CkClient,
+    module_id: Option<&str>,
+    json_output: bool,
+) -> Result<(), CkError> {
+    let entries = client.catalog_list().await?;
+    let selected: Vec<_> = match module_id {
+        Some(wanted) => entries
+            .iter()
+            .filter(|entry| entry.module_id == wanted)
+            .collect(),
+        None => entries.iter().collect(),
+    };
+
+    if json_output {
+        let value = serde_json::to_value(&selected).map_err(|error| {
+            CkError::Message(format!("could not render catalog as JSON: {error}"))
+        })?;
+        print_json(&value)?;
+    } else if selected.is_empty() {
+        match module_id {
+            Some(wanted) => println!("{wanted} is not registered"),
+            None => println!("no modules registered"),
+        }
+    } else {
+        let mut rows = Vec::new();
+        for entry in &selected {
+            rows.push(vec![
+                entry.module_id.clone(),
+                entry
+                    .module_version
+                    .clone()
+                    .unwrap_or_else(|| "-".to_string()),
+                entry.roles.len().to_string(),
+            ]);
+        }
+        print_table(&["module", "version", "roles"], rows);
+    }
+
+    // A named module that is absent exits non-zero so a harness can poll this verb
+    // directly -- `until ck catalog my-module; do sleep 1; done` -- instead of
+    // parsing output or grepping a log.
+    if module_id.is_some() && selected.is_empty() {
+        return Err(CkError::RenderedExit { exit_code: 1 });
+    }
+    Ok(())
 }
 
 async fn supervisor_routes(
@@ -6336,6 +6405,7 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
                 Some("upgrade") => UPGRADE_HELP.into(),
                 Some("module") => MODULE_HELP.into(),
                 Some("routes") => ROUTES_HELP.into(),
+                Some("catalog") => CATALOG_HELP.into(),
                 Some("provenance") => PROVENANCE_HELP.into(),
                 Some("quota") => QUOTA_HELP.into(),
                 Some("health") => HEALTH_HELP.into(),
@@ -6446,6 +6516,25 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
                     })
                 }
                 _ => Ok(Command::Help(ROUTES_HELP.into())),
+            }
+        }
+        "catalog" => {
+            let positional = tail
+                .iter()
+                .filter(|argument| argument.as_os_str() != "--verbose")
+                .collect::<Vec<_>>();
+            match positional.as_slice() {
+                [] => Ok(Command::Catalog { module_id: None }),
+                [module_id]
+                    if module_id.as_os_str() != "-h"
+                        && module_id.as_os_str() != "--help"
+                        && module_id.as_os_str() != "help" =>
+                {
+                    Ok(Command::Catalog {
+                        module_id: Some(module_id.to_string_lossy().into_owned()),
+                    })
+                }
+                _ => Ok(Command::Help(CATALOG_HELP.into())),
             }
         }
         "provenance" => {
@@ -7813,6 +7902,36 @@ mod tests {
             Command::Module(ModuleCommand::ReleaseReserved { module_id }) if module_id == "vault"
         ));
         assert!(MODULE_HELP.contains("ck module release <id>"));
+    }
+
+    /// The verb exists because the ROSTER and the REGISTRY answer different
+    /// questions and only the roster had a verb: a self-registered module is in the
+    /// catalog and never in the roster, so a harness asking "is it up" through
+    /// `ck module list` gets a truthful no forever.
+    #[test]
+    fn catalog_command_accepts_an_optional_module_id_and_documents_the_distinction() {
+        let all = parse_command("catalog", &[]).unwrap();
+        assert!(matches!(all, Command::Catalog { module_id: None }));
+
+        let one = parse_command("catalog", &[OsString::from("aft")]).unwrap();
+        assert!(matches!(
+            one,
+            Command::Catalog { module_id: Some(module_id) } if module_id == "aft"
+        ));
+
+        let help = parse_command("catalog", &[OsString::from("--help")]).unwrap();
+        assert!(matches!(help, Command::Help(_)));
+
+        // The help must say WHICH question this answers, because the only way a
+        // consumer learned the roster was the wrong surface was by being told.
+        assert!(
+            CATALOG_HELP.contains("not the supervisor roster"),
+            "catalog help must distinguish itself from the roster: {CATALOG_HELP}"
+        );
+        assert!(
+            CATALOG_HELP.contains("exit 1 if it is not registered"),
+            "the poll-friendly exit code is the reason a harness can use this without parsing"
+        );
     }
 
     #[test]
