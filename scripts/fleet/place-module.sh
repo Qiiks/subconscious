@@ -21,11 +21,16 @@
 #                   --marker <string> [--control <string>] [--no-restart]
 #
 # Refuses (exit 2) before touching the destination if any pre-arm fails.
+#
+# MUTATION REQUIRES --place. The default runs every arm and stops before the first
+# side effect, because a tool that places by DEFAULT is one distracted invocation
+# from placing when you meant to test it -- which happened on 2026-09-15. The
+# default should be the one that is safe to be wrong about.
 set -euo pipefail
 
 STAGING="${CK_STAGING:-$HOME/.local/share/cortexkit/staging}"
 BIN_DIR="${CK_BIN_DIR:-$HOME/.local/share/cortexkit/bin}"
-MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; GONE=""; RESTART=1; CHECK_ONLY=0
+MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; GONE=""; RESTART=1; PLACE=0
 
 while (($# > 0)); do
   case "$1" in
@@ -36,7 +41,8 @@ while (($# > 0)); do
     --marker) MARKER="$2"; shift 2 ;;
     --control) CONTROL="$2"; shift 2 ;;
     --gone) GONE="$2"; shift 2 ;;
-    --check-only) CHECK_ONLY=1; shift ;;
+    --place) PLACE=1; shift ;;
+    --check-only) shift ;;  # now the default; accepted so older call sites keep working
     --no-restart) RESTART=0; shift ;;
     *) echo "refusal: unknown argument '$1'" >&2; exit 2 ;;
   esac
@@ -132,8 +138,8 @@ fi
 # window on 2026-09-15, while the author was attending to the arm's logic and not to
 # what the script does after the arms pass. Remembering that it places is exactly the
 # thing that failed.
-if [ "$CHECK_ONLY" = "1" ]; then
-  say "=== check-only: all arms evaluated, NOTHING placed and NOTHING restarted"
+if [ "$PLACE" != "1" ]; then
+  say "=== arms evaluated, NOTHING placed and NOTHING restarted (pass --place to mutate)"
   exit 0
 fi
 
