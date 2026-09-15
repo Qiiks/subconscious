@@ -25,7 +25,7 @@ set -euo pipefail
 
 STAGING="${CK_STAGING:-$HOME/.local/share/cortexkit/staging}"
 BIN_DIR="${CK_BIN_DIR:-$HOME/.local/share/cortexkit/bin}"
-MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; RESTART=1
+MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; GONE=""; RESTART=1; CHECK_ONLY=0
 
 while (($# > 0)); do
   case "$1" in
@@ -35,6 +35,8 @@ while (($# > 0)); do
     --path-face) PATH_FACE="$2"; shift 2 ;;
     --marker) MARKER="$2"; shift 2 ;;
     --control) CONTROL="$2"; shift 2 ;;
+    --gone) GONE="$2"; shift 2 ;;
+    --check-only) CHECK_ONLY=1; shift ;;
     --no-restart) RESTART=0; shift ;;
     *) echo "refusal: unknown argument '$1'" >&2; exit 2 ;;
   esac
@@ -104,6 +106,35 @@ if [ -n "$CONTROL" ]; then
   say "control $marker_table:\"$CONTROL\" staged $c_staged / live $c_live"
   { [ "$c_staged" -gt 0 ] && [ "$c_live" -gt 0 ]; } \
     || refuse "control must read on BOTH images in the SAME table the marker used, else the marker's count is uninformative"
+fi
+
+# --gone asserts a REMOVAL, which is the inverse of a marker: a marker asks "did the
+# new thing arrive", this asks "did the old thing leave". A bare "expect 0" is
+# unfalsifiable -- it passes when the field is gone, when the reader is broken, and
+# when the caller typos the string. THE DEPLOYED 1 IS WHAT MAKES THE STAGED 0 MEAN
+# SOMETHING: same reader, same needle, one artifact answering each way.
+if [ -n "$GONE" ]; then
+  for t in strings nm; do
+    gs=$(count_in "$t" "$STAGED" "$GONE")
+    gl=$(count_in "$t" "$DEST" "$GONE")
+    [ "$gl" -gt 0 ] || continue
+    say "gone $t:\"$GONE\" staged $gs / live $gl"
+    [ "$gs" -eq 0 ] || refuse "\"$GONE\" still reads $gs in the staged artifact: the removal did not land"
+    gone_seen=1
+  done
+  [ "${gone_seen:-0}" = "1" ] \
+    || refuse "\"$GONE\" is absent from the RUNNING image in both tables, so its absence from the staged one proves nothing (no positive control)"
+fi
+
+# A GATE WITH SIDE EFFECTS MUST BE EXERCISABLE WITHOUT THEM. Every arm above is a
+# read; everything below mutates. Without this split the only way to test a new arm
+# is to place a binary -- which is how 0.3.92 reached production outside its quiet
+# window on 2026-09-15, while the author was attending to the arm's logic and not to
+# what the script does after the arms pass. Remembering that it places is exactly the
+# thing that failed.
+if [ "$CHECK_ONLY" = "1" ]; then
+  say "=== check-only: all arms evaluated, NOTHING placed and NOTHING restarted"
+  exit 0
 fi
 
 say "=== rollback"
