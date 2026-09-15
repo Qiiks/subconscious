@@ -293,7 +293,74 @@ extension AskModelsTests {
         XCTAssertNil(ask.thread?[0].attachmentIndexes)
     }
 
-    /// `who` is an open string by producer contract. A speaker value no current
+    /// THE SHAPE THAT BLANKED THE PHONE: an artifact pointer carries `artifactID`
+    /// and NO `index`. With index required, one such element threw
+    /// keyNotFound('index') and took the whole ask -- and the app's list with it.
+    /// Measured against the live store at the time: every attachment on the wire was
+    /// this shape, and the operator saw zero of 24 pending asks.
+    func testDecodesArtifactPointerAttachmentWithoutIndex() throws {
+        let data = try JSONSerialization.data(withJSONObject: [
+            "requestID": "ask_ptr", "question": "Approve?", "askedAt": 1_700_000_000_000,
+            "attachments": [
+                ["artifactID": "art_9f2", "title": "review.md", "mime": "text/markdown", "byteCount": 4_096, "sealed": false],
+            ],
+        ])
+        let ask = try JSONDecoder().decode(AskRequest.self, from: data)
+        let attachment = try XCTUnwrap(ask.attachments?.first)
+        XCTAssertEqual(attachment.artifactID, "art_9f2")
+        XCTAssertNil(attachment.index, "a pointer must NOT be given a synthetic index: it would occupy the ordinal space thread attachmentIndexes joins against")
+        XCTAssertEqual(attachment.title, "review.md")
+        XCTAssertEqual(attachment.sealed, false)
+    }
+
+    /// Both identities on one ask, which is the mixed state the producer can emit
+    /// once inline attachments return: the inline element keeps its ordinal and the
+    /// pointer keeps its id, with no collision between them.
+    func testDecodesMixedInlineAndPointerAttachments() throws {
+        let data = try JSONSerialization.data(withJSONObject: [
+            "requestID": "ask_mix", "question": "Approve?", "askedAt": 1_700_000_000_000,
+            "attachments": [
+                ["index": 0, "title": "diff.patch", "mime": "text/x-patch", "byteCount": 8_192],
+                ["artifactID": "art_7c1", "title": "log.txt", "mime": "text/plain"],
+            ],
+        ])
+        let ask = try JSONDecoder().decode(AskRequest.self, from: data)
+        XCTAssertEqual(ask.attachments?.count, 2)
+        XCTAssertEqual(ask.attachments?[0].index, 0)
+        XCTAssertNil(ask.attachments?[0].artifactID)
+        XCTAssertEqual(ask.attachments?[1].artifactID, "art_7c1")
+        XCTAssertNil(ask.attachments?[1].index)
+        XCTAssertNil(ask.attachments?[1].byteCount, "byteCount is nullable on the producer, so its absence is not an error")
+    }
+
+    /// An element carrying NEITHER identity decodes rather than throwing. It is
+    /// unfetchable and the caller can say so; a throw would take the ask, which is
+    /// the failure this whole change exists to remove.
+    func testAttachmentWithNoIdentityStillDecodes() throws {
+        let data = try JSONSerialization.data(withJSONObject: [
+            "requestID": "ask_none", "question": "Approve?", "askedAt": 1_700_000_000_000,
+            "attachments": [["title": "mystery", "mime": "application/octet-stream"]],
+        ])
+        let ask = try JSONDecoder().decode(AskRequest.self, from: data)
+        let attachment = try XCTUnwrap(ask.attachments?.first)
+        XCTAssertNil(attachment.index)
+        XCTAssertNil(attachment.artifactID)
+        XCTAssertEqual(attachment.title, "mystery")
+    }
+
+    /// A consumer that camel-cases a snake_case wire produces `artifactId`; the
+    /// board decoder had to learn the same lesson, so the ask decoder learns it
+    /// here rather than on the operator's phone.
+    func testDecodesArtifactIdUnderAlternateSpellings() throws {
+        for spelling in ["artifactID", "artifactId", "artifact_id"] {
+            let data = try JSONSerialization.data(withJSONObject: [
+                "requestID": "ask_\(spelling)", "question": "Approve?", "askedAt": 1_700_000_000_000,
+                "attachments": [[spelling: "art_abc", "title": "t", "mime": "text/plain"]],
+            ])
+            let ask = try JSONDecoder().decode(AskRequest.self, from: data)
+            XCTAssertEqual(ask.attachments?.first?.artifactID, "art_abc", "spelling \(spelling) must decode")
+        }
+    }// `who` is an open string by producer contract. A speaker value no current
     /// client knows must decode, not throw — an enum here would take the whole
     /// ask down with the first new speaker kind.
     func testUnknownThreadSpeakerDecodesAsPlainString() throws {

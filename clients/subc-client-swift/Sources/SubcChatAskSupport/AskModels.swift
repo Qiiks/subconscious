@@ -165,19 +165,77 @@ extension AskRequest: Hashable {
 
 /// One attachment descriptor on an ask. Pointer-only: content is fetched on demand
 /// via ask.attachment_content, never carried on the ask record or in pushes.
+///
+/// TWO IDENTITIES, EITHER ONE SUFFICIENT. An inline attachment carries `index`, a
+/// stable ordinal that `AskThreadEntry.attachmentIndexes` joins against and that the
+/// fetch uses as its key. An artifact pointer carries `artifactID` instead and no
+/// index at all, because a content-addressed pointer is identified by its artifact
+/// id; the producer's dispatch accepts either as the fetch key.
+///
+/// Both are optional and neither is synthesised. Minting an index for a pointer
+/// would occupy the ordinal space the thread joins against, so a pointer and a later
+/// inline attachment could claim the same index and a thread entry would resolve to
+/// the wrong evidence. An element carrying neither identity still decodes: it is
+/// unfetchable, which the caller can see and report, whereas a throw here takes the
+/// whole ask — and one ask took the entire list on the phone before this change.
+///
+/// `byteCount` is optional because the producer's own field is nullable.
 public struct AskAttachment: Codable, Equatable, Hashable {
-    public var index: Int
+    public var index: Int?
+    public var artifactID: String?
     public var title: String
     public var mime: String
-    public var byteCount: Int
+    public var byteCount: Int?
+    public var sealed: Bool?
 
-    public init(index: Int, title: String, mime: String, byteCount: Int) {
+    public init(
+        index: Int? = nil,
+        artifactID: String? = nil,
+        title: String,
+        mime: String,
+        byteCount: Int? = nil,
+        sealed: Bool? = nil
+    ) {
         self.index = index
+        self.artifactID = artifactID
         self.title = title
         self.mime = mime
         self.byteCount = byteCount
+        self.sealed = sealed
+    }
+
+    /// Hand-written so an element missing BOTH identities still decodes, and so the
+    /// artifact id is found whichever spelling reaches us: the producer writes
+    /// `artifactID`, and consumers that camel-case a snake_case wire produce
+    /// `artifactId`. Synthesised Codable would accept exactly one spelling and throw
+    /// on the others, and a throw here is not one bad attachment -- it is the whole
+    /// ask, and on the phone it was the whole list.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: AnyAskCodingKey.self)
+        func key(_ name: String) -> AnyAskCodingKey? { AnyAskCodingKey(stringValue: name) }
+        func string(_ names: [String]) -> String? {
+            for name in names {
+                if let k = key(name), let v = try? container.decode(String.self, forKey: k) { return v }
+            }
+            return nil
+        }
+        index = key("index").flatMap { try? container.decode(Int.self, forKey: $0) }
+        artifactID = string(["artifactID", "artifactId", "artifact_id"])
+        title = string(["title"]) ?? ""
+        mime = string(["mime"]) ?? ""
+        byteCount = key("byteCount").flatMap { try? container.decode(Int.self, forKey: $0) }
+            ?? key("byte_count").flatMap { try? container.decode(Int.self, forKey: $0) }
+        sealed = key("sealed").flatMap { try? container.decode(Bool.self, forKey: $0) }
     }
 }
+
+private struct AnyAskCodingKey: CodingKey {
+    var stringValue: String
+    var intValue: Int?
+    init?(stringValue: String) { self.stringValue = stringValue }
+    init?(intValue: Int) { self.stringValue = String(intValue); self.intValue = intValue }
+}
+
 
 /// One clarification-thread entry on an ask.
 ///
