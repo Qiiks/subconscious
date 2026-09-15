@@ -168,6 +168,22 @@ export interface RequestOptions {
   binary?: boolean;
   /** Called for each interim PUSH / StreamData frame before the terminal reply. */
   onProgress?: (body: Uint8Array) => void;
+  /**
+   * Abort the request: when this fires while the request is still in flight, the
+   * client emits a CANCEL frame carrying that request's own corr.
+   *
+   * The signal exists instead of exposing corr because corr lifetime is already
+   * tracked here to settle replies; handing it out would make every caller keep a
+   * second map that can disagree with this one, and would let a caller cancel a
+   * corr it does not own.
+   *
+   * Cancellation is best-effort by the wire's construction: the daemon forwards
+   * the frame on a live route and silently drops it on a departed one, and no
+   * acknowledgement exists at any layer. Only the module's own reply proves what
+   * happened, so the promise is NOT rejected here -- it settles however the module
+   * answers, which may be a normal completion that beat the cancel.
+   */
+  signal?: AbortSignal;
 }
 
 export interface ManagedCallOptions extends RequestOptions {
@@ -605,6 +621,7 @@ export class SubcClient {
       undefined,
       undefined,
       binary,
+      opts.signal,
     );
     return this.decodeReply(reply);
   }
@@ -754,6 +771,39 @@ export class SubcClient {
     return { unsubscribe, closed };
   }
 
+  /**
+   * Emit CANCEL for one in-flight request when its caller's signal fires.
+   *
+   * Emits only while the request is unsettled by this client's own book, which is
+   * a fact it owns and can check without racing. It deliberately does NOT check
+   * whether the route still exists: that would be a guess, and a wrong guess turns
+   * a frame the daemon would harmlessly drop into a frame never sent -- removing
+   * the caller's only chance at the cost of saving nothing.
+   */
+  private attachCancelSignal(
+    signal: AbortSignal,
+    key: string,
+    handle: RouteHandle | null,
+    corr: bigint,
+    priority: Priority,
+  ): void {
+    if (!handle) return;
+    const emit = (): void => {
+      if (!this.pending.has(key)) return;
+      try {
+        this.cancel(handle, corr, priority);
+      } catch {
+        // A stale handle or a closed socket cannot be acted on, and the caller
+        // already treats an unanswered cancel as unknown rather than as failure.
+      }
+    };
+    if (signal.aborted) {
+      emit();
+      return;
+    }
+    signal.addEventListener("abort", emit, { once: true });
+  }
+
   /** Send a pure-header cancellation for an in-flight request. */
   cancel(handle: RouteHandle, corr: bigint, priority: Priority = Priority.Interactive): void {
     this.assertLiveHandle(handle);
@@ -899,6 +949,7 @@ export class SubcClient {
     acceptFrame?: (frame: Frame) => boolean,
     onLateResponse?: (frame: Frame) => void,
     binary = false,
+    signal?: AbortSignal,
   ): Promise<Frame> {
     if (handle) this.assertLiveHandle(handle);
     if (this.closedErr) return Promise.reject(this.closedErr);
@@ -933,6 +984,7 @@ export class SubcClient {
       };
       pending.timer = setTimeout(() => this.arbitrateTimeout(key, pending, channel, corr, ms), ms);
       this.pending.set(key, pending);
+      if (signal) this.attachCancelSignal(signal, key, handle, corr, priority);
       writeBorrowed(this.sock, encodeFrame(frame), Date.now() + ms).catch((error) => {
         const current = this.pending.get(key);
         if (current) this.rejectPending(key, current, error instanceof Error ? error : new SubcError(String(error)));
@@ -991,6 +1043,7 @@ export class SubcClient {
         opts.timeoutMs,
         opts.onProgress,
         binary,
+        opts.signal,
       );
       return this.decodeReply(reply);
     } catch (error) {
@@ -1007,6 +1060,7 @@ export class SubcClient {
     timeoutMs: number | undefined,
     onProgress: ((body: Uint8Array) => void) | undefined,
     binary = false,
+    signal?: AbortSignal,
   ): Promise<Frame> {
     try {
       this.assertLiveHandle(handle);
@@ -1061,6 +1115,7 @@ export class SubcClient {
       };
       pending.timer = setTimeout(() => this.arbitrateTimeout(key, pending, handle.channel, corr, ms), ms);
       this.pending.set(key, pending);
+      if (signal) this.attachCancelSignal(signal, key, handle, corr, priority);
       const write = writeTrackedBorrowed(this.sock, encodeFrame(frame), Date.now() + ms);
       handedToSocket = write.queued;
       write.completed.catch((error) => {
