@@ -1107,6 +1107,18 @@ mod tests {
     /// threads and the four data-home variables are process-global.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// A path that is absolute on the platform running the test. `/data` is
+    /// relative on Windows (no drive letter), which is not a bug in the resolver
+    /// but a bug in a test that assumes POSIX absoluteness -- the relative-home
+    /// refusal exposed three such tests on the Windows leg.
+    fn abs(posix: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!("C:{}", posix.replace('/', "\\")))
+        } else {
+            PathBuf::from(posix)
+        }
+    }
+
     #[test]
     fn default_data_home_matches_golden_fixture() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -1239,13 +1251,18 @@ mod tests {
             "wrong refusal: {err:?}"
         );
 
-        // Control: an absolute value parses -- the guard is on the value.
-        let doc =
-            r#"{ "version": 1, "storage": { "backend": "sqlite", "data_home": "/abs/home" } }"#;
-        let cfg = parse_doc(doc, path).expect("absolute data_home parses");
+        // Control: an absolute value parses -- the guard is on the value. The
+        // path must be absolute ON THIS PLATFORM; `/abs/home` is relative on
+        // Windows and would make the control refuse for the wrong reason.
+        let want = abs("/abs/home");
+        let doc = format!(
+            r#"{{ "version": 1, "storage": {{ "backend": "sqlite", "data_home": {} }} }}"#,
+            serde_json::to_string(&want).expect("json path")
+        );
+        let cfg = parse_doc(&doc, path).expect("absolute data_home parses");
         assert!(matches!(
             cfg.storage,
-            Some(StorageConfig::Sqlite { ref data_home }) if data_home == Path::new("/abs/home")
+            Some(StorageConfig::Sqlite { ref data_home }) if *data_home == want
         ));
 
         for (k, v) in saved {
@@ -1282,14 +1299,17 @@ mod tests {
     #[test]
     fn sqlite_storage_parses_with_explicit_data_home() {
         let config = parse_doc(
-            r#"{ "version": 1, "storage": { "backend": "sqlite", "data_home": "/data" } }"#,
+            &format!(
+                r#"{{ "version": 1, "storage": {{ "backend": "sqlite", "data_home": {} }} }}"#,
+                serde_json::to_string(&abs("/data")).expect("json path")
+            ),
             Path::new("/tmp/subc.jsonc"),
         )
         .expect("parse");
         assert_eq!(
             config.storage,
             Some(StorageConfig::Sqlite {
-                data_home: PathBuf::from("/data")
+                data_home: abs("/data")
             })
         );
     }
@@ -1302,7 +1322,7 @@ mod tests {
         // reading or writing the data-home variables serializes on ENV_LOCK
         // (the golden-fixture test above mutates all four variables).
         let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        std::env::set_var("XDG_DATA_HOME", "/forced/data/home");
+        std::env::set_var("XDG_DATA_HOME", abs("/forced/data/home"));
         let config = parse_doc(
             r#"{ "version": 1, "storage": { "backend": "sqlite" } }"#,
             Path::new("/tmp/subc.jsonc"),
@@ -1312,7 +1332,7 @@ mod tests {
         assert_eq!(
             config.storage,
             Some(StorageConfig::Sqlite {
-                data_home: PathBuf::from("/forced/data/home")
+                data_home: abs("/forced/data/home")
             })
         );
     }
