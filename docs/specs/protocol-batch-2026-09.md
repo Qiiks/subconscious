@@ -127,7 +127,13 @@ silence must never be a success shape.
 
 ## 3. `call_with_streamed_body` (SDK affordance; no daemon change)
 
-**Consumer:** MC (82.7 MB cold seed; feared a 1 MiB cap that does not exist).
+**Consumer:** MC. The 82.7 MB cold seed that motivated this is gone (the
+adapter now ships inventory deltas and boundary-scoped seeds); the realistic
+streamed body is a `state_sync` cold seed for a session the module has never
+seen (single-digit MB) and later the D5 `lineage.begin/put/finish` uploads,
+which the D5 contract already chunks above 1 MiB with begin/put/finish
+semantics of its own (R11). The affordance stays because the shape is
+right; the motivating size is recorded here so nobody sizes buffers to it.
 
 Facts: `MAX_FRAME_BODY_LEN` is 64 MiB (subc-protocol lib.rs:162). The
 client→module data path is `route.module_sink.send(frame).await`
@@ -144,14 +150,44 @@ Shape: one `Request` frame carrying the JSON head (`op`, params, and
 per-op ceiling the module declares in its manifest operation:
 
 ```rust
-ManagementOperation { …, streamed_body_max_bytes: Option<u64> }
+ManagementOperation {
+    …,
+    streamed_body_max_bytes: Option<u64>,
+    streamed_body_digest: StreamedBodyDigest,   // Optional (default) | Required
+}
 ```
 
+The ceiling counts **body bytes only** — the head `Request` frame is bounded
+by `MAX_FRAME_BODY_LEN` like any request and does not count against it.
+
 Refusals by name, before any bytes are buffered past the ceiling:
-`streamed_body_over_cap` (declared ceiling), `streamed_body_unsupported` (op
-has no ceiling declared), `streamed_body_digest_mismatch` (trailer digest
-present and wrong). An `on_stream_begin` admission hook lets a module refuse
-on the head alone. Rust `SubcConsumer::call_with_streamed_body(target, head,
+
+- `streamed_body_over_cap` fires on **two arms**, both tested: (i) EARLY, on
+  the head, when `total_bytes` is present and exceeds the ceiling — before
+  any `StreamData` is read; (ii) LATE, on actual bytes crossing the ceiling,
+  when `total_bytes` is absent or understates the body. A head that lies
+  small does not buy a larger buffer.
+- `streamed_body_unsupported` (op has no ceiling declared).
+- `streamed_body_digest_required` (op declares `Required` and the head
+  carries no digest) — refused on the head, before buffering. A module whose
+  custody model is digest-bound (D5's begin/put/finish refuses a conflicting
+  re-declaration with the original intact) cannot admit a body it cannot
+  bind, and the SDK refusing beats the handler discovering it after
+  reassembly.
+- `streamed_body_digest_mismatch` (trailer digest present and wrong).
+- `streamed_body_sender_closed` — the sender's connection closed, or the
+  request was cancelled, before the `LAST` frame. Surfaced to the handler as a
+  typed refusal on the reassembly, never as a hang: an abort after the head
+  must not leave the module reassembling a body nobody will read.
+  `on_stream_begin` admits on the head; this is the symmetric close.
+
+No resume after a dropped chunk: under backpressure-not-drop a dropped chunk
+is a dropped connection, and the consumer re-sends the whole body (MC's
+bodies are idempotent by key — `state_sync` on ordinal/inventory, D5 uploads
+on digest). One trailer digest over the whole body, not per chunk: these
+bodies are consumed whole.
+
+An `on_stream_begin` admission hook lets a module refuse on the head alone. Rust `SubcConsumer::call_with_streamed_body(target, head,
 impl AsyncRead)`; TS `callStreamed(moduleId, head, ReadableStream)`. The
 binary-body gap noted in Rust (`send_request` hardcodes `Flags::new(false,…)`)
 and Swift (`beginRouteRequest` binary:false) closes in the same wave.
@@ -202,6 +238,12 @@ current rendering are closed. Lands in the daemon cut that carries 2a–2c.
   so the drain waits for exactly the calls whose interruption is an
   `ambiguous` reconciliation. Items 3–6: no exposure.
 
+- **magic-context** (MC): item 3 — first consumer; r1 stands with the
+  digest-required arm and the two ceiling sentences (body-bytes-only, and
+  over-cap on both the early `total_bytes` arm and the late actual-bytes
+  arm) folded above. Will always send the trailer digest. Items 1, 2, 4–6:
+  no exposure.
+
 - **alfonso-ios** (CKIOS): item 1 — the phone is a pure client and never
   sends `BindIdentity`; no consumer. Item 2a — a consumer seam, not a
   reviewer note: whatever `Draining{reason, deadline_ms}` becomes in the
@@ -217,7 +259,9 @@ current rendering are closed. Lands in the daemon cut that carries 2a–2c.
 - 2b: gauge name conflicts — a module declaring `Busy` anchored to a gauge
   its health reply omits. Proposed: treat omission as busy for one drain
   and log; do not refuse HELLO.
-- 3: whether the trailer digest is mandatory. Proposed: optional, verified
-  when present.
+- 3: ~~whether the trailer digest is mandatory~~ — settled by MC: optional
+  by SDK default, verified when present, and **requirable per op** via
+  `streamed_body_digest: Required` (refused as
+  `streamed_body_digest_required` on the head).
 - 1: whether `ck routes` should render `project_id` or only expose it in
   `--json`.
