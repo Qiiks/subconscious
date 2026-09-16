@@ -48,6 +48,16 @@ Semantics, normative:
   catch a producer that drops the id later**. This invariant is the only
   brace; it goes in the doc comment and the CONSUMER-IMPACT notice verbatim.
 
+  **Stated as the consequence, not the rule (BROCA):** a producer that
+  alternates between `Some(id)` and `None` across binds SILENTLY FORKS THE
+  LINEAGE — two WAL files, two lease keys, two store rows, and no error at
+  either end. Neither half is corrupt, which is why nothing reports it; the
+  second half simply looks like a new session. Broca's re-key work exists
+  because 21,473 sessions drifted exactly this way through a directory
+  rename. Therefore: **a producer that cannot answer consistently must
+  answer `None` consistently.** Having the id is not better than not having
+  it if the answer is unstable. This sentence goes in the doc comment.
+
   **How a producer honours it (producer rule, normative — ALF's wording):**
   *"A producer resolves `project_id` at most once per session, before the
   session's first bind, and persists the outcome with the session;
@@ -74,10 +84,12 @@ Semantics, normative:
 - **Daemon posture:** relayed verbatim on `route.bind`, unattested, same as
   `project_root`/`harness`/`session`. Consumers verify via entorhinal
   `resolve`. `ck routes` renders it in the table when present, abbreviated
-  to `pj-` plus eight characters, full in `--json`: the field exists for
-  rename-stability, and the person debugging a forked lineage is comparing
-  two rows by eye — making them reach for `jq` to see whether two ids match
-  defeats the purpose.
+  to `pj-` plus eight characters and marked truncated, full in `--json`.
+  Two consumers disagreed and converged on this shape: ALF (the reader
+  debugging a forked lineage compares two rows by eye; `jq` defeats the
+  purpose) and BROCA (the consumers are programs; do not spend the width —
+  but if it must appear, truncate to 8 and mark it). The abbreviated form
+  is what both accept.
 - **Construct impact:** `BindIdentity` is a plain struct with struct-literal
   construction sites across the fleet; this is construct-breaking for them.
   The wave adds `BindIdentity::new(project_root, harness, session)` and
@@ -119,18 +131,59 @@ held-open subscription lanes, and let in-flight requests settle. It is
 advisory: a module that ignores it is treated as today. The module GOODBYE
 at drain end is unchanged and remains the exit trigger.
 
-**2b. Busy predicate from a declared gauge.** A module may declare, in its
+**Timing is the contract, not the frame shape.** The notice is written to
+the module's channel 0 **at drain start**, before the quiescence wait
+begins — never at the end of the window, and never as a courtesy before
+SIGKILL. A notice delivered at the end of the window is indistinguishable
+from no notice, because the work it authorises (a seal, a flush) takes
+longer than what remains. BROCA's seal was dead code for a week for the
+adjacent reason: wired to SIGTERM, which the daemon never sends, so the
+handler never ran while the process exited 0.
+
+**Recommendation to implementers, from the same incident:** log BOTH arms of
+the stop hook, including the success shape ("sealed 0, none in flight"). A
+module that logs only its failure arm cannot be told apart from one whose
+handler never fired; silence must be a finding, never a success shape.
+
+**2b. Busy predicate from declared gauges.** A module may declare, in its
 manifest `self_signals`, one entry of a new kind:
 
 ```rust
-SelfSignalKind::Busy   // anchored_to a health gauge name, e.g. "runs_in_flight"
+SelfSignalKind::Busy   // anchored_to ONE OR MORE health gauge names
 ```
 
 When present, the drain's quiescence condition becomes
-`wire_quiescent && health.metrics[gauge] == 0`, polled from the module's
-`health.check` reply at the existing probe cadence. Undeclared modules keep
-wire-only quiescence. The gauge must be a non-negative integer; anything else
-reads as "busy" and is logged once per drain.
+`wire_quiescent && sum(health.metrics[g] for g in gauges) == 0`, polled from
+the module's `health.check` reply at the existing probe cadence. **More than
+one gauge is allowed and they are summed by the daemon**, because a single
+declared number hides which one held the drain: broca's own seal waits on
+`runs_in_flight == 0 && opening == 0` (registry.rs:1104), and a session
+mid-open has no run yet and is about to have one, so a gauge of runs alone
+reads zero during exactly the window where admission is in flight. A
+module declares both; health shows both; the daemon sums.
+
+Undeclared modules keep wire-only quiescence. The gauge must be a
+non-negative integer; anything else reads as "busy" for that drain.
+
+**Omission is busy, counted, never refused.** A declared gauge the health
+reply omits reads as busy for that drain and the daemon increments
+`drains_with_undeclared_gauge` (surfaced on `server.describe` beside the
+drop counters, and rendered by `ck module status`) — a COUNTER, not only a
+log line, because "busy for one drain" means a module that never fixes its
+declaration costs one full drain window per restart forever, and a log line
+nobody greps is the shape this fleet has spent two days convicting. HELLO is
+never refused on this: the fail-safe direction is correct (busy-on-omission
+cannot cut work; quiet-on-omission can), and it should be diffable.
+
+**Why 2b is the whole fix and 2c is a cleanup (BROCA's measurement):** broca
+breaks the wire predicate in BOTH directions — `session.send` returns an
+admission ack and then the run executes 10–900 s in the actor (wire quiet
+while busy), and `session.subscribe` holds a credit for the stream's
+lifetime (wire busy while idle). Their last drain logged `waited 30s
+routes_notified 49 route_goodbyes 49 drained false` on a box with both.
+Wire credits have no relationship to a module's work in either direction;
+2c removes one of two symmetric errors, 2b removes the other. After 2c
+alone, that drain completes faster and is still wrong about runs.
 
 **2c. Subscription-excluded wire quiescence.** `endpoint_in_flight_count`
 (forwarding.rs:1347) counts every acquired credit. The drain's quiescence
@@ -292,6 +345,17 @@ current rendering are closed. Lands in the daemon cut that carries 2a–2c.
   so the drain waits for exactly the calls whose interruption is an
   `ambiguous` reconciliation. Items 3–6: no exposure.
 
+- **broca** (BROCA): items 1, 2a, 2b, 2c — the consumer whose work the
+  drain exists to protect. r1 stands on 1 and 2a with two hardenings
+  folded (consequence-stated alternation caveat; stop-notice timing and
+  both-arms logging). 2b changed: gauges plural and summed
+  (`runs_in_flight + opening`), omission counted not only logged. 2c is a
+  stronger yes than asked: broca breaks the wire predicate in both
+  directions today, measured, so excluding subscriptions removes one of two
+  symmetric errors and adds no hazard. `ck routes`: would prefer `--json`
+  only; accepts the abbreviated-and-marked table form. Items 3–6: no
+  exposure.
+
 - **prefrontal** (ALF): item 1 — the PRODUCER that matters for BROCA's
   lineage (prefrontal-core opening worker/gather routes as
   `alfonso:<task or gather id>`; the host plugin binds to prefrontal-core
@@ -329,9 +393,9 @@ current rendering are closed. Lands in the daemon cut that carries 2a–2c.
 
 ## Open for review
 
-- 2b: gauge name conflicts — a module declaring `Busy` anchored to a gauge
-  its health reply omits. Proposed: treat omission as busy for one drain
-  and log; do not refuse HELLO.
+- 2b: ~~gauge omission~~ — settled by BROCA: busy for that drain, COUNTED
+  on the daemon (`drains_with_undeclared_gauge`), never refused at HELLO;
+  gauges may be several and are summed.
 - 3: ~~whether the trailer digest is mandatory~~ — settled by MC: optional
   by SDK default, verified when present, and **requirable per op** via
   `streamed_body_digest: Required` (refused as
