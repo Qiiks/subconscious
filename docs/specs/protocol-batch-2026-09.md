@@ -84,7 +84,11 @@ Semantics, normative:
 - **Daemon posture:** relayed verbatim on `route.bind`, unattested, same as
   `project_root`/`harness`/`session`. Consumers verify via entorhinal
   `resolve`. `ck routes` renders it in the table when present, abbreviated
-  to `pj-` plus eight characters and marked truncated, full in `--json`.
+  to `pj-` plus eight characters **with a visible ellipsis suffix**
+  (`pj-a1b2c3d4…`, never a bare eight that reads as complete), full in
+  `--json`. The suffix is load-bearing: a truncated id that looks complete
+  is the bounded-page shape — someone compares two truncations, finds them
+  equal, and concludes the ids match.
   Two consumers disagreed and converged on this shape: ALF (the reader
   debugging a forked lineage compares two rows by eye; `jq` defeats the
   purpose) and BROCA (the consumers are programs; do not spend the width —
@@ -395,7 +399,12 @@ current rendering are closed. Lands in the daemon cut that carries 2a–2c.
 
 - 2b: ~~gauge omission~~ — settled by BROCA: busy for that drain, COUNTED
   on the daemon (`drains_with_undeclared_gauge`), never refused at HELLO;
-  gauges may be several and are summed.
+  gauges may be several and are summed. **Validation target before the
+  declaration API exists:** broca's `health.check` already serves
+  `runs_in_flight`, `opening`, `closing`, `active_sessions`; driving a
+  `session.send` and sampling during admission shows `opening` non-zero
+  while `runs_in_flight` is still zero — the real window that makes the sum
+  load-bearing. Test 2b's summing against that before any fixture.
 - 3: ~~whether the trailer digest is mandatory~~ — settled by MC: optional
   by SDK default, verified when present, and **requirable per op** via
   `streamed_body_digest: Required` (refused as
