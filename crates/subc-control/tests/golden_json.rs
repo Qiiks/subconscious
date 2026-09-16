@@ -405,6 +405,7 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                             build_git_sha: Some(
                                 "0123456789abcdef0123456789abcdef01234567".to_string(),
                             ),
+                            build_git_sha_absence_reason: None,
                             build_lock_digest: Some(
                                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                                     .to_string(),
@@ -494,6 +495,7 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                             build_git_sha: Some(
                                 "fedcba9876543210fedcba9876543210fedcba98-dirty".to_string(),
                             ),
+                            build_git_sha_absence_reason: None,
                             build_lock_digest: Some(
                                 "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
                                     .to_string(),

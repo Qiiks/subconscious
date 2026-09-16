@@ -66,6 +66,7 @@ async fn catalog_update_refreshes_catalog_without_disrupting_bound_routes() {
     let mut module = connect_endpoint(&server, "module").await;
     let provenance = ManifestProvenance {
         build_git_sha: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+        build_git_sha_absence_reason: None,
         build_lock_digest: Some("lock-digest".to_string()),
         wire_crate_version: Some("0.13.0".to_string()),
         store_schema_version: Some("3".to_string()),
