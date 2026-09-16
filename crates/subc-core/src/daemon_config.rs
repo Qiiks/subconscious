@@ -420,6 +420,13 @@ pub fn default_config_path() -> PathBuf {
 /// `AppData\Roaming` (Windows) → `HOME/.config` → `.config` relative.
 /// Empty values count as unset. Mirrors the data-home ladder exactly except for
 /// the per-platform tails (`.local/share` there, `.config` here).
+///
+/// A RELATIVE result means one of two things and the resolver does not say
+/// which: no home variable was set (the final rung), or `XDG_CONFIG_HOME` was
+/// itself relative (honoured as-is, golden-pinned). Either way the path resolves
+/// against the caller's cwd, which is a true answer about a directory nobody
+/// chose. Callers that must be fail-closed check `is_absolute()` and refuse;
+/// the daemon does so for the storage descriptor it serves (`parse_doc`).
 pub fn default_config_home() -> PathBuf {
     if let Some(config_home) = non_empty_os_var("XDG_CONFIG_HOME") {
         return PathBuf::from(config_home);
@@ -615,11 +622,37 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
         path,
     )?;
 
-    let storage = raw.storage.map(|s| match s {
-        RawStorageConfig::Sqlite { data_home } => StorageConfig::Sqlite {
-            data_home: data_home.unwrap_or_else(default_data_home),
-        },
-    });
+    let storage = raw
+        .storage
+        .map(|s| match s {
+            RawStorageConfig::Sqlite { data_home } => {
+                let data_home = data_home.unwrap_or_else(default_data_home);
+                // A relative data home is served to every module in its storage
+                // descriptor and resolves against each module's own cwd, so one
+                // daemon would hand out N different directories while every
+                // module's gate stays green. The resolver returns a relative
+                // path when no home variable is set (golden-pinned) or when an
+                // operator set XDG_DATA_HOME to one; both are refused here rather
+                // than in the resolver, because the resolver's contract is shared
+                // with modules that may legitimately tolerate it.
+                if !data_home.is_absolute() {
+                    return Err(DaemonConfigError::InvalidValue {
+                        path: path.to_path_buf(),
+                        message: format!(
+                            "storage data home resolved to the relative path {} \
+                             (no absolute XDG_DATA_HOME, APPDATA, USERPROFILE, or HOME \
+                             in the daemon's environment); refusing to serve a \
+                             cwd-relative storage descriptor to modules. Set \
+                             XDG_DATA_HOME or HOME to an absolute path, or set \
+                             storage.data_home in this file.",
+                            data_home.display()
+                        ),
+                    });
+                }
+                Ok(StorageConfig::Sqlite { data_home })
+            }
+        })
+        .transpose()?;
 
     Ok(DaemonConfig {
         path: path.to_path_buf(),
@@ -1161,6 +1194,59 @@ mod tests {
             ran >= 6,
             "only {ran} golden cases ran; fixture or filter broken"
         );
+
+        for (k, v) in saved {
+            match v {
+                Some(val) => env::set_var(k, val),
+                None => env::remove_var(k),
+            }
+        }
+    }
+
+    /// A relative storage data home is refused at parse rather than served.
+    /// Both ways a relative path arises are covered: an explicit relative
+    /// `storage.data_home` in the file, and the resolver's own fall-through when
+    /// no home variable is set. The control proves the guard is on the VALUE and
+    /// not on the presence of the key: the same document with an absolute home
+    /// parses.
+    #[test]
+    fn relative_storage_data_home_is_refused_at_parse() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let path = Path::new("/golden/subc.jsonc");
+
+        // Arm 1: explicit relative value in the file.
+        let doc =
+            r#"{ "version": 1, "storage": { "backend": "sqlite", "data_home": "relative/home" } }"#;
+        let err = parse_doc(doc, path).expect_err("relative data_home must refuse");
+        assert!(
+            matches!(&err, DaemonConfigError::InvalidValue { message, .. }
+                if message.contains("relative path relative/home")),
+            "wrong refusal: {err:?}"
+        );
+
+        // Arm 2: the resolver's fall-through, with every home variable cleared.
+        let vars = ["XDG_DATA_HOME", "APPDATA", "USERPROFILE", "HOME"];
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+            vars.iter().map(|v| (*v, env::var_os(v))).collect();
+        for v in vars {
+            env::remove_var(v);
+        }
+        let doc = r#"{ "version": 1, "storage": { "backend": "sqlite" } }"#;
+        let err = parse_doc(doc, path).expect_err("no home in env must refuse");
+        assert!(
+            matches!(&err, DaemonConfigError::InvalidValue { message, .. }
+                if message.contains("no absolute XDG_DATA_HOME")),
+            "wrong refusal: {err:?}"
+        );
+
+        // Control: an absolute value parses -- the guard is on the value.
+        let doc =
+            r#"{ "version": 1, "storage": { "backend": "sqlite", "data_home": "/abs/home" } }"#;
+        let cfg = parse_doc(doc, path).expect("absolute data_home parses");
+        assert!(matches!(
+            cfg.storage,
+            Some(StorageConfig::Sqlite { ref data_home }) if data_home == Path::new("/abs/home")
+        ));
 
         for (k, v) in saved {
             match v {
