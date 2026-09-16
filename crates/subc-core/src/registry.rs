@@ -266,6 +266,12 @@ pub fn module_id_path_hazard(module_id: &str) -> Result<(), String> {
     if module_id.chars().any(|c| c.is_control()) {
         return Err("contains a control character".to_string());
     }
+    // `module_id` is already one literal store-path component, so this reports
+    // the existing failure before derivation instead of adding a restriction.
+    // NAME_MAX is 255 UTF-8 bytes, which `str::len()` measures.
+    if module_id.len() > 255 {
+        return Err("is longer than 255 bytes".to_string());
+    }
     Ok(())
 }
 
@@ -306,6 +312,37 @@ mod path_hazard_tests {
         // behind, and the generation never moved.
         assert_eq!(registry.active_registration_count().unwrap(), 0);
         assert_eq!(registry.generation().unwrap(), 0);
+    }
+
+    #[test]
+    fn module_id_path_component_length_matches_shared_refusal_vectors() {
+        let doc: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/golden/module_id_path_component_refusals.json"
+        ))
+        .expect("refusal fixture parses");
+
+        for case in doc["vectors"].as_array().expect("vectors array") {
+            let name = case["name"].as_str().expect("name");
+            let module_id = case["module_id"]["unit"]
+                .as_str()
+                .expect("module_id unit")
+                .repeat(
+                    case["module_id"]["repeat"]
+                        .as_u64()
+                        .expect("module_id repeat") as usize,
+                );
+            assert_eq!(
+                module_id.len(),
+                case["utf8_bytes"].as_u64().expect("utf8 bytes") as usize
+            );
+
+            let expected = case["expect_reason"].as_str().map(str::to_owned);
+            assert_eq!(
+                module_id_path_hazard(&module_id).err(),
+                expected,
+                "shared refusal vector {name:?} diverged"
+            );
+        }
     }
 
     #[test]

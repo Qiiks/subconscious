@@ -98,6 +98,10 @@ function assertPathSafeModuleId(moduleId: string): void {
   if (moduleId === "." || moduleId === "..") refuse("is a dot path component");
   // eslint-disable-next-line no-control-regex
   if (/[\u0000-\u001f\u007f]/.test(moduleId)) refuse("contains a control character");
+  // `module_id` is already one literal store-path component, so this reports
+  // the existing failure before derivation instead of adding a restriction.
+  // NAME_MAX is 255 UTF-8 bytes; String.length is UTF-16 code units instead.
+  if (textEncoder.encode(moduleId).length > 255) refuse("is longer than 255 bytes");
 }
 
 function postgresSlug(moduleId: string): string {

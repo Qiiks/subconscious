@@ -118,6 +118,34 @@ describe("sqliteStorePath path-hazard refusal (issue #32)", () => {
     );
     expect(sqliteStorePath("/data", "v1.2-module")).toBe("/data/cortexkit/v1.2-module/store.db");
   });
+
+  test("matches the shared UTF-8 path-component length refusal vectors", () => {
+    const golden = require("../../../crates/subc-core/tests/golden/module_id_path_component_refusals.json") as {
+      vectors: {
+        name: string;
+        module_id: { unit: string; repeat: number };
+        utf8_bytes: number;
+        utf16_code_units: number;
+        expect_reason: string | null;
+      }[];
+    };
+
+    for (const vector of golden.vectors) {
+      const moduleId = vector.module_id.unit.repeat(vector.module_id.repeat);
+      expect(moduleId.length, `${vector.name} UTF-16 code units`).toBe(vector.utf16_code_units);
+      expect(new TextEncoder().encode(moduleId).length, `${vector.name} UTF-8 bytes`).toBe(
+        vector.utf8_bytes,
+      );
+
+      if (vector.expect_reason === null) {
+        expect(sqliteStorePath("/data", moduleId), vector.name).toBe(
+          `/data/cortexkit/${moduleId}/store.db`,
+        );
+      } else {
+        expect(() => sqliteStorePath("/data", moduleId), vector.name).toThrow(vector.expect_reason);
+      }
+    }
+  });
 });
 
 describe("data-home resolver (mirror of subc default_data_home)", () => {
