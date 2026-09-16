@@ -403,31 +403,43 @@ enum RawHealthAction {
 }
 
 pub fn default_config_path() -> PathBuf {
+    default_config_home().join(DAEMON_CONFIG_RELATIVE_PATH)
+}
+
+/// The XDG-style CONFIG HOME (`~/.config`, `%APPDATA%`), with no `cortexkit/`
+/// tail. This is the AUTHORITY for every module that resolves its own config
+/// file: mirrors (`cortexkit-store-types::resolve_config_home`, and any module
+/// still carrying a hand copy of this ladder) assert against
+/// `tests/golden/config_home_resolution.json` and may not diverge. It is split
+/// from `default_config_path` so the mirror and the daemon share one ladder
+/// rather than one ladder plus a tail that each copy re-appends differently --
+/// the daemon appends `cortexkit/subc.jsonc`, a module appends
+/// `cortexkit/<its file>`, and a copy that bakes the tail in cannot be reused.
+///
+/// Resolution: `XDG_CONFIG_HOME` → `APPDATA` (Windows) → `USERPROFILE` +
+/// `AppData\Roaming` (Windows) → `HOME/.config` → `.config` relative.
+/// Empty values count as unset. Mirrors the data-home ladder exactly except for
+/// the per-platform tails (`.local/share` there, `.config` here).
+pub fn default_config_home() -> PathBuf {
     if let Some(config_home) = non_empty_os_var("XDG_CONFIG_HOME") {
-        return PathBuf::from(config_home).join(DAEMON_CONFIG_RELATIVE_PATH);
+        return PathBuf::from(config_home);
     }
 
     #[cfg(windows)]
     {
         if let Some(app_data) = non_empty_os_var("APPDATA") {
-            return PathBuf::from(app_data).join("cortexkit").join("subc.jsonc");
+            return PathBuf::from(app_data);
         }
         if let Some(user_profile) = non_empty_os_var("USERPROFILE") {
-            return PathBuf::from(user_profile)
-                .join("AppData")
-                .join("Roaming")
-                .join("cortexkit")
-                .join("subc.jsonc");
+            return PathBuf::from(user_profile).join("AppData").join("Roaming");
         }
     }
 
     if let Some(home) = non_empty_os_var("HOME") {
-        return PathBuf::from(home)
-            .join(".config")
-            .join(DAEMON_CONFIG_RELATIVE_PATH);
+        return PathBuf::from(home).join(".config");
     }
 
-    PathBuf::from(".config").join(DAEMON_CONFIG_RELATIVE_PATH)
+    PathBuf::from(".config")
 }
 
 pub fn load(path: impl AsRef<Path>) -> Result<Option<DaemonConfig>, DaemonConfigError> {
@@ -1095,6 +1107,56 @@ mod tests {
             ran += 1;
         }
         // Vacuity floor: 'any' rows plus this platform's rows must both run.
+        assert!(
+            ran >= 6,
+            "only {ran} golden cases ran; fixture or filter broken"
+        );
+
+        for (k, v) in saved {
+            match v {
+                Some(val) => env::set_var(k, val),
+                None => env::remove_var(k),
+            }
+        }
+    }
+
+    /// Same harness as the data-home golden, over the config-home ladder. The two
+    /// fixtures share a row shape on purpose: a divergence between the ladders
+    /// (one honouring a variable the other does not) is exactly the class that
+    /// produced the doubled-path store defect, and a shared harness makes it
+    /// visible as a fixture diff rather than as a runtime surprise.
+    #[test]
+    fn default_config_home_matches_golden_fixture() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let doc: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/golden/config_home_resolution.json"))
+                .expect("golden parses");
+        let vars = ["XDG_CONFIG_HOME", "APPDATA", "USERPROFILE", "HOME"];
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+            vars.iter().map(|v| (*v, env::var_os(v))).collect();
+        let platform_matches =
+            |p: &str| p == "any" || p == if cfg!(windows) { "windows" } else { "unix" };
+
+        let mut ran = 0usize;
+        for case in doc["cases"].as_array().expect("cases array") {
+            let name = case["name"].as_str().expect("name");
+            if !platform_matches(case["platform"].as_str().expect("platform")) {
+                continue;
+            }
+            for v in vars {
+                env::remove_var(v);
+            }
+            for (k, v) in case["env"].as_object().expect("env map") {
+                env::set_var(k, v.as_str().expect("env value"));
+            }
+            let got = default_config_home();
+            assert_eq!(
+                got.to_string_lossy(),
+                case["expect"].as_str().expect("expect"),
+                "golden case '{name}' diverged"
+            );
+            ran += 1;
+        }
         assert!(
             ran >= 6,
             "only {ran} golden cases ran; fixture or filter broken"
