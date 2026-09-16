@@ -106,12 +106,38 @@ reads as "busy" and is logged once per drain.
 
 **2c. Subscription-excluded wire quiescence.** `endpoint_in_flight_count`
 (forwarding.rs:1347) counts every acquired credit. The drain's quiescence
-wait excludes credits whose request was answered with at least one
-`StreamData` frame and no terminal frame — a held-open stream — **settled at
-drain start**: the excluded set is captured when the drain begins; streams
-opened after the notice are not excluded (they should not exist; 2a asked
-the module to stop admitting). Excluded streams still receive their route
-GOODBYE at drain end as today.
+wait excludes credits whose request the **client declared a subscription at
+open** — an explicit request-kind bit on the route request, never inferred.
+AFT's review killed the inferred form: "first reply was `StreamData` with no
+terminal yet" is not a discriminator, because a `bash` call with `wait:true`
+on a 25-minute cargo run holds its permit exactly the same way for exactly as
+long and MUST count as in flight (it is the class `drained:false` was right
+about), and a provider that streams a long tool result would be misread the
+same way. There is no body field the daemon parses and no stream-begin frame
+in subc-protocol, so the only honest signal is the client saying so.
+
+Wire: a `SUBSCRIPTION` flag bit on the `Request` envelope (the envelope's
+remaining reserved bit, allocated here; TS/Swift constants and the golden
+`protocol_constants.json` in the same bump). The SDKs set it from
+`subscribe()`/`callStreamed`-style entry points; an ordinary `call()` never
+sets it. The daemon reads it at credit acquisition and tags the credit.
+
+The excluded set is **settled at drain start**: captured when the drain
+begins; subscriptions opened after the notice are not excluded (they should
+not exist; 2a asked the module to stop admitting). Excluded subscriptions
+still receive their route GOODBYE at drain end as today.
+
+`route.closed` gains `excluded_subscriptions: u32` beside `drained` and
+`abandoned`, so a consumer can tell "drained because nothing was in flight"
+(0) from "drained with N held-open subscriptions excluded" — the line that
+says whether a consumer's wake lanes were live at close.
+
+Ordering with 2a: the stop notice is written to the endpoint's channels
+**before** the quiescence wait begins, so a consumer's cancel-on-closing
+fires before any GOODBYE. If a drain completes early under 2c, the consumer
+sees the notice, then GOODBYE — never GOODBYE alone. (A consumer that treats
+GOODBYE as terminal regardless is safe either way; the stop-first order is
+the cleaner one and is normative.)
 
 The 30 s ceiling is never extended by any of the three. Consequently `Busy`
 changes **when** the kill lands inside the ceiling, never **whether**: a
@@ -237,6 +263,15 @@ current rendering are closed. Lands in the daemon cut that carries 2a–2c.
   elsewhere) and 2b will anchor `Busy` to a new `ledgered_in_flight` gauge
   so the drain waits for exactly the calls whose interruption is an
   `ambiguous` reconciliation. Items 3–6: no exposure.
+
+- **aft** (AFT): item 2c — the consumer whose 328 held-open wake
+  subscriptions pinned every drain to the ceiling. r1 stands with one
+  change, folded: the subscription discriminator is an EXPLICIT request-kind
+  bit set by the client at open (their 1a), not inferred from the first reply
+  frame (their 1b, which misreads a long `wait:true` tool call). Cancel-on-
+  `route.closing` is safe against 2c in either ordering; stop-first is
+  normative. `excluded_subscriptions` on `route.closed` added at their
+  request. Items 1, 3–6: no exposure.
 
 - **magic-context** (MC): item 3 — first consumer; r1 stands with the
   digest-required arm and the two ceiling sentences (body-bytes-only, and
