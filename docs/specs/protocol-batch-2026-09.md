@@ -47,9 +47,37 @@ Semantics, normative:
   lineage byte-identical to a new session, so **no consumer-side fence can
   catch a producer that drops the id later**. This invariant is the only
   brace; it goes in the doc comment and the CONSUMER-IMPACT notice verbatim.
+
+  **How a producer honours it (producer rule, normative — ALF's wording):**
+  *"A producer resolves `project_id` at most once per session, before the
+  session's first bind, and persists the outcome with the session;
+  subsequent binds of that session send the persisted value and never
+  re-resolve."* The alternating path is real and it is the resolver's
+  unavailable arm at cold start: entorhinal unreachable for a session's
+  first bind and reachable for its second would, under per-bind resolution,
+  open that session once without the id and once with it. Resolve-once-and-
+  persist holds across reconnect, worktree rebind (the worktree path is not
+  the identity; the session row is) and a producer restart, because the row
+  survives all three. A session that started while entorhinal was down binds
+  without the id for its whole life, and that is correct.
+
+  **Registered-only is a match arm, not a policy.** A resolver that returns
+  a project id on every outcome (prefrontal's has three arms and all three
+  carry one: `Resolved{via: Registered|Alias|Implicit}`, `Unavailable`,
+  `Disabled`) leaks derived ids unless the producer gates on the resolution
+  KIND: send only `Resolved` with `via` `Registered` or `Alias` (an alias is
+  a registered project under another root; its id is the registered one and
+  stable). Never `Implicit` (re-rolls on rename), `Unavailable` or
+  `Disabled` (locally derived fallbacks). A producer pins this with a test
+  driving every outcome shape through the bind and asserting the field is
+  present for exactly the registered ones.
 - **Daemon posture:** relayed verbatim on `route.bind`, unattested, same as
   `project_root`/`harness`/`session`. Consumers verify via entorhinal
-  `resolve`. `ck routes` shows it when present.
+  `resolve`. `ck routes` renders it in the table when present, abbreviated
+  to `pj-` plus eight characters, full in `--json`: the field exists for
+  rename-stability, and the person debugging a forked lineage is comparing
+  two rows by eye — making them reach for `jq` to see whether two ids match
+  defeats the purpose.
 - **Construct impact:** `BindIdentity` is a plain struct with struct-literal
   construction sites across the fleet; this is construct-breaking for them.
   The wave adds `BindIdentity::new(project_root, harness, session)` and
@@ -264,6 +292,16 @@ current rendering are closed. Lands in the daemon cut that carries 2a–2c.
   so the drain waits for exactly the calls whose interruption is an
   `ambiguous` reconciliation. Items 3–6: no exposure.
 
+- **prefrontal** (ALF): item 1 — the PRODUCER that matters for BROCA's
+  lineage (prefrontal-core opening worker/gather routes as
+  `alfonso:<task or gather id>`; the host plugin binds to prefrontal-core
+  and keys nothing on the field). r1 did NOT stand as written: it needed the
+  producer rule above, which ALF found by reading their own resolver — all
+  three outcome arms carry an id, and the unavailable arm at cold start is a
+  real alternating path. Both folded. Their producer change lands with the
+  resolve-once rule and a five-shape pin; commit to follow. Items 2–6: no
+  exposure.
+
 - **aft** (AFT): item 2c — the consumer whose 328 held-open wake
   subscriptions pinned every drain to the ceiling. r1 stands with one
   change, folded: the subscription discriminator is an EXPLICIT request-kind
@@ -298,5 +336,5 @@ current rendering are closed. Lands in the daemon cut that carries 2a–2c.
   by SDK default, verified when present, and **requirable per op** via
   `streamed_body_digest: Required` (refused as
   `streamed_body_digest_required` on the head).
-- 1: whether `ck routes` should render `project_id` or only expose it in
-  `--json`.
+- 1: ~~whether `ck routes` should render `project_id`~~ — settled by ALF:
+  table, abbreviated; full in `--json`.
