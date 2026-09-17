@@ -135,6 +135,7 @@ async fn supervisor_provenance_reports_declared_and_observed_module_facts() {
     // leakage sweep below.
     let ManifestProvenance {
         build_git_sha,
+        build_git_sha_absence_reason: _,
         build_lock_digest,
         wire_crate_version,
         store_schema_version,

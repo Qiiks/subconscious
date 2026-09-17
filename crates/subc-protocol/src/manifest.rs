@@ -512,6 +512,11 @@ pub enum SignalCadence {
 pub struct ManifestProvenance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_git_sha: Option<String>,
+    /// Why `build_git_sha` is unavailable. This is absent when the commit is
+    /// declared, and remains open so future causes do not make readers reject
+    /// the enclosing provenance declaration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_git_sha_absence_reason: Option<BuildGitShaAbsenceReason>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_lock_digest: Option<String>,
     /// REFERENT: the `subc-protocol` crate version linked into this binary
@@ -528,6 +533,84 @@ pub struct ManifestProvenance {
     pub store_schema_version: Option<String>,
 }
 
+/// A build pipeline's reason for omitting `build_git_sha`.
+///
+/// This is an open string enum: consumers preserve a future reason instead of
+/// rejecting the enclosing provenance declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuildGitShaAbsenceReason {
+    DeclinedDirty,
+    NeverDerived,
+    NoGitDir,
+    ForwardCompatibleUnknown(String),
+}
+
+impl BuildGitShaAbsenceReason {
+    fn wire_name(&self) -> &str {
+        match self {
+            Self::DeclinedDirty => "declined_dirty",
+            Self::NeverDerived => "never_derived",
+            Self::NoGitDir => "no_git_dir",
+            Self::ForwardCompatibleUnknown(value) => value,
+        }
+    }
+}
+
+impl Serialize for BuildGitShaAbsenceReason {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.wire_name())
+    }
+}
+
+impl<'de> Deserialize<'de> for BuildGitShaAbsenceReason {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "declined_dirty" => Self::DeclinedDirty,
+            "never_derived" => Self::NeverDerived,
+            "no_git_dir" => Self::NoGitDir,
+            _ => Self::ForwardCompatibleUnknown(value),
+        })
+    }
+}
+
+/// The observable state of a git worktree when a build pipeline found a revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitTreeState {
+    Clean,
+    Dirty,
+}
+
+/// How the build pipeline obtained (or did not obtain) git revision data.
+///
+/// `NoGitDir` and `NeverDerived` carry no revision, so callers cannot attach
+/// those absence causes to an otherwise attested commit through this API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildGitShaSource<'a> {
+    Git {
+        revision: &'a str,
+        tree_state: GitTreeState,
+    },
+    NeverDerived,
+    NoGitDir,
+}
+
+/// Return a commit only when its source tree was clean at build time.
+///
+/// The rule is pure so stampers can exercise both branches without rebuilding.
+pub fn attestable_commit(revision: &str, tree_state: GitTreeState) -> Option<&str> {
+    match tree_state {
+        GitTreeState::Clean => Some(revision),
+        GitTreeState::Dirty => None,
+    }
+}
+
 const MAX_PROVENANCE_VALUE_BYTES: usize = 128;
 const BUILD_GIT_SHA_CANONICAL_FORM: &str = "exactly 40 lowercase hexadecimal characters";
 const BUILD_LOCK_DIGEST_CANONICAL_FORM: &str = "exactly 64 lowercase hexadecimal characters";
@@ -536,6 +619,8 @@ const BUILD_LOCK_DIGEST_CANONICAL_FORM: &str = "exactly 64 lowercase hexadecimal
 struct ManifestProvenanceWire {
     #[serde(default)]
     build_git_sha: Option<String>,
+    #[serde(default)]
+    build_git_sha_absence_reason: Option<BuildGitShaAbsenceReason>,
     #[serde(default)]
     build_lock_digest: Option<String>,
     #[serde(default)]
@@ -552,6 +637,7 @@ impl<'de> Deserialize<'de> for ManifestProvenance {
         let wire = ManifestProvenanceWire::deserialize(deserializer)?;
         let provenance = Self {
             build_git_sha: wire.build_git_sha,
+            build_git_sha_absence_reason: wire.build_git_sha_absence_reason,
             build_lock_digest: wire.build_lock_digest,
             wire_crate_version: wire.wire_crate_version,
             store_schema_version: wire.store_schema_version,
@@ -641,8 +727,24 @@ impl std::error::Error for ManifestProvenanceError {}
 
 impl ManifestProvenance {
     pub fn validate(&self) -> Result<(), ManifestProvenanceError> {
+        if let (Some(_), Some(reason)) = (
+            self.build_git_sha.as_ref(),
+            self.build_git_sha_absence_reason.as_ref(),
+        ) {
+            return Err(ManifestProvenanceError::new(
+                "build_git_sha_absence_reason",
+                reason.wire_name(),
+                "must be omitted when build_git_sha is present",
+            ));
+        }
         for (field, value) in [
             ("build_git_sha", self.build_git_sha.as_deref()),
+            (
+                "build_git_sha_absence_reason",
+                self.build_git_sha_absence_reason
+                    .as_ref()
+                    .map(|reason| reason.wire_name()),
+            ),
             ("build_lock_digest", self.build_lock_digest.as_deref()),
             ("wire_crate_version", self.wire_crate_version.as_deref()),
             ("store_schema_version", self.store_schema_version.as_deref()),
@@ -678,8 +780,41 @@ impl ManifestProvenance {
     }
 }
 
-/// Build a [`ManifestProvenance`] from raw build facts, normalizing sentinel
-/// and empty values to field omission, then validating canonical declared forms.
+/// Build [`ManifestProvenance`] from legacy raw build facts.
+///
+/// Callers of this compatibility path did not supply the tree state that
+/// explains an omitted SHA. It emits no absence reason not because the absence
+/// has no cause, but because guessing one without that state would fabricate
+/// the fact this API exists to report honestly.
+///
+/// ```
+/// use subc_protocol::manifest::build_provenance;
+///
+/// let provenance = build_provenance(option_env!("CK_BUILD_REV"), None, None)
+///     .expect("legacy build facts remain supported");
+/// assert!(provenance.build_git_sha_absence_reason.is_none());
+/// ```
+///
+/// Sentinel and empty values become field omission before canonical form
+/// validation, preserving the established three-argument wire behavior.
+pub fn build_provenance(
+    build_git_sha: Option<&str>,
+    build_lock_digest: Option<&str>,
+    store_schema_version: Option<&str>,
+) -> Result<ManifestProvenance, ProvenanceFormError> {
+    let build_git_sha = normalize_and_validate_build_git_sha(build_git_sha)?;
+    build_provenance_with_build_git_sha(
+        build_git_sha,
+        None,
+        build_lock_digest,
+        store_schema_version,
+    )
+}
+
+/// Build a [`ManifestProvenance`] from source-state-aware build facts.
+///
+/// The source state makes the SHA absence cause attestable: `Dirty` declines
+/// the commit, while `NeverDerived` and `NoGitDir` name distinct source paths.
 /// A `build_git_sha` must be exactly 40 lowercase hexadecimal characters and a
 /// `build_lock_digest` exactly 64 lowercase hexadecimal characters. Abbreviations
 /// are not conforming; a real value in the wrong form returns a
@@ -691,11 +826,37 @@ impl ManifestProvenance {
 /// that owns the type. This helper constructs `ManifestProvenance`, so it
 /// lives here in subc-protocol (not in subc-client-rs) — transport-direct
 /// modules that never link the client SDK can still build honest provenance.
-pub fn build_provenance(
-    build_git_sha: Option<&str>,
+pub fn build_provenance_from_source(
+    build_git_sha_source: BuildGitShaSource<'_>,
     build_lock_digest: Option<&str>,
     store_schema_version: Option<&str>,
 ) -> Result<ManifestProvenance, ProvenanceFormError> {
+    let (raw_build_git_sha, mut build_git_sha_absence_reason) = match build_git_sha_source {
+        BuildGitShaSource::Git {
+            revision,
+            tree_state,
+        } => match attestable_commit(revision, tree_state) {
+            Some(revision) => (Some(revision), None),
+            None => (None, Some(BuildGitShaAbsenceReason::DeclinedDirty)),
+        },
+        BuildGitShaSource::NeverDerived => (None, Some(BuildGitShaAbsenceReason::NeverDerived)),
+        BuildGitShaSource::NoGitDir => (None, Some(BuildGitShaAbsenceReason::NoGitDir)),
+    };
+    let build_git_sha = normalize_and_validate_build_git_sha(raw_build_git_sha)?;
+    if build_git_sha.is_none() {
+        build_git_sha_absence_reason.get_or_insert(BuildGitShaAbsenceReason::NeverDerived);
+    }
+    build_provenance_with_build_git_sha(
+        build_git_sha,
+        build_git_sha_absence_reason,
+        build_lock_digest,
+        store_schema_version,
+    )
+}
+
+fn normalize_and_validate_build_git_sha(
+    build_git_sha: Option<&str>,
+) -> Result<Option<String>, ProvenanceFormError> {
     let build_git_sha = normalize_provenance_fact(build_git_sha);
     validate_provenance_form(
         "build_git_sha",
@@ -703,7 +864,15 @@ pub fn build_provenance(
         BUILD_GIT_SHA_CANONICAL_FORM,
         40,
     )?;
+    Ok(build_git_sha)
+}
 
+fn build_provenance_with_build_git_sha(
+    build_git_sha: Option<String>,
+    build_git_sha_absence_reason: Option<BuildGitShaAbsenceReason>,
+    build_lock_digest: Option<&str>,
+    store_schema_version: Option<&str>,
+) -> Result<ManifestProvenance, ProvenanceFormError> {
     let build_lock_digest = normalize_provenance_fact(build_lock_digest);
     validate_provenance_form(
         "build_lock_digest",
@@ -714,6 +883,7 @@ pub fn build_provenance(
 
     Ok(ManifestProvenance {
         build_git_sha,
+        build_git_sha_absence_reason,
         build_lock_digest,
         wire_crate_version: Some(crate::SUBC_PROTOCOL_CRATE_VERSION.to_string()),
         store_schema_version: normalize_provenance_fact(store_schema_version),
@@ -1551,6 +1721,7 @@ mod tests {
             }]))
             .provenance(Some(ManifestProvenance {
                 build_git_sha: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+                build_git_sha_absence_reason: None,
                 build_lock_digest: Some(
                     "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string(),
                 ),
@@ -1736,16 +1907,36 @@ mod tests {
             "  unknown  ",
             "",
         ] {
-            let p = build_provenance(Some(sentinel), Some(sentinel), Some(sentinel))
-                .expect("sentinels are omitted before form validation");
+            let p = build_provenance_from_source(
+                BuildGitShaSource::Git {
+                    revision: sentinel,
+                    tree_state: GitTreeState::Clean,
+                },
+                Some(sentinel),
+                Some(sentinel),
+            )
+            .expect("sentinels are omitted before form validation");
             assert_eq!(
-                (p.build_git_sha, p.build_lock_digest, p.store_schema_version),
-                (None, None, None),
+                (
+                    p.build_git_sha,
+                    p.build_git_sha_absence_reason,
+                    p.build_lock_digest,
+                    p.store_schema_version,
+                ),
+                (
+                    None,
+                    Some(BuildGitShaAbsenceReason::NeverDerived),
+                    None,
+                    None,
+                ),
                 "sentinel {sentinel:?} must be omitted, not published"
             );
         }
-        let real = build_provenance(
-            Some("0123456789abcdef0123456789abcdef01234567"),
+        let real = build_provenance_from_source(
+            BuildGitShaSource::Git {
+                revision: "0123456789abcdef0123456789abcdef01234567",
+                tree_state: GitTreeState::Clean,
+            },
             None,
             Some("9"),
         )
@@ -1766,8 +1957,11 @@ mod tests {
 
     #[test]
     fn build_provenance_accepts_canonical_sha_and_lock_digest() {
-        let provenance = build_provenance(
-            Some(" 0123456789abcdef0123456789abcdef01234567 "),
+        let provenance = build_provenance_from_source(
+            BuildGitShaSource::Git {
+                revision: " 0123456789abcdef0123456789abcdef01234567 ",
+                tree_state: GitTreeState::Clean,
+            },
             Some(" abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789 "),
             Some(" schema-v3 "),
         )
@@ -1777,6 +1971,7 @@ mod tests {
             provenance,
             ManifestProvenance {
                 build_git_sha: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+                build_git_sha_absence_reason: None,
                 build_lock_digest: Some(
                     "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string(),
                 ),
@@ -1788,8 +1983,15 @@ mod tests {
 
     #[test]
     fn build_provenance_refuses_an_abbreviated_git_sha() {
-        let error = build_provenance(Some("0123456789ab"), None, None)
-            .expect_err("a 12-character abbreviation is not canonical");
+        let error = build_provenance_from_source(
+            BuildGitShaSource::Git {
+                revision: "0123456789ab",
+                tree_state: GitTreeState::Clean,
+            },
+            None,
+            None,
+        )
+        .expect_err("a 12-character abbreviation is not canonical");
 
         assert_eq!(error.field(), "build_git_sha");
         assert_eq!(error.length(), 12);
@@ -1802,8 +2004,12 @@ mod tests {
 
     #[test]
     fn build_provenance_refuses_an_abbreviated_lock_digest() {
-        let error = build_provenance(None, Some("0123456789abcdef"), None)
-            .expect_err("a 16-character digest is not canonical");
+        let error = build_provenance_from_source(
+            BuildGitShaSource::NeverDerived,
+            Some("0123456789abcdef"),
+            None,
+        )
+        .expect_err("a 16-character digest is not canonical");
 
         assert_eq!(error.field(), "build_lock_digest");
         assert_eq!(error.length(), 16);
@@ -1813,8 +2019,15 @@ mod tests {
     #[test]
     fn build_provenance_refuses_uppercase_hex() {
         let uppercase_sha = "A".repeat(40);
-        let error = build_provenance(Some(&uppercase_sha), None, None)
-            .expect_err("uppercase hexadecimal is not canonical");
+        let error = build_provenance_from_source(
+            BuildGitShaSource::Git {
+                revision: &uppercase_sha,
+                tree_state: GitTreeState::Clean,
+            },
+            None,
+            None,
+        )
+        .expect_err("uppercase hexadecimal is not canonical");
 
         assert_eq!(error.field(), "build_git_sha");
         assert_eq!(error.length(), 40);
@@ -1822,9 +2035,12 @@ mod tests {
     }
 
     #[test]
-    fn build_provenance_refuses_dirty_revision_stamp() {
-        let error = build_provenance(
-            Some("0123456789abcdef0123456789abcdef01234567-dirty"),
+    fn build_provenance_refuses_dirty_revision_stamp_claimed_clean() {
+        let error = build_provenance_from_source(
+            BuildGitShaSource::Git {
+                revision: "0123456789abcdef0123456789abcdef01234567-dirty",
+                tree_state: GitTreeState::Clean,
+            },
             None,
             None,
         )
@@ -1837,8 +2053,11 @@ mod tests {
 
     #[test]
     fn build_provenance_keeps_a_lock_digest_when_identity_is_unavailable() {
-        let provenance = build_provenance(
-            Some("unavailable"),
+        let provenance = build_provenance_from_source(
+            BuildGitShaSource::Git {
+                revision: "unavailable",
+                tree_state: GitTreeState::Clean,
+            },
             Some("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"),
             None,
         )
@@ -1857,8 +2076,12 @@ mod tests {
 
     #[test]
     fn build_provenance_omits_fully_unavailable_inputs() {
-        let provenance = build_provenance(None, Some(" unavailable "), Some("   "))
-            .expect("omitted and sentinel inputs are not form errors");
+        let provenance = build_provenance_from_source(
+            BuildGitShaSource::NeverDerived,
+            Some(" unavailable "),
+            Some("   "),
+        )
+        .expect("omitted and sentinel inputs are not form errors");
 
         assert_eq!(provenance.build_git_sha, None);
         assert_eq!(provenance.build_lock_digest, None);
@@ -1867,5 +2090,115 @@ mod tests {
             provenance.wire_crate_version,
             Some(crate::SUBC_PROTOCOL_CRATE_VERSION.to_string())
         );
+    }
+
+    #[test]
+    fn legacy_build_provenance_keeps_master_wire_bytes_without_an_absence_reason() {
+        let revision = "0123456789abcdef0123456789abcdef01234567";
+        for (input, expected) in [
+            (
+                Some(revision),
+                format!(
+                    r#"{{"build_git_sha":"{revision}","wire_crate_version":"{}"}}"#,
+                    crate::SUBC_PROTOCOL_CRATE_VERSION
+                ),
+            ),
+            (
+                None,
+                format!(
+                    r#"{{"wire_crate_version":"{}"}}"#,
+                    crate::SUBC_PROTOCOL_CRATE_VERSION
+                ),
+            ),
+            (
+                Some("unknown"),
+                format!(
+                    r#"{{"wire_crate_version":"{}"}}"#,
+                    crate::SUBC_PROTOCOL_CRATE_VERSION
+                ),
+            ),
+        ] {
+            let provenance = build_provenance(input, None, None)
+                .expect("the legacy build facts remain constructible");
+            assert_eq!(provenance.build_git_sha_absence_reason, None);
+            assert_eq!(
+                serde_json::to_string(&provenance).expect("legacy provenance serializes"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn build_provenance_derives_git_sha_absence_from_the_stamping_inputs() {
+        let revision = "0123456789abcdef0123456789abcdef01234567";
+        let cases = [
+            (
+                BuildGitShaSource::Git {
+                    revision,
+                    tree_state: GitTreeState::Clean,
+                },
+                Some(revision),
+                None,
+            ),
+            (
+                BuildGitShaSource::Git {
+                    revision,
+                    tree_state: GitTreeState::Dirty,
+                },
+                None,
+                Some(BuildGitShaAbsenceReason::DeclinedDirty),
+            ),
+            (
+                BuildGitShaSource::NeverDerived,
+                None,
+                Some(BuildGitShaAbsenceReason::NeverDerived),
+            ),
+            (
+                BuildGitShaSource::NoGitDir,
+                None,
+                Some(BuildGitShaAbsenceReason::NoGitDir),
+            ),
+        ];
+
+        for (source, expected_sha, expected_reason) in cases {
+            let provenance = build_provenance_from_source(source, None, None)
+                .expect("every stamping state constructs honest provenance");
+            assert_eq!(provenance.build_git_sha.as_deref(), expected_sha);
+            assert_eq!(provenance.build_git_sha_absence_reason, expected_reason);
+        }
+    }
+
+    #[test]
+    fn unknown_git_sha_absence_reason_round_trips_byte_faithfully() {
+        let wire = format!(
+            r#"{{"build_git_sha_absence_reason":"future_stamper_state","wire_crate_version":"{}"}}"#,
+            crate::SUBC_PROTOCOL_CRATE_VERSION
+        );
+        let provenance: ManifestProvenance =
+            serde_json::from_str(&wire).expect("future absence reasons remain readable");
+
+        assert_eq!(
+            provenance.build_git_sha_absence_reason,
+            Some(BuildGitShaAbsenceReason::ForwardCompatibleUnknown(
+                "future_stamper_state".to_string()
+            ))
+        );
+        assert_eq!(
+            serde_json::to_string(&provenance).expect("future absence reason reserializes"),
+            wire
+        );
+    }
+
+    #[test]
+    fn provenance_rejects_an_absence_reason_beside_a_declared_commit() {
+        let error = serde_json::from_value::<ManifestProvenance>(json!({
+            "build_git_sha": "0123456789abcdef0123456789abcdef01234567",
+            "build_git_sha_absence_reason": "declined_dirty"
+        }))
+        .expect_err("a declared commit cannot also claim an absence reason");
+
+        assert!(error.to_string().contains(
+            "build_git_sha_absence_reason has must be omitted when build_git_sha is present"
+        ));
     }
 }

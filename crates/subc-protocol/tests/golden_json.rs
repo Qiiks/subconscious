@@ -282,6 +282,7 @@ fn manifest_provenance_omits_each_unavailable_fact_independently() {
     ] {
         let mut provenance = ManifestProvenance {
             build_git_sha: Some("commit".to_string()),
+            build_git_sha_absence_reason: None,
             build_lock_digest: Some("lock".to_string()),
             wire_crate_version: Some("wire".to_string()),
             store_schema_version: Some("schema".to_string()),
@@ -577,6 +578,7 @@ fn module_hello_body_with_provenance() -> ModuleHelloBody {
     let mut hello = module_hello_body();
     hello.manifest.provenance = Some(ManifestProvenance {
         build_git_sha: Some("0123456789abcdef0123456789abcdef01234567-dirty".to_string()),
+        build_git_sha_absence_reason: None,
         build_lock_digest: Some(
             "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string(),
         ),
