@@ -372,6 +372,11 @@ if [ -n "$free_gb" ]; then
     for t in "$ck_root"/*/target; do
       [ -d "$t" ] && du -sg "$t" 2>/dev/null
     done | sort -rn | head -8 | awk '{printf "    %s GB  %s\n", $1, $2}'
+    # The one automatic lever this seat owns: its OWN trees' debug and
+    # cross-target dirs. Other seats' trees are theirs; the floor line above is
+    # the notice. Three emergencies in a month were all this class.
+    echo "  sweeping this seat's own build debris (subconscious, entorhinal, commons):"
+    "$(dirname "$0")/sweep-build-debris.sh" --floor-gib 150 2>&1 | sed 's/^/    /'
   fi
   [ -n "$tgt_lines" ] && printf "$tgt_lines"
 else
