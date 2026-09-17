@@ -2141,11 +2141,20 @@ async fn supervisor_reload_rejects_new_work_during_drain() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_supervisor_ops_remain_coherent() {
     let server = TestServer::start().await;
+    // The drain budget must comfortably cover the 100 ms slow request below,
+    // because this test asserts `drained: true` -- that the drain WAITED for
+    // the in-flight request rather than timing out on it. 500 ms was enough on
+    // every developer machine and on the CI push run, and not enough on one
+    // hosted Windows release-verify run (0.17.45), where the stub's reply plus
+    // its event-file write crossed the budget and the frame read
+    // `drained: false`. The margin failed, not the mechanism: the drain still
+    // completes in ~100 ms when the request is fast, so widening the ceiling
+    // costs nothing on the passing path.
     let supervisor = supervisor_with_drain_timeout(
         &server,
         1,
         Duration::from_millis(10),
-        Duration::from_millis(500),
+        Duration::from_secs(5),
     );
     let module_id = "fake-aft-supervisor-concurrent";
     let (module, events_path) = spawn_stub_with_events(
