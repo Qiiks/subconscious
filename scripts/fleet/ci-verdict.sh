@@ -31,8 +31,14 @@ if full=$(git rev-parse "$sha^{commit}" 2>/dev/null); then
   sha="$full"
 fi
 
+# One sha can carry SEVERAL push runs when the same tree was pushed to more than
+# one branch (a train/twin branch and then master by fast-forward). Those runs
+# are on identical bytes, but the tag gate reads master's own run, so the
+# verdict is taken on the run for the requested branch (default: master), and
+# every other run is printed so a reader sees what else exists.
+branch="${CI_VERDICT_BRANCH:-master}"
 runs=$(gh run list --repo "$repo" --commit "$sha" --workflow "$workflow" \
-  --json databaseId,event,status,conclusion 2>/dev/null) || {
+  --json databaseId,event,status,conclusion,headBranch 2>/dev/null) || {
   echo "UNCHECKED: cannot list runs for ${sha:0:8} in $repo"
   exit 2
 }
@@ -46,10 +52,10 @@ if [ "$n" = "0" ]; then
   exit 3
 fi
 
-printf '%s' "$runs" | jq -r '.[] | "  \(.event):\(.status):\(.conclusion // "pending")"'
+printf '%s' "$runs" | jq -r '.[] | "  \(.event)@\(.headBranch):\(.status):\(.conclusion // "pending")"'
 
-push_status=$(printf '%s' "$runs" | jq -r '[.[] | select(.event=="push")][0].status // "absent"')
-push_concl=$(printf '%s' "$runs" | jq -r '[.[] | select(.event=="push")][0].conclusion // "none"')
+push_status=$(printf '%s' "$runs" | jq -r --arg b "$branch" '[.[] | select(.event=="push" and .headBranch==$b)][0].status // "absent"')
+push_concl=$(printf '%s' "$runs" | jq -r --arg b "$branch" '[.[] | select(.event=="push" and .headBranch==$b)][0].conclusion // "none"')
 
 case "$push_status" in
   absent)     echo "VERDICT ${sha:0:8}: NO PUSH RUN — $n run(s) exist but none from a push"; exit 3 ;;
@@ -60,7 +66,7 @@ esac
 # A run whose top-level conclusion is success can still contain a cancelled or
 # skipped leg; the tag rule is that every defined leg completed with success on
 # this exact sha.
-id=$(printf '%s' "$runs" | jq -r '[.[] | select(.event=="push")][0].databaseId')
+id=$(printf '%s' "$runs" | jq -r --arg b "$branch" '[.[] | select(.event=="push" and .headBranch==$b)][0].databaseId')
 jobs=$(gh run view "$id" --repo "$repo" --json jobs 2>/dev/null) || {
   echo "VERDICT ${sha:0:8}: push=$push_concl (jobs unreadable)"; exit 2; }
 
