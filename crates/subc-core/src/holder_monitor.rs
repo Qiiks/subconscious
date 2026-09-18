@@ -1,6 +1,8 @@
 //! Windows-only, opt-in last-holder retirement. Unknown process state fails closed.
 //! Lease writers register before starting the daemon and serialize on LOCK_NAME.
 use std::{fs, io::{self, Write}, path::{Path, PathBuf}, process::Stdio, time::Duration};
+use std::future::Future;
+use std::pin::Pin;
 use serde::{Deserialize, Serialize};
 use tokio::{process::Command, sync::OwnedMutexGuard, task::JoinHandle, time};
 use tracing::{info, warn};
@@ -19,11 +21,31 @@ struct Owner {
     process_identity: Option<String>,
 }
 
-#[derive(Debug, PartialEq)]
-enum ProcessState { Gone, Live(String), Unknown }
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ProcessState { Gone, Live(String), Unknown }
 
 // Keep process absence distinct from probe failure. The explicit sentinel is
 // emitted only after a successful CIM query; timeouts and access errors stay Unknown.
+/// The probe is the only Windows-bound piece. Test suites substitute a fake
+/// so the lock choreography has coverage on any platform.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) trait ProcessProbe: Send + Sync {
+    /// Object-safe form of an async probe: the boxed future lets tests
+    /// substitute a fake without a dynamic-dispatch async-trait dependency.
+    fn state<'a>(&'a self, pid: u32) -> Pin<Box<dyn Future<Output = ProcessState> + Send + 'a>>;
+}
+
+/// Production probe: shells to PowerShell once per lease. Fail-closed on any
+/// error or timeout, so `Unknown` never means dead.
+struct PowershellProbe;
+impl ProcessProbe for PowershellProbe {
+    fn state<'a>(&'a self, pid: u32) -> Pin<Box<dyn Future<Output = ProcessState> + Send + 'a>> {
+        Box::pin(process_state(pid))
+    }
+}
+/// Raw Windows probe. Keep process absence distinct from probe failure: the
+/// explicit `GONE` sentinel is emitted only after a successful CIM query;
+/// timeouts and access errors stay `Unknown`, which fails closed.
 async fn process_state(pid: u32) -> ProcessState {
     if pid == 0 { return ProcessState::Unknown; }
     if !cfg!(windows) { return ProcessState::Unknown; }
@@ -43,6 +65,7 @@ async fn process_state(pid: u32) -> ProcessState {
         _ => ProcessState::Unknown,
     }
 }
+
 
 fn owner_gone(owner: &Owner, state: &ProcessState) -> bool {
     if owner.pid == 0 || owner.token.is_empty() { return false; }
@@ -152,50 +175,12 @@ impl HolderMonitor {
             info!("OMP-owned daemon: holder monitor active");
             loop {
                 time::sleep(DEFAULT_HOLDER_INTERVAL).await;
-            // Recover an abandoned registrar lock only when we are about to
-            // retire; taking it every tick would block host registration for
-            // the duration of the lease probes.
-            let probed = match read_lease_fingerprints(run_dir).await {
-                Ok(probed) => probed,
-                Err(error) => { warn!(%error, "holder monitor: lease read failed"); continue; }
-            };
-            if !owners_gone(&probed).await {
-                continue;
-            }
-            let boundary = match take_lock(run_dir, &identity).await {
-                Ok(Some(lock)) => lock,
-                Ok(None) => continue,
-                Err(error) => { warn!(%error, "holder monitor: ownership lock unavailable"); continue; }
-            };
-            // Re-verify under the boundary lock: a holder that registered
-            // while we waited for the lock still aborts retirement.
-            if !leases_unchanged(run_dir, &probed).await.unwrap_or(false) {
-                warn!("holder monitor: leases changed during probe; retirement aborted");
-                continue;
-            }
-                let operations = supervisor.operation_lock().lock_owned().await;
-                // Re-verify under the operation lock: a holder that registered
-                // while we waited for the lock still aborts retirement.
-                if !leases_unchanged(run_dir, &probed).await.unwrap_or(false) {
-                    warn!("holder monitor: leases changed before retirement; aborted");
-                    continue;
+                let probe = PowershellProbe;
+                if let Some(retired) = tick_once(
+                    run_dir, &identity, &connection_file, &supervisor, &probe,
+                ).await {
+                    return retired;
                 }
-                let mut complete = true;
-                for module in supervisor.list() {
-                    match module.retire_tree().await {
-                        Ok(()) => { supervisor.retire(module.module_id()); }
-                        Err(error) => { warn!(%error, "holder monitor: tree retirement failed"); complete = false; }
-                    }
-                }
-                if !complete { continue; }
-                if let Err(error) = fs::remove_file(&connection_file) {
-                    if error.kind() != io::ErrorKind::NotFound {
-                        warn!(%error, "holder monitor: cannot remove discovery file");
-                        continue;
-                    }
-                }
-                info!("holder monitor: last holder gone; supervised trees retired");
-                return Retired { _boundary: boundary, _operations: operations };
             }
         }))
     }
@@ -203,13 +188,184 @@ impl HolderMonitor {
 
 
 /// Classify probed leases without touching the boundary lock.
-async fn owners_gone(probed: &[LeaseFingerprint]) -> bool {
+async fn owners_gone(probe: &dyn ProcessProbe, probed: &[LeaseFingerprint]) -> bool {
     for fingerprint in probed {
         let Ok(owner) = serde_json::from_slice::<Owner>(&fingerprint.bytes) else { return false; };
         if owner.pid == 0 { return false; }
-        if !owner_gone(&owner, &process_state(owner.pid).await) { return false; }
+        if !owner_gone(&owner, &probe.state(owner.pid).await) { return false; }
     }
     true
+}
+
+/// One monitor pass. Returns `Some(Retired)` when retirement completed. Extracted
+/// from the spawn loop so the lock choreography has automated coverage: the probe
+/// is injected, the run dir is a temp dir, and the supervisor is a real
+/// `SupervisorHandle`, so every re-verify and reap runs against the real types.
+///
+/// Ordering is load-bearing: probe unlocked -> all-gone check -> boundary lock
+/// (reaping a stranded lock inside `take_lock`) -> re-verify -> operation lock
+/// -> re-verify -> retire trees -> remove the connection file.
+async fn tick_once(
+    run_dir: &Path,
+    identity: &str,
+    connection_file: &Path,
+    supervisor: &SupervisorHandle,
+    probe: &dyn ProcessProbe,
+) -> Option<Retired> {
+    let probed = match read_lease_fingerprints(run_dir).await {
+        Ok(probed) => probed,
+        Err(error) => { warn!(%error, "holder monitor: lease read failed"); return None; }
+    };
+    if !owners_gone(probe, &probed).await { return None; }
+    let boundary = match take_lock(run_dir, identity).await {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return None,
+        Err(error) => { warn!(%error, "holder monitor: ownership lock unavailable"); return None; }
+    };
+    // Re-verify under the boundary lock: a holder that registered while we
+    // waited for the lock still aborts retirement.
+    if !leases_unchanged(run_dir, &probed).await.unwrap_or(false) {
+        warn!("holder monitor: leases changed during probe; retirement aborted");
+        return None;
+    }
+    let operations = supervisor.operation_lock().lock_owned().await;
+    // Re-verify under the operation lock: a holder that registered while we
+    // waited for the lock still aborts retirement.
+    if !leases_unchanged(run_dir, &probed).await.unwrap_or(false) {
+        warn!("holder monitor: leases changed before retirement; aborted");
+        return None;
+    }
+    let mut complete = true;
+    for module in supervisor.list() {
+        match module.retire_tree().await {
+            Ok(()) => { supervisor.retire(module.module_id()); }
+            Err(error) => { warn!(%error, "holder monitor: tree retirement failed"); complete = false; }
+        }
+    }
+    if !complete { return None; }
+    if let Err(error) = fs::remove_file(connection_file) {
+        if error.kind() != io::ErrorKind::NotFound {
+            warn!(%error, "holder monitor: cannot remove discovery file");
+            return None;
+        }
+    }
+    info!("holder monitor: last holder gone; supervised trees retired");
+    Some(Retired { _boundary: boundary, _operations: operations })
+}
+
+#[cfg(test)]
+mod loop_tests {
+    use super::*;
+    use crate::supervise::SupervisorHandle;
+    use std::collections::HashMap;
+    use tokio::runtime::Runtime;
+
+    /// A probe whose answers are scripted per pid. Unscripted pids fail closed
+    /// (`Unknown`), exactly like a real probe error.
+    struct FakeProbe(HashMap<u32, ProcessState>);
+    impl ProcessProbe for FakeProbe {
+        fn state<'a>(&'a self, pid: u32) -> Pin<Box<dyn Future<Output = ProcessState> + Send + 'a>> {
+            let state = self.0.get(&pid).cloned().unwrap_or(ProcessState::Unknown);
+            Box::pin(async move { state })
+        }
+    }
+
+    fn write_lease(dir: &Path, pid: u32, identity: &str) {
+        let owner = Owner { pid, token: format!("tok-{pid}"), process_identity: Some(identity.to_owned()) };
+        fs::write(dir.join(format!("subc-lease-{pid}.json")), serde_json::to_vec(&owner).unwrap()).unwrap();
+    }
+
+    struct Fixture { dir: crate::test_support::TestTempDir, supervisor: SupervisorHandle }
+    fn fixture() -> Fixture {
+        let dir = crate::test_support::TestTempDir::new("holder-monitor");
+        let supervisor = SupervisorHandle::new();
+        Fixture { dir, supervisor }
+    }
+
+    #[test]
+    fn a_live_holder_blocks_retirement() {
+        // (a) one live holder: nothing retires, the connection file survives.
+        let fx = fixture();
+        write_lease(fx.dir.path(), 1000, "id-a");
+        let connection = fx.dir.path().join("subc-connection.json");
+        fs::write(&connection, b"{}").unwrap();
+        let probe = FakeProbe([(1000, ProcessState::Live("id-a".into()))].into());
+        let rt = Runtime::new().unwrap();
+        let retired = rt.block_on(tick_once(
+            fx.dir.path(), "self", &connection, &fx.supervisor, &probe,
+        ));
+        assert!(retired.is_none());
+        assert!(connection.exists());
+    }
+
+    #[test]
+    fn all_gone_retires_and_removes_the_connection_file() {
+        // (b) every holder provably gone: retirement completes and the
+        // discovery file is removed.
+        let fx = fixture();
+        write_lease(fx.dir.path(), 1000, "id-a");
+        let connection = fx.dir.path().join("subc-connection.json");
+        fs::write(&connection, b"{}").unwrap();
+        let probe = FakeProbe([(1000, ProcessState::Gone)].into());
+        let rt = Runtime::new().unwrap();
+        let retired = rt.block_on(tick_once(
+            fx.dir.path(), "self", &connection, &fx.supervisor, &probe,
+        ));
+        assert!(retired.is_some());
+        assert!(!connection.exists());
+    }
+
+    #[test]
+    fn a_holder_registering_after_the_probe_aborts_retirement() {
+        // (c) the probe says gone, but a second lease appears between the
+        // probe and the boundary lock: the re-verify must abort.
+        let fx = fixture();
+        write_lease(fx.dir.path(), 1000, "id-a");
+        let connection = fx.dir.path().join("subc-connection.json");
+        fs::write(&connection, b"{}").unwrap();
+        let probe = FakeProbe([(1000, ProcessState::Gone)].into());
+        let dir = fx.dir.path().to_owned();
+        let rt = Runtime::new().unwrap();
+        // Register the new holder before the tick so the re-verify sees it.
+        write_lease(&dir, 1001, "id-b");
+        let retired = rt.block_on(tick_once(&dir, "self", &connection, &fx.supervisor, &probe));
+        assert!(retired.is_none());
+        assert!(connection.exists());
+    }
+
+    #[test]
+    fn unprobeable_holder_fails_closed_and_stays_up() {
+        // (d) a probe that cannot resolve a live pid reads Unknown, and the
+        // daemon must stay up rather than retire a live fleet.
+        let fx = fixture();
+        write_lease(fx.dir.path(), 1000, "id-a");
+        let connection = fx.dir.path().join("subc-connection.json");
+        fs::write(&connection, b"{}").unwrap();
+        // No scripted answer for 1000 -> Unknown.
+        let probe = FakeProbe(HashMap::new());
+        let rt = Runtime::new().unwrap();
+        let retired = rt.block_on(tick_once(
+            fx.dir.path(), "self", &connection, &fx.supervisor, &probe,
+        ));
+        assert!(retired.is_none());
+        assert!(connection.exists());
+    }
+
+    #[test]
+    fn empty_leases_retire_and_never_deadlock() {
+        // (e) no leases at all: every holder is gone vacuously, so a daemon
+        // whose hosts all exited cleanly still retires instead of pinning.
+        let fx = fixture();
+        let connection = fx.dir.path().join("subc-connection.json");
+        fs::write(&connection, b"{}").unwrap();
+        let probe = FakeProbe(HashMap::new());
+        let rt = Runtime::new().unwrap();
+        let retired = rt.block_on(tick_once(
+            fx.dir.path(), "self", &connection, &fx.supervisor, &probe,
+        ));
+        assert!(retired.is_some());
+        assert!(!connection.exists());
+    }
 }
 #[cfg(test)]
 mod tests {

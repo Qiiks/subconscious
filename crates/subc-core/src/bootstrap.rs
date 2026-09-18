@@ -28,10 +28,12 @@ use crate::{
     daemon_config::{self, ConfiguredModule, DaemonConfigError},
     server::{serve_listeners, ServerAuth, ServerError},
     supervise::HealthConfig,
-    ConnectedClients, ControlHandler, DaemonSelfWatchdog, DaemonSelfWatchdogConfig, ForwardingTable, HolderMonitor,
+    ConnectedClients, ControlHandler, DaemonSelfWatchdog, DaemonSelfWatchdogConfig, ForwardingTable,
     Registry, RestartPolicy, Router, Supervisor, SupervisorHandle,
     SupervisorProcessLiveness,
 };
+#[cfg(windows)]
+use crate::holder_monitor::HolderMonitor;
 use std::sync::Arc;
 
 pub const DEFAULT_SUBC_PORT: u16 = 8757;
@@ -584,9 +586,12 @@ async fn serve_bound_daemon(
     control.refresh_capability_requirements();
     Arc::clone(&control).spawn_capability_deadline_loop();
 
+    #[cfg(windows)]
     let mut holder_task = HolderMonitor::spawn_if_owned(
         bound.connection_file_path.clone(), supervisor_handle,
     ).map(AbortOnDrop::new);
+    #[cfg(not(windows))]
+    let mut holder_task: Option<AbortOnDrop<()>> = None;
     if let Some(task) = holder_task.as_mut() {
         tokio::select! {
             result = serve_task.join() => {

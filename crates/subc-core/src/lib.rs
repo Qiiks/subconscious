@@ -14,6 +14,7 @@ pub mod daemon_config;
 pub(crate) mod dispatch_spike;
 pub mod fleet_lint;
 pub mod forwarding;
+#[cfg(windows)]
 pub mod holder_monitor;
 pub mod identity;
 pub mod observability;
@@ -57,7 +58,6 @@ pub use supervise::{
     ModuleSpec, ModuleState, ModuleStatus, RestartPolicy, SuperviseError, SupervisedModule,
     Supervisor, SupervisorHandle, SupervisorProcessLiveness, DEFAULT_DRAIN_TIMEOUT, SUBC_ARG,
 };
-pub(crate) use holder_monitor::HolderMonitor;
 pub use watchdog::{
     DaemonSelfWatchdog, DaemonSelfWatchdogConfig, WatchdogStage, WatchdogTickError,
     DEFAULT_SELF_WATCHDOG_DEADLINE, DEFAULT_SELF_WATCHDOG_INTERVAL,

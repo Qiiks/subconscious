@@ -3077,6 +3077,31 @@ async fn handle_supervisor_command(
         }
         SupervisorCommand::Retire { reply, tree } => {
             let result = async {
+                // Drain BEFORE the tree kill: modules hang graceful-stop work off
+                // the GOODBYE the drain delivers (broca seals its WAL, engram
+                // closes a capture). Killing the tree first makes that delivery
+                // a no-op against a dead process and can kill a module mid-write.
+                begin_forwarding_drain_if_configured(
+                    spec,
+                    runtime,
+                    snapshot,
+                    None,
+                    RouteCloseReason::Disable,
+                )
+                .await?;
+                let drain_result = drain_optional_child(
+                    &spec.module_id,
+                    registry,
+                    snapshot,
+                    &runtime.terminal_ring,
+                    child,
+                    runtime.drain_timeout,
+                    ModuleState::Stopped,
+                    None,
+                )
+                .await;
+                // The /T is the right tool for grandchildren, but it belongs at
+                // the kill step, after the drain-and-wait, not ahead of it.
                 if tree {
                     #[cfg(windows)]
                     if let Some(pid) = child.as_ref().and_then(SupervisedChild::id) {
@@ -3101,25 +3126,7 @@ async fn handle_supervisor_command(
                         }
                     }
                 }
-                begin_forwarding_drain_if_configured(
-                    spec,
-                    runtime,
-                    snapshot,
-                    None,
-                    RouteCloseReason::Disable,
-                )
-                .await?;
-                drain_optional_child(
-                    &spec.module_id,
-                    registry,
-                    snapshot,
-                    &runtime.terminal_ring,
-                    child,
-                    runtime.drain_timeout,
-                    ModuleState::Stopped,
-                    None,
-                )
-                .await
+                drain_result
             }
             .await;
             let registration_released = result.is_ok();
