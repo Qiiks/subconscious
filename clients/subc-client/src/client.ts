@@ -1642,6 +1642,20 @@ export class SubcClient {
     const sock = this.sock;
     const generation = this.generation;
 
+    // ONE CODE, TWO SITES, ON PURPOSE. `reverse_request_unhandled` is emitted
+    // both here (no handler registered) and below (a handler that threw), with
+    // different MESSAGES and the same CODE. That is a ruling, not an oversight:
+    // the distinction between "nobody listening" and "the listener broke" is
+    // ours to log, and every provider's decision is identical for both -- not
+    // granted, retry later. A second code would be a second thing every
+    // consumer's decoder must learn for a branch none of them takes. If one ever
+    // needs it, the message carries it. (Settled with prefrontal, the lane's
+    // first consumer, before anyone pinned on it.)
+    //
+    // What must NOT join them: a handler that RETURNS bytes declining the
+    // request answers with an ordinary Response in the provider's own
+    // vocabulary. Error means "the consumer did not answer", never "the consumer
+    // said no" -- that separation is the reason this lane exists.
     const reply = async (): Promise<void> => {
       if (!handler || !method) {
         await this.sendReverseError(
