@@ -32,6 +32,26 @@ if [ -n "$pushed" ]; then
       echo "pre-push: the pushed commit's Cargo.lock does not match its manifests (run cargo update -w or commit the lock)" >&2
       exit 1
     fi
+    # SECOND ARM, and it is not belt-and-braces: the two questions PRODUCE EACH
+    # OTHER (FUSI, 2026-09-18). The remediation for the arm above -- stage
+    # explicit paths so a toolchain's lock rewrite does not ride along -- is
+    # exactly what leaves a CURRENT tree beside a STALE commit. And the
+    # remediation for that (commit the rewritten lock) is what produces the
+    # first. So:
+    #
+    #   archive resolve   does the COMMIT's lock resolve
+    #   cmp equality      is the tree the same file I actually gated against
+    #
+    # Without this, every local gate can pass against a working tree while the
+    # verdict is reported about a different file. Same shape as the
+    # gate-rewrites-its-own-inputs rule: tree clean after the gate is what makes
+    # the verdict be about the commit.
+    if [ -f Cargo.lock ] && ! cmp -s "$tmp/Cargo.lock" Cargo.lock; then
+      echo "pre-push: the working-tree Cargo.lock differs from the commit being pushed --" >&2
+      echo "          your local gates verified a file that is not going to origin." >&2
+      echo "          git diff HEAD -- Cargo.lock, then commit it or restore it." >&2
+      exit 1
+    fi
   fi
 fi
 
