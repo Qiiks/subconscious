@@ -87,48 +87,69 @@ done
 (cd "$staged_dir" && shasum -c "$sidecar" >/dev/null 2>&1) || refuse "staged sidecar does not verify its own artifact: $sidecar"
 say "staged sidecar $sidecar: OK"
 
-# ---- STALENESS: is this artifact the NEWEST staged one for this module? ----
+# ---- CURRENCY: is this the artifact its OWNER says is live? ----
 #
-# Measured 2026-09-18: the staging directory held 84 binaries across all
-# modules, 30 for broca alone, EVERY ONE with a verifying sidecar -- which is
-# this gate's entire placeability test. So thirty artifacts looked exactly as
-# placeable as the live card, and the only thing standing between a wrong
-# placement and a right one was the operator typing a path from the right
-# message. That is a convention, not a mechanism.
+# TWO MECHANISMS, AND ONE OF THEM IS AUTHORITATIVE.
 #
-# The failure it prevents is real and nearly happened: a broca card was
-# superseded upstream hours after it was staged and gated, and I learned it
-# from its owner rather than from anything here.
+#   ck-<module>.current   a manifest the module's owner writes when they hand
+#                         over a card: "<sha256>  <filename>  <UTC stamp>".
+#                         It STATES a fact. Authoritative.
+#   newest-by-mtime       this gate INFERS from file ordering. A fallback, and
+#                         a poor one -- the directory accumulates leftovers, so
+#                         the newest file may be stale too.
 #
-# NOT A REFUSAL OF THE ROLLBACK CASE, because placing an older artifact
-# deliberately must stay a one-liner: it asks for --older rather than blocking.
+# They agreed the first night the manifest existed (broca 0.3.98). THAT
+# AGREEMENT IS EXACTLY WHEN TO DECIDE WHICH ONE WINS, rather than treating
+# concord as validation and discovering the ordering at the moment they
+# disagree -- which would be a placement, with an operator waiting.
 #
-# THIS IS A SPEED BUMP, NOT THE FIX, and the honest limit is that
-# NEWEST-BY-MTIME IS A PROXY FOR CURRENT AND A POOR ONE. Proven while testing
-# it: the arm correctly refused a stale broca artifact and named a "newer" one
-# that is ALSO stale, because the live card had been superseded and renamed out
-# of range. So it reliably catches "you grabbed something old" and cannot tell
-# you what to grab instead. The real fix is the owner naming the current
-# artifact -- a fact the gate can check rather than an ordering it infers.
-newest=$(ls -t "$staged_dir" 2>/dev/null \
-  | grep -E "^(SIGNED\.)?ck-$MODULE\.[0-9a-f]+$" \
-  | head -1)
+# So: manifest present -> it decides, and the mtime arm is not consulted at all.
+# Manifest absent -> mtime, and the line SAYS it is inferring, because a
+# fallback that reads like a verdict is how a guess becomes a fact.
+#
+# Measured 2026-09-18, which is why any of this exists: 84 staged binaries across
+# all modules, 26 for broca alone with verifying sidecars, every one passing this
+# gate's only placeability test. A broca card was superseded upstream hours after
+# it was staged and gated, and I learned it from its owner rather than from here.
+manifest="$staged_dir/ck-$MODULE.current"
 staged_base=$(basename "$STAGED")
-if [ -n "$newest" ] && [ "$newest" != "$staged_base" ]; then
-  if [ "$OLDER" -eq 1 ]; then
-    say "staleness: placing $staged_base although $newest is newer (--older given)"
+if [ -f "$manifest" ]; then
+  want_sha=$(awk 'NR==1{print $1}' "$manifest")
+  want_file=$(awk 'NR==1{print $2}' "$manifest")
+  have_sha=$(shasum -a256 "$STAGED" | awk '{print $1}')
+  if [ "$have_sha" = "$want_sha" ]; then
+    # Name matching is secondary: the sha is the identity. A renamed copy of the
+    # current bytes is the current artifact.
+    say "currency: matches ck-$MODULE.current (owner-declared), sha ${have_sha:0:16}"
+  elif [ "$OLDER" -eq 1 ]; then
+    say "currency: placing $staged_base although the owner declares $want_file current (--older given)"
   else
-    echo "REFUSED: $staged_base is not the newest staged artifact for $MODULE" >&2
-    echo "         newer: $newest" >&2
-    echo "         If this is deliberate (a rollback, or the newer file is not a" >&2
-    echo "         release), pass --older. Otherwise re-read the card." >&2
-    echo "         NOTE: newest-by-mtime is not the same as CURRENT. This directory" >&2
-    echo "         accumulates leftovers, so the newer file named above may be stale" >&2
-    echo "         too -- it is stated as a fact, not a recommendation." >&2
+    echo "REFUSED: $staged_base is not what ck-$MODULE.current declares" >&2
+    echo "         owner declares: $want_file  ${want_sha:0:16}" >&2
+    echo "         you passed:     $staged_base  ${have_sha:0:16}" >&2
+    echo "         The manifest is the module owner's statement of which artifact is" >&2
+    echo "         live. If this is deliberate (a rollback), pass --older." >&2
     exit 2
   fi
 else
-  say "staleness: $staged_base is the newest staged artifact for $MODULE"
+  newest=$(ls -t "$staged_dir" 2>/dev/null \
+    | grep -E "^(SIGNED\.)?ck-$MODULE\.[0-9a-f]+$" \
+    | head -1)
+  if [ -n "$newest" ] && [ "$newest" != "$staged_base" ]; then
+    if [ "$OLDER" -eq 1 ]; then
+      say "currency: INFERRED from mtime (no ck-$MODULE.current); placing $staged_base although $newest is newer (--older given)"
+    else
+      echo "REFUSED: $staged_base is not the newest staged artifact for $MODULE" >&2
+      echo "         newer: $newest" >&2
+      echo "         INFERRED FROM MTIME -- there is no ck-$MODULE.current manifest, so" >&2
+      echo "         this gate is GUESSING from file ordering. The named file may be" >&2
+      echo "         stale too; it is a fact about timestamps, not a recommendation." >&2
+      echo "         Ask the module owner to write ck-$MODULE.current, or pass --older." >&2
+      exit 2
+    fi
+  else
+    say "currency: INFERRED from mtime (no ck-$MODULE.current); $staged_base is newest"
+  fi
 fi
 
 # Signing posture must match the running image: an ad-hoc re-sign of a Developer ID
