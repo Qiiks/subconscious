@@ -35,8 +35,43 @@
 set -uo pipefail
 
 ROOT="${CK_PROJECTS_ROOT:-$HOME/Work/Projects/CortexKit}"
-REPOS=(engram synapse plexus claustrum astrocyte fusiform entorhinal wernicke cerebellum insula broca prefrontal thalamus callosum aft magic-context)
 UPSTREAMS=(subconscious commons)
+
+# THE CONSUMER SET IS DISCOVERED, NEVER WRITTEN DOWN.
+#
+# It was a hardcoded 16-name array until 2026-09-18, and it was wrong in both
+# directions: it MISSED alfonso-tui, which path-deps subc-client-rs and
+# subc-protocol from its root manifest and had therefore never had a lock
+# checked; and it LISTED aft and thalamus, which consume no path deps at all
+# (thalamus pins subc by git rev, so a bump here cannot reach it until it
+# repins). Neither error was visible from the script's output: it reported
+# "examined 16 path-dependent repos" whether or not the seventeenth existed.
+#
+# A hardcoded list is A CLAIM ABOUT ANOTHER FILE, and this guard cannot tell you
+# when that claim expires -- which is the same defect one layer up from the one
+# it exists to catch (FUSI, who hit it building the mirror of this check).
+#
+# Discovery reads the fleet convention: root manifest plus crates/*/Cargo.toml,
+# looking for a path dep naming an upstream. Local clones are excluded by their
+# origin pointing inside $ROOT, so a scratch copy of a seat is not counted as a
+# second seat.
+discover_consumers() {
+  local repo name origin
+  for repo in "$ROOT"/*/; do
+    name=$(basename "$repo")
+    [ -d "$repo/.git" ] || continue
+    case " ${UPSTREAMS[*]} " in *" $name "*) continue ;; esac
+    origin=$(git -C "$repo" remote get-url origin 2>/dev/null || true)
+    case "$origin" in "$ROOT"/*) continue ;; esac
+    if [ "$(cat "$repo"/Cargo.toml "$repo"/crates/*/Cargo.toml 2>/dev/null \
+         | grep -cE '^[a-z0-9_-]+ *= *\{[^}]*path *= *"[^"]*(subconscious|commons)/')" -gt 0 ]; then
+      printf '%s\n' "$name"
+    fi
+  done
+}
+
+REPOS=()
+while IFS= read -r line; do REPOS+=("$line"); done < <(discover_consumers)
 
 examined=0
 bad=0
