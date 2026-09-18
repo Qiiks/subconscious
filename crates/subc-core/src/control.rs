@@ -1573,6 +1573,30 @@ impl ControlHandler {
     /// `code`/`module_id`/`connection_id` returns both directions of the same
     /// decision rather than two shapes a reader has to join by hand.
     ///
+    /// `module_id` IS RENDERED BARE HERE AND DEBUG-ESCAPED ON THE REFUSAL PATH,
+    /// and the difference carries information rather than being an
+    /// inconsistency. This line is only reachable after a successful bind to a
+    /// REGISTERED module, so the value has already passed HELLO validation
+    /// including the path-hazard refusal and cannot contain control bytes. A
+    /// refused id may be arbitrary attacker-chosen bytes and must stay escaped.
+    /// So A QUOTED `module_id` IN THE LOG MEANS THE VALUE WAS NEVER VALIDATED.
+    ///
+    /// Bare is also what every other daemon line already emits (`module
+    /// registered`, `configured module supervised`). Shipping `?module_id` here
+    /// made this instrument the only one in the file whose ids did not answer
+    /// `grep module_id=broca` -- 3 hits against 342 for the escaped form, in a
+    /// line whose whole purpose is being grepped beside its sibling.
+    ///
+    /// THIS RENDERING IS UNFENCED AND THE REASON IS WORTH KNOWING: the in-crate
+    /// `EventCapture` test layer implements only `record_debug`, so `Visit`
+    /// forwards every field type through it and a bare `&str` and a `?`-escaped
+    /// one are recorded identically. A test written against that harness passes
+    /// either way -- I wrote one, measured it, and deleted it rather than ship a
+    /// green assertion that cannot fail. The same limit applies to the escaping
+    /// assertion in `route_open_supervised_absence_emits_refusal_fields_and_counts_code`:
+    /// it reads as a guard on the Debug escaping and cannot detect its removal.
+    /// Fencing either needs the real formatter, not the capture layer.
+    ///
     /// `peer_addr` is NOT here and cannot be: `SO_PEERCRED`/`LOCAL_PEERPID` are
     /// unix-socket options and subc is loopback TCP, so there is no peer identity
     /// to record. The ephemeral port would decay within minutes and answer only a
@@ -1585,7 +1609,7 @@ impl ControlHandler {
         info!(
             target: "subc_core::control",
             principal,
-            module_id = ?module_id,
+            module_id,
             connection_id = ctx.connection_id.get(),
             "route.open accepted"
         );
