@@ -5,9 +5,10 @@ pub mod policy_cache;
 pub use consumer::{
     is_retryable_route_open_code, CallError, CallOptions, CatalogList, CloseRouteOptions,
     ConnectionState, ConsumerError, ConsumerOptions, ControlPush, PushEvent, RetryBackoff,
-    RouteCloseDisposition, RouteCloseReason, RoutePollResult, SubcConsumer, SubscribeOptions,
-    Subscription, SubscriptionClosed, DEFAULT_CALL_TIMEOUT, DEFAULT_LIVENESS_PROBE_WINDOW,
-    DEFAULT_ROUTE_RETRY_DEADLINE,
+    ReverseRequestContext, ReverseRequestError, ReverseRequestRegistrationError,
+    ReverseRequestRegistry, RouteCloseDisposition, RouteCloseReason, RoutePollResult, SubcConsumer,
+    SubscribeOptions, Subscription, SubscriptionClosed, DEFAULT_CALL_TIMEOUT,
+    DEFAULT_LIVENESS_PROBE_WINDOW, DEFAULT_ROUTE_RETRY_DEADLINE,
 };
 pub use policy_cache::{
     PolicyResolveError, PolicyResolver, PolicyResolverConfig, PolicyVerdict, ProjectRef, Subject,
@@ -84,11 +85,12 @@ type InFlight = Arc<Mutex<HashMap<RequestKey, CancellationToken>>>;
 /// Only `channel` and `epoch` are serialized. The private connection token prevents
 /// work retained from an earlier connection from acting on a later connection that
 /// happens to reuse the same wire pair.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy)]
 pub struct RouteHandle {
     pub channel: u16,
     pub epoch: u32,
     connection_token: u64,
+    reverse_request_registry_id: u64,
 }
 
 impl RouteHandle {
@@ -97,11 +99,77 @@ impl RouteHandle {
             channel,
             epoch,
             connection_token,
+            reverse_request_registry_id: 0,
+        }
+    }
+
+    pub(crate) fn new_consumer(
+        channel: u16,
+        epoch: u32,
+        connection_token: u64,
+        reverse_requests: ReverseRequestRegistry,
+    ) -> Self {
+        reverse_requests.seal();
+        Self {
+            channel,
+            epoch,
+            connection_token,
+            reverse_request_registry_id: consumer::install_reverse_request_registry(
+                reverse_requests,
+            ),
         }
     }
 
     pub(crate) fn connection_token(self) -> u64 {
         self.connection_token
+    }
+
+    pub fn on_request<F, Fut>(
+        &self,
+        method_family: impl Into<String>,
+        handler: F,
+    ) -> Result<(), ReverseRequestRegistrationError>
+    where
+        F: Fn(Vec<u8>, ReverseRequestContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Vec<u8>> + Send + 'static,
+    {
+        consumer::route_reverse_request_registry(self.reverse_request_registry_id)?
+            .on_request(method_family, handler)
+    }
+
+    pub fn on_request_fallible<F, Fut>(
+        &self,
+        method_family: impl Into<String>,
+        handler: F,
+    ) -> Result<(), ReverseRequestRegistrationError>
+    where
+        F: Fn(Vec<u8>, ReverseRequestContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Vec<u8>, ReverseRequestError>> + Send + 'static,
+    {
+        consumer::route_reverse_request_registry(self.reverse_request_registry_id)?
+            .on_request_fallible(method_family, handler)
+    }
+
+    pub(crate) fn reverse_request_registry_id(self) -> u64 {
+        self.reverse_request_registry_id
+    }
+}
+
+impl PartialEq for RouteHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.channel == other.channel
+            && self.epoch == other.epoch
+            && self.connection_token == other.connection_token
+    }
+}
+
+impl Eq for RouteHandle {}
+
+impl std::hash::Hash for RouteHandle {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.channel, state);
+        std::hash::Hash::hash(&self.epoch, state);
+        std::hash::Hash::hash(&self.connection_token, state);
     }
 }
 

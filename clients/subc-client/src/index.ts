@@ -35,7 +35,14 @@ export {
   type RoutePollKind,
   type RoutePollResult,
 } from "./client.js";
-export { RouteHandle, StaleRouteHandleError } from "./route-handle.js";
+export {
+  ReverseRequestRegistry,
+  ReverseRequestRegistrationError,
+  RouteHandle,
+  StaleRouteHandleError,
+  type ReverseRequestContext,
+  type ReverseRequestHandler,
+} from "./route-handle.js";
 export {
   readConnectionFile,
   ConnectionFileError,

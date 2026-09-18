@@ -303,6 +303,13 @@ impl AsyncRead)`; TS `callStreamed(moduleId, head, ReadableStream)`. The
 binary-body gap noted in Rust (`send_request` hardcodes `Flags::new(false,…)`)
 and Swift (`beginRouteRequest` binary:false) closes in the same wave.
 
+**Deferred from this wave:** this affordance requires per-operation
+`streamed_body_max_bytes` and `streamed_body_digest` fields on
+`ManagementOperation`; those fields do not exist at
+`crates/subc-protocol/src/manifest.rs:1473-1480`. It is therefore a wire change,
+not an SDK-only affordance, and belongs in a later versioned wave with its own
+crate bump and fleet notice.
+
 ## 4. `connection_file::discovery_candidates` treats empty as unset (subc-transport)
 
 `discover()` already filters `SUBC_CONNECTION_FILE=""` via

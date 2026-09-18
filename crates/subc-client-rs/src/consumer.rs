@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     error::Error,
     fmt,
     future::Future,
@@ -8,7 +8,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex, MutexGuard,
+        Arc, Mutex, MutexGuard, OnceLock,
     },
     task::{Context, Poll},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -19,8 +19,8 @@ use subc_control::{
 };
 use subc_protocol::{
     error_codes, manifest::is_valid_capability_identifier, AdmissionClass, BindIdentity, ErrorBody,
-    Flags, Frame, FrameBuildError, FrameType, Priority, RouteTarget, SUBC_LAUNCH_NONCE_ENV,
-    SUBC_MODULE_ID_ENV,
+    Flags, Frame, FrameBuildError, FrameType, Priority, RouteTarget, FLAG_SUBSCRIPTION,
+    SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV,
 };
 
 use crate::RouteHandle;
@@ -51,6 +51,238 @@ const EGRESS_BUFFER: usize = 128;
 const DEFAULT_ROUTE_WINDOW: usize = 1024;
 const DEFAULT_SUBSCRIPTION_EVENT_BUFFER: usize = 128;
 const DEFAULT_PUSH_EVENT_BUFFER: usize = 128;
+const REVERSE_REQUEST_UNHANDLED: &str = "reverse_request_unhandled";
+
+type ReverseRequestFuture =
+    Pin<Box<dyn Future<Output = Result<Vec<u8>, ReverseRequestError>> + Send + 'static>>;
+type ReverseRequestHandler =
+    Arc<dyn Fn(Vec<u8>, ReverseRequestContext) -> ReverseRequestFuture + Send + Sync + 'static>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReverseRequestContext {
+    pub corr: u64,
+    pub method: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReverseRequestError {
+    message: String,
+}
+
+impl ReverseRequestError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for ReverseRequestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl Error for ReverseRequestError {}
+
+#[derive(Default)]
+struct ReverseRequestRegistryState {
+    handlers: HashMap<String, ReverseRequestHandler>,
+    declared_families: Option<BTreeSet<String>>,
+}
+
+/// Handler registry prepared before route.open. Its method families are the
+/// route's derived consumer_capabilities declaration.
+#[derive(Clone, Default)]
+pub struct ReverseRequestRegistry {
+    inner: Arc<Mutex<ReverseRequestRegistryState>>,
+}
+
+impl fmt::Debug for ReverseRequestRegistry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReverseRequestRegistry")
+            .field("capabilities", &self.capabilities())
+            .finish()
+    }
+}
+
+impl PartialEq for ReverseRequestRegistry {
+    fn eq(&self, other: &Self) -> bool {
+        self.capabilities() == other.capabilities()
+    }
+}
+
+impl Eq for ReverseRequestRegistry {}
+
+impl ReverseRequestRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn on_request<F, Fut>(
+        &self,
+        method_family: impl Into<String>,
+        handler: F,
+    ) -> Result<(), ReverseRequestRegistrationError>
+    where
+        F: Fn(Vec<u8>, ReverseRequestContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Vec<u8>> + Send + 'static,
+    {
+        self.on_request_fallible(method_family, move |body, ctx| {
+            let future = handler(body, ctx);
+            async move { Ok(future.await) }
+        })
+    }
+
+    pub fn on_request_fallible<F, Fut>(
+        &self,
+        method_family: impl Into<String>,
+        handler: F,
+    ) -> Result<(), ReverseRequestRegistrationError>
+    where
+        F: Fn(Vec<u8>, ReverseRequestContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Vec<u8>, ReverseRequestError>> + Send + 'static,
+    {
+        let method_family = method_family.into();
+        if !is_valid_method_family(&method_family) {
+            return Err(ReverseRequestRegistrationError::InvalidFamily(
+                method_family,
+            ));
+        }
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state
+            .declared_families
+            .as_ref()
+            .is_some_and(|families| !families.contains(&method_family))
+        {
+            return Err(ReverseRequestRegistrationError::NotDeclared(method_family));
+        }
+        state.handlers.insert(
+            method_family,
+            Arc::new(move |body, ctx| Box::pin(handler(body, ctx))),
+        );
+        Ok(())
+    }
+
+    fn capabilities(&self) -> Vec<String> {
+        let state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut capabilities = state.handlers.keys().cloned().collect::<Vec<_>>();
+        capabilities.sort();
+        capabilities
+    }
+
+    fn handler(&self, method_family: &str) -> Option<ReverseRequestHandler> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .handlers
+            .get(method_family)
+            .cloned()
+    }
+
+    pub(crate) fn seal(&self) {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.declared_families.is_none() {
+            state.declared_families = Some(state.handlers.keys().cloned().collect());
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReverseRequestRegistrationError {
+    InvalidFamily(String),
+    NotDeclared(String),
+    NotConsumerRoute,
+}
+
+impl fmt::Display for ReverseRequestRegistrationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidFamily(family) => {
+                write!(f, "invalid reverse-request method family {family:?}")
+            }
+            Self::NotDeclared(family) => write!(
+                f,
+                "reverse-request capability {family:?} was not registered before route.open"
+            ),
+            Self::NotConsumerRoute => {
+                f.write_str("route handle does not belong to a consumer route")
+            }
+        }
+    }
+}
+
+impl Error for ReverseRequestRegistrationError {}
+
+fn is_valid_method_family(value: &str) -> bool {
+    let mut segments = value.split(['.', '_', '-']);
+    segments.next().is_some_and(|segment| {
+        segment
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_lowercase)
+            && segment
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+    }) && segments.all(|segment| {
+        !segment.is_empty()
+            && segment
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+    })
+}
+
+static NEXT_REVERSE_REQUEST_REGISTRY_ID: AtomicU64 = AtomicU64::new(1);
+static REVERSE_REQUEST_REGISTRIES: OnceLock<Mutex<HashMap<u64, ReverseRequestRegistry>>> =
+    OnceLock::new();
+
+fn reverse_request_registries() -> &'static Mutex<HashMap<u64, ReverseRequestRegistry>> {
+    REVERSE_REQUEST_REGISTRIES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn install_reverse_request_registry(registry: ReverseRequestRegistry) -> u64 {
+    let id = NEXT_REVERSE_REQUEST_REGISTRY_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .expect("reverse-request route registry id exhausted");
+    reverse_request_registries()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(id, registry);
+    id
+}
+
+pub(crate) fn route_reverse_request_registry(
+    id: u64,
+) -> Result<ReverseRequestRegistry, ReverseRequestRegistrationError> {
+    if id == 0 {
+        return Err(ReverseRequestRegistrationError::NotConsumerRoute);
+    }
+    reverse_request_registries()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&id)
+        .cloned()
+        .ok_or(ReverseRequestRegistrationError::NotConsumerRoute)
+}
+
+fn release_reverse_request_registry(handle: RouteHandle) {
+    let id = handle.reverse_request_registry_id();
+    if id != 0 {
+        reverse_request_registries()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&id);
+    }
+}
 
 /// Capped exponential backoff used for reconnects and transient route-open retry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,11 +351,8 @@ pub struct CloseRouteOptions {
     /// when absent, SUBC_MODULE_ID and SUBC_LAUNCH_NONCE environment variables
     /// identify the route for a supervised consumer.
     pub consumer_identity: Option<ConsumerIdentity>,
-    /// Consumer-declared reverse-request capabilities for the route being closed.
-    /// This is a declaration, not a verified privilege; providers treat an absent
-    /// field as no reverse-request capability. Known MCP method-family values
-    /// today are "elicitation", "sampling", and "roots".
-    pub consumer_capabilities: Option<Vec<String>>,
+    /// The registry whose derived capability set identifies the route being closed.
+    pub reverse_requests: ReverseRequestRegistry,
 }
 
 impl Default for CloseRouteOptions {
@@ -132,7 +361,7 @@ impl Default for CloseRouteOptions {
             drain: false,
             drain_timeout: DEFAULT_CALL_TIMEOUT,
             consumer_identity: None,
-            consumer_capabilities: None,
+            reverse_requests: ReverseRequestRegistry::new(),
         }
     }
 }
@@ -150,11 +379,9 @@ pub struct CallOptions {
     pub route_retry_deadline: Duration,
     /// Explicit consumer identity for route.open; when absent, non-empty SUBC_MODULE_ID and SUBC_LAUNCH_NONCE environment variables are used.
     pub consumer_identity: Option<ConsumerIdentity>,
-    /// Consumer-declared reverse-request capabilities for route.open. This is a
-    /// declaration, not a verified privilege; providers treat an absent field as
-    /// no reverse-request capability. Known MCP method-family values today are
-    /// "elicitation", "sampling", and "roots".
-    pub consumer_capabilities: Option<Vec<String>>,
+    /// Reverse-request handlers for this route. consumer_capabilities is derived
+    /// from the registered method families and omitted when this registry is empty.
+    pub reverse_requests: ReverseRequestRegistry,
 }
 
 impl Default for CallOptions {
@@ -166,7 +393,7 @@ impl Default for CallOptions {
             route_retry: RetryBackoff::default(),
             route_retry_deadline: DEFAULT_ROUTE_RETRY_DEADLINE,
             consumer_identity: None,
-            consumer_capabilities: None,
+            reverse_requests: ReverseRequestRegistry::new(),
         }
     }
 }
@@ -189,11 +416,9 @@ pub struct SubscribeOptions {
     pub route_open_timeout: Duration,
     /// Explicit consumer identity for route.open; when absent, non-empty SUBC_MODULE_ID and SUBC_LAUNCH_NONCE environment variables are used.
     pub consumer_identity: Option<ConsumerIdentity>,
-    /// Consumer-declared reverse-request capabilities for route.open. This is a
-    /// declaration, not a verified privilege; providers treat an absent field as
-    /// no reverse-request capability. Known MCP method-family values today are
-    /// "elicitation", "sampling", and "roots".
-    pub consumer_capabilities: Option<Vec<String>>,
+    /// Reverse-request handlers for this route. consumer_capabilities is derived
+    /// from the registered method families and omitted when this registry is empty.
+    pub reverse_requests: ReverseRequestRegistry,
 }
 
 impl Default for SubscribeOptions {
@@ -206,7 +431,7 @@ impl Default for SubscribeOptions {
             route_retry_deadline: DEFAULT_ROUTE_RETRY_DEADLINE,
             route_open_timeout: DEFAULT_CALL_TIMEOUT,
             consumer_identity: None,
-            consumer_capabilities: None,
+            reverse_requests: ReverseRequestRegistry::new(),
         }
     }
 }
@@ -473,6 +698,7 @@ impl SubcConsumer {
             identity: &identity,
             consumer_identity: &consumer_identity,
             consumer_capabilities: &consumer_capabilities,
+            reverse_requests: &opts.reverse_requests,
         };
         self.shared
             .ensure_route(&key, &params, &opts, deadline)
@@ -502,7 +728,7 @@ impl SubcConsumer {
         })
         .map_err(|err| CallError::not_sent(format!("failed to encode route.open: {err}")))?;
 
-        let terminal = self.shared.control_call(body, deadline, true).await?;
+        let terminal = self.shared.control_call(body, deadline, true, None).await?;
         let TerminalFrame::Response {
             generation, body, ..
         } = terminal
@@ -541,7 +767,7 @@ impl SubcConsumer {
         loop {
             match self
                 .shared
-                .control_call(body.clone(), deadline, false)
+                .control_call(body.clone(), deadline, false, None)
                 .await
             {
                 Ok(TerminalFrame::Response { body, .. }) => {
@@ -640,6 +866,7 @@ impl SubcConsumer {
                 admission_class: opts.admission_class,
                 deadline,
                 retain_late_route_open: false,
+                route_open_reverse_requests: None,
             })
             .await;
         drop(permit);
@@ -708,6 +935,7 @@ impl SubcConsumer {
                 admission_class: AdmissionClass::Normal,
                 deadline,
                 retain_late_route_open: false,
+                route_open_reverse_requests: None,
             })
             .await?;
         let TerminalFrame::Response { body, .. } = terminal else {
@@ -831,6 +1059,7 @@ impl SubcConsumer {
             identity: &identity,
             consumer_identity: &consumer_identity,
             consumer_capabilities: &consumer_capabilities,
+            reverse_requests: &opts.reverse_requests,
         };
 
         loop {
@@ -870,6 +1099,7 @@ impl SubcConsumer {
                     admission_class: opts.admission_class,
                     deadline: call_deadline,
                     retain_late_route_open: false,
+                    route_open_reverse_requests: None,
                 })
                 .await;
             drop(permit);
@@ -932,7 +1162,7 @@ impl SubcConsumer {
             route_retry: opts.route_retry,
             route_retry_deadline: opts.route_retry_deadline,
             consumer_identity: opts.consumer_identity.clone(),
-            consumer_capabilities: opts.consumer_capabilities.clone(),
+            reverse_requests: opts.reverse_requests.clone(),
         };
         let consumer_identity = route_open_consumer_identity(&route_opts);
         let consumer_capabilities = route_open_consumer_capabilities(&route_opts);
@@ -948,6 +1178,7 @@ impl SubcConsumer {
             identity: &identity,
             consumer_identity: &consumer_identity,
             consumer_capabilities: &consumer_capabilities,
+            reverse_requests: &opts.reverse_requests,
         };
 
         loop {
@@ -1340,6 +1571,7 @@ impl Inner {
         let route = self.routes.remove(key)?;
         let indexed = self.route_by_channel.remove(&route.handle.channel);
         debug_assert_eq!(indexed.as_ref(), Some(key));
+        release_reverse_request_registry(route.handle);
         Some(route)
     }
 
@@ -1354,20 +1586,30 @@ impl Inner {
                 return self.remove_route(&key);
             }
         }
-        self.one_shot_routes
+        let route = self
+            .one_shot_routes
             .get(&handle.channel)
             .is_some_and(|route| route.handle == handle)
             .then(|| self.one_shot_routes.remove(&handle.channel))
-            .flatten()
+            .flatten();
+        if let Some(route) = &route {
+            release_reverse_request_registry(route.handle);
+        }
+        route
     }
 
     fn drain_routes(&mut self) -> Vec<RouteState> {
         self.route_by_channel.clear();
-        self.routes
+        let routes = self
+            .routes
             .drain()
             .map(|(_, route)| route)
             .chain(self.one_shot_routes.drain().map(|(_, route)| route))
-            .collect()
+            .collect::<Vec<_>>();
+        for route in &routes {
+            release_reverse_request_registry(route.handle);
+        }
+        routes
     }
 
     fn close_routes(&mut self) {
@@ -1835,7 +2077,15 @@ impl Shared {
                 admission_facts: None,
             })
             .map_err(|err| CallError::not_sent(format!("failed to encode route.open: {err}")))?;
-            match self.control_call(body, route_deadline, true).await {
+            match self
+                .control_call(
+                    body,
+                    route_deadline,
+                    true,
+                    Some(route_open.reverse_requests.clone()),
+                )
+                .await
+            {
                 Ok(TerminalFrame::Response {
                     generation, body, ..
                 }) => {
@@ -1854,8 +2104,18 @@ impl Shared {
                             "route.open returned an unexpected control response",
                         ));
                     };
+                    let handle = self
+                        .ingress_handle(generation, route_channel, route_epoch)
+                        .unwrap_or_else(|| {
+                            RouteHandle::new_consumer(
+                                route_channel,
+                                route_epoch,
+                                generation,
+                                route_open.reverse_requests.clone(),
+                            )
+                        });
                     let route = RouteState {
-                        handle: RouteHandle::new(route_channel, route_epoch, generation),
+                        handle,
                         sem: Arc::new(Semaphore::new(DEFAULT_ROUTE_WINDOW)),
                     };
                     let install = {
@@ -1953,6 +2213,7 @@ impl Shared {
         body: Vec<u8>,
         deadline: Instant,
         retain_late_route_open: bool,
+        route_open_reverse_requests: Option<ReverseRequestRegistry>,
     ) -> Result<TerminalFrame, CallError> {
         self.ensure_connected_for_call(deadline).await?;
         self.send_request(RequestSend {
@@ -1964,6 +2225,7 @@ impl Shared {
             admission_class: AdmissionClass::Normal,
             deadline,
             retain_late_route_open,
+            route_open_reverse_requests,
         })
         .await
     }
@@ -1981,6 +2243,7 @@ impl Shared {
             admission_class,
             deadline,
             retain_late_route_open,
+            route_open_reverse_requests,
         } = request;
         if Instant::now() >= deadline {
             return Err(CallError::not_sent(
@@ -2053,7 +2316,12 @@ impl Shared {
                 .flatten();
             inner.pending.insert(
                 key,
-                PendingEntry::unary(tx, retain_late_route_open, expected_control_handle),
+                PendingEntry::unary(
+                    tx,
+                    retain_late_route_open,
+                    expected_control_handle,
+                    route_open_reverse_requests,
+                ),
             );
         }
         let mut registration =
@@ -2271,7 +2539,12 @@ impl Shared {
 
         let frame = Frame::build(
             FrameType::Request,
-            Flags::new(false, priority, false).with_admission_class(admission_class),
+            Flags(
+                Flags::new(false, priority, false)
+                    .with_admission_class(admission_class)
+                    .0
+                    | FLAG_SUBSCRIPTION,
+            ),
             channel,
             epoch,
             corr,
@@ -2783,6 +3056,7 @@ impl Shared {
         if inner.route_epochs.get(&handle.channel) == Some(&handle) {
             inner.route_epochs.remove(&handle.channel);
             inner.push_event_receivers.remove(&handle);
+            release_reverse_request_registry(handle);
         }
     }
 
@@ -2918,6 +3192,7 @@ struct RouteOpenParams<'a> {
     identity: &'a BindIdentity,
     consumer_identity: &'a Option<ConsumerIdentity>,
     consumer_capabilities: &'a Option<Vec<String>>,
+    reverse_requests: &'a ReverseRequestRegistry,
 }
 
 struct RequestSend {
@@ -2929,6 +3204,7 @@ struct RequestSend {
     admission_class: AdmissionClass,
     deadline: Instant,
     retain_late_route_open: bool,
+    route_open_reverse_requests: Option<ReverseRequestRegistry>,
 }
 
 struct SubscriptionSend {
@@ -3192,6 +3468,7 @@ struct PendingEntry {
     accepted: bool,
     retain_late_route_open: bool,
     expected_control_handle: Option<RouteHandle>,
+    route_open_reverse_requests: Option<ReverseRequestRegistry>,
     completion: PendingCompletion,
 }
 
@@ -3216,11 +3493,13 @@ impl PendingEntry {
         tx: oneshot::Sender<PendingResult>,
         retain_late_route_open: bool,
         expected_control_handle: Option<RouteHandle>,
+        route_open_reverse_requests: Option<ReverseRequestRegistry>,
     ) -> Self {
         Self {
             accepted: false,
             retain_late_route_open,
             expected_control_handle,
+            route_open_reverse_requests,
             completion: PendingCompletion::Unary(tx),
         }
     }
@@ -3235,6 +3514,7 @@ impl PendingEntry {
             accepted: false,
             retain_late_route_open: false,
             expected_control_handle: None,
+            route_open_reverse_requests: None,
             completion: PendingCompletion::Subscription {
                 events,
                 closed,
@@ -3460,6 +3740,100 @@ async fn open_connection_with_info(
     Ok(OpenedConnection { stream })
 }
 
+fn dispatch_reverse_request(shared: &Arc<Shared>, frame: Frame, handle: RouteHandle) {
+    let method = serde_json::from_slice::<serde_json::Value>(&frame.body)
+        .ok()
+        .and_then(|body| body.get("method")?.as_str().map(str::to_string));
+    let method_family = method
+        .as_deref()
+        .and_then(|method| method.split('/').next())
+        .filter(|family| !family.is_empty())
+        .map(str::to_string);
+    let handler = method_family.as_deref().and_then(|family| {
+        route_reverse_request_registry(handle.reverse_request_registry_id())
+            .ok()?
+            .handler(family)
+    });
+    let generation = handle.connection_token();
+    let shared = Arc::clone(shared);
+
+    tokio::spawn(async move {
+        let (frame_type, body) = if let (Some(handler), Some(method)) = (handler, method) {
+            let request_body = frame.body.clone();
+            let corr = frame.header.corr;
+            match tokio::spawn(async move {
+                handler(request_body, ReverseRequestContext { corr, method }).await
+            })
+            .await
+            {
+                Ok(Ok(body)) => (FrameType::Response, body),
+                Ok(Err(err)) => (
+                    FrameType::Error,
+                    serde_json::to_vec(&ErrorBody::new(REVERSE_REQUEST_UNHANDLED, err.to_string()))
+                        .unwrap_or_default(),
+                ),
+                Err(err) => (
+                    FrameType::Error,
+                    serde_json::to_vec(&ErrorBody::new(
+                        REVERSE_REQUEST_UNHANDLED,
+                        join_error_message(err),
+                    ))
+                    .unwrap_or_default(),
+                ),
+            }
+        } else {
+            let message = method_family.map_or_else(
+                || "reverse request has no valid method".to_string(),
+                |family| format!("no reverse-request handler is registered for {family}"),
+            );
+            (
+                FrameType::Error,
+                serde_json::to_vec(&ErrorBody::new(REVERSE_REQUEST_UNHANDLED, message))
+                    .unwrap_or_default(),
+            )
+        };
+
+        if shared.ingress_handle(generation, handle.channel, handle.epoch) != Some(handle) {
+            return;
+        }
+        let reply = match Frame::build_with_version(
+            frame.header.ver,
+            frame_type,
+            Flags::new(false, Priority::Interactive, false),
+            handle.channel,
+            handle.epoch,
+            frame.header.corr,
+            body,
+        ) {
+            Ok(reply) => reply,
+            Err(_) => return,
+        };
+        let writer = shared.lock_inner().writer.clone();
+        if let Some(writer) = writer {
+            let _ = writer
+                .send(WriteCommand {
+                    frame: reply,
+                    pending: None,
+                })
+                .await;
+        }
+    });
+}
+
+fn join_error_message(error: tokio::task::JoinError) -> String {
+    if !error.is_panic() {
+        return error.to_string();
+    }
+    let payload = error.into_panic();
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    "reverse-request handler panicked".to_string()
+}
+
 async fn reader_loop(shared: Arc<Shared>, mut reader: OwnedReadHalf, generation: u64) {
     loop {
         match read_frame(&mut reader).await {
@@ -3487,6 +3861,15 @@ async fn dispatch_frame(shared: &Arc<Shared>, generation: u64, frame: Frame) -> 
     if frame.header.channel != 0
         && !shared.validate_ingress_handle(generation, frame.header.channel, frame.header.epoch)
     {
+        return true;
+    }
+
+    if frame.header.ty == FrameType::Request && frame.header.channel != 0 {
+        if let Some(handle) =
+            shared.ingress_handle(generation, frame.header.channel, frame.header.epoch)
+        {
+            dispatch_reverse_request(shared, frame, handle);
+        }
         return true;
     }
 
@@ -3525,7 +3908,15 @@ async fn dispatch_frame(shared: &Arc<Shared>, generation: u64, frame: Frame) -> 
             route_epoch,
         }) = serde_json::from_slice::<ClientControlResponse>(&frame.body)
         {
-            shared.install_ingress_handle(RouteHandle::new(route_channel, route_epoch, generation));
+            let reverse_requests = shared
+                .pending_route_open_reverse_requests(key)
+                .unwrap_or_default();
+            shared.install_ingress_handle(RouteHandle::new_consumer(
+                route_channel,
+                route_epoch,
+                generation,
+                reverse_requests,
+            ));
         }
     }
 
@@ -3639,6 +4030,22 @@ impl Shared {
             .is_some_and(|entry| entry.retain_late_route_open)
     }
 
+    fn pending_route_open_reverse_requests(
+        &self,
+        key: PendingKey,
+    ) -> Option<ReverseRequestRegistry> {
+        self.lock_inner()
+            .pending
+            .get(&key)
+            .and_then(|entry| entry.route_open_reverse_requests.clone())
+    }
+
+    fn ingress_handle(&self, generation: u64, channel: u16, epoch: u32) -> Option<RouteHandle> {
+        let inner = self.lock_inner();
+        let handle = inner.route_epochs.get(&channel).copied()?;
+        (handle.connection_token() == generation && handle.epoch == epoch).then_some(handle)
+    }
+
     fn validate_ingress_handle(&self, generation: u64, channel: u16, epoch: u32) -> bool {
         let mut inner = self.lock_inner();
         let expected = RouteHandle::new(channel, epoch, generation);
@@ -3654,7 +4061,11 @@ impl Shared {
         let mut inner = self.lock_inner();
         if !inner.closed && inner.generation == handle.connection_token() && inner.writer.is_some()
         {
-            inner.route_epochs.insert(handle.channel, handle);
+            if let Some(previous) = inner.route_epochs.insert(handle.channel, handle) {
+                if previous.reverse_request_registry_id() != handle.reverse_request_registry_id() {
+                    release_reverse_request_registry(previous);
+                }
+            }
         }
     }
 
@@ -3727,11 +4138,15 @@ fn close_route_consumer_identity(opts: &CloseRouteOptions) -> Option<ConsumerIde
 }
 
 fn route_open_consumer_capabilities(opts: &CallOptions) -> Option<Vec<String>> {
-    opts.consumer_capabilities.clone()
+    opts.reverse_requests.seal();
+    let capabilities = opts.reverse_requests.capabilities();
+    (!capabilities.is_empty()).then_some(capabilities)
 }
 
 fn close_route_consumer_capabilities(opts: &CloseRouteOptions) -> Option<Vec<String>> {
-    opts.consumer_capabilities.clone()
+    opts.reverse_requests.seal();
+    let capabilities = opts.reverse_requests.capabilities();
+    (!capabilities.is_empty()).then_some(capabilities)
 }
 
 fn consumer_identity_from_env() -> Option<ConsumerIdentity> {
@@ -3983,6 +4398,296 @@ mod tests {
         ))
     }
 
+    fn reverse_test_shared(
+        reverse_requests: ReverseRequestRegistry,
+    ) -> (Arc<Shared>, mpsc::Receiver<WriteCommand>, RouteHandle) {
+        let shared = writer_test_shared();
+        let (writer, receiver) = mpsc::channel(16);
+        let handle = RouteHandle::new_consumer(17, 3, 1, reverse_requests);
+        {
+            let mut inner = shared.lock_inner();
+            inner.writer = Some(writer);
+            inner.route_epochs.insert(handle.channel, handle);
+        }
+        (shared, receiver, handle)
+    }
+
+    fn reverse_request_frame(handle: RouteHandle, corr: u64, body: Vec<u8>) -> Frame {
+        Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            handle.channel,
+            handle.epoch,
+            corr,
+            body,
+        )
+        .unwrap()
+    }
+
+    async fn capture_route_open(
+        reverse_requests: ReverseRequestRegistry,
+    ) -> (serde_json::Value, RouteHandle) {
+        let shared = writer_test_shared();
+        let (writer, mut receiver) = mpsc::channel(4);
+        shared.lock_inner().writer = Some(writer);
+        let consumer = SubcConsumer {
+            shared: Arc::clone(&shared),
+        };
+        let opts = CallOptions {
+            reverse_requests,
+            ..CallOptions::default()
+        };
+        let task = tokio::spawn(async move {
+            consumer
+                .open_route(
+                    RouteTarget::ToolProvider {
+                        module_id: "reverse-provider".to_string(),
+                    },
+                    BindIdentity::new(
+                        PathBuf::from("/tmp/project"),
+                        "test".to_string(),
+                        "reverse".to_string(),
+                    ),
+                    opts,
+                )
+                .await
+        });
+        let command = receiver.recv().await.expect("route.open frame");
+        let request = serde_json::from_slice(&command.frame.body).unwrap();
+        let response_body = serde_json::to_vec(&ClientControlResponse::RouteOpen {
+            route_channel: 17,
+            route_epoch: 3,
+        })
+        .unwrap();
+        assert!(
+            dispatch_frame(
+                &shared,
+                1,
+                response_frame(0, 0, command.frame.header.corr, response_body),
+            )
+            .await
+        );
+        let handle = task.await.unwrap().unwrap();
+        (request, handle)
+    }
+
+    #[tokio::test]
+    async fn ordinary_call_envelope_has_bit_7_clear_and_subscribe_envelope_has_bit_7_set() {
+        let (shared, mut receiver, handle) = reverse_test_shared(ReverseRequestRegistry::new());
+        let call_shared = Arc::clone(&shared);
+        let call = tokio::spawn(async move {
+            call_shared
+                .send_request(RequestSend {
+                    expected_handle: Some(handle),
+                    channel: handle.channel,
+                    epoch: handle.epoch,
+                    body: b"ordinary".to_vec(),
+                    priority: Priority::Interactive,
+                    admission_class: AdmissionClass::Normal,
+                    deadline: Instant::now() + Duration::from_secs(1),
+                    retain_late_route_open: false,
+                    route_open_reverse_requests: None,
+                })
+                .await
+        });
+        let ordinary = receiver.recv().await.unwrap();
+        assert_eq!(ordinary.frame.header.encode()[6] & FLAG_SUBSCRIPTION, 0);
+        assert!(
+            dispatch_frame(
+                &shared,
+                1,
+                response_frame(
+                    handle.channel,
+                    handle.epoch,
+                    ordinary.frame.header.corr,
+                    Vec::new()
+                ),
+            )
+            .await
+        );
+        assert!(call.await.unwrap().is_ok());
+
+        let permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+        let subscription = Arc::clone(&shared)
+            .send_subscription(SubscriptionSend {
+                expected_handle: Some(handle),
+                channel: handle.channel,
+                epoch: handle.epoch,
+                body: b"held".to_vec(),
+                priority: Priority::Interactive,
+                admission_class: AdmissionClass::Normal,
+                event_buffer: 1,
+                deadline: Instant::now() + Duration::from_secs(1),
+                permit,
+            })
+            .await
+            .unwrap();
+        let held = receiver.recv().await.unwrap();
+        assert_eq!(
+            held.frame.header.encode()[6] & FLAG_SUBSCRIPTION,
+            FLAG_SUBSCRIPTION
+        );
+        drop(subscription);
+        release_reverse_request_registry(handle);
+    }
+
+    #[tokio::test]
+    async fn registered_handlers_derive_route_open_consumer_capabilities() {
+        let registry = ReverseRequestRegistry::new();
+        registry
+            .on_request("elicitation", |_body, _ctx| async { Vec::new() })
+            .unwrap();
+        let (request, handle) = capture_route_open(registry).await;
+        assert_eq!(
+            request.get("consumer_capabilities"),
+            Some(&serde_json::json!(["elicitation"]))
+        );
+        release_reverse_request_registry(handle);
+    }
+
+    #[tokio::test]
+    async fn no_handlers_omit_consumer_capabilities_from_route_open() {
+        let (request, handle) = capture_route_open(ReverseRequestRegistry::new()).await;
+        assert!(!request
+            .as_object()
+            .unwrap()
+            .contains_key("consumer_capabilities"));
+        release_reverse_request_registry(handle);
+    }
+
+    #[tokio::test]
+    async fn reverse_request_without_handler_returns_typed_error_instead_of_silence() {
+        let (shared, mut receiver, handle) = reverse_test_shared(ReverseRequestRegistry::new());
+        let body = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "elicitation/create",
+            "params": {}
+        }))
+        .unwrap();
+        assert!(dispatch_frame(&shared, 1, reverse_request_frame(handle, 800, body)).await);
+        let reply = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .frame;
+        assert_eq!(reply.header.ty, FrameType::Error);
+        assert_eq!(reply.header.corr, 800);
+        let error: ErrorBody = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(error.code, REVERSE_REQUEST_UNHANDLED);
+        release_reverse_request_registry(handle);
+    }
+
+    #[tokio::test]
+    async fn reverse_request_round_trip_preserves_raw_body_corr_and_response() {
+        let registry = ReverseRequestRegistry::new();
+        let seen = Arc::new(Mutex::new(None));
+        let seen_by_handler = Arc::clone(&seen);
+        let response = br#"{"jsonrpc":"2.0","id":9,"result":{"accepted":true}}"#.to_vec();
+        let expected_response = response.clone();
+        registry
+            .on_request("elicitation", move |body, ctx| {
+                *seen_by_handler
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some((body, ctx.corr, ctx.method));
+                let response = response.clone();
+                async move { response }
+            })
+            .unwrap();
+        let (shared, mut receiver, handle) = reverse_test_shared(registry);
+        let request_body =
+            br#"{"jsonrpc":"2.0","id":9,"method":"elicitation/create","params":{"z":1,"a":2}}"#
+                .to_vec();
+        assert!(
+            dispatch_frame(
+                &shared,
+                1,
+                reverse_request_frame(handle, 801, request_body.clone()),
+            )
+            .await
+        );
+        let reply = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .frame;
+        assert_eq!(reply.header.ty, FrameType::Response);
+        assert_eq!(reply.header.corr, 801);
+        assert_eq!(reply.body, expected_response);
+        assert_eq!(
+            seen.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            Some((request_body, 801, "elicitation/create".to_string()))
+        );
+        release_reverse_request_registry(handle);
+    }
+
+    #[tokio::test]
+    async fn panicking_reverse_handler_returns_typed_refusal_and_sibling_request_resolves() {
+        let registry = ReverseRequestRegistry::new();
+        registry
+            .on_request("sampling", |_body, _ctx| async move {
+                panic!("person prompt exploded");
+            })
+            .unwrap();
+        let (shared, mut receiver, handle) = reverse_test_shared(registry);
+        let sibling_shared = Arc::clone(&shared);
+        let sibling = tokio::spawn(async move {
+            sibling_shared
+                .send_request(RequestSend {
+                    expected_handle: Some(handle),
+                    channel: handle.channel,
+                    epoch: handle.epoch,
+                    body: b"sibling".to_vec(),
+                    priority: Priority::Interactive,
+                    admission_class: AdmissionClass::Normal,
+                    deadline: Instant::now() + Duration::from_secs(1),
+                    retain_late_route_open: false,
+                    route_open_reverse_requests: None,
+                })
+                .await
+        });
+        let sibling_request = receiver.recv().await.unwrap();
+        let reverse_body = serde_json::to_vec(&serde_json::json!({
+            "method": "sampling/createMessage",
+            "params": {}
+        }))
+        .unwrap();
+        assert!(
+            dispatch_frame(&shared, 1, reverse_request_frame(handle, 802, reverse_body),).await
+        );
+        assert!(
+            dispatch_frame(
+                &shared,
+                1,
+                response_frame(
+                    handle.channel,
+                    handle.epoch,
+                    sibling_request.frame.header.corr,
+                    b"ok".to_vec(),
+                ),
+            )
+            .await
+        );
+        assert!(matches!(
+            sibling.await.unwrap().unwrap(),
+            TerminalFrame::Response { body, .. } if body == b"ok"
+        ));
+        let refusal = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .frame;
+        assert_eq!(refusal.header.ty, FrameType::Error);
+        let error: ErrorBody = serde_json::from_slice(&refusal.body).unwrap();
+        assert_eq!(error.code, REVERSE_REQUEST_UNHANDLED);
+        assert!(error.message.contains("person prompt exploded"));
+        assert!(shared.generation_is_current(1));
+        release_reverse_request_registry(handle);
+    }
+
     #[tokio::test]
     async fn writer_batches_ready_frames_into_one_flush() {
         const FRAME_COUNT: usize = 8;
@@ -4010,7 +4715,7 @@ mod tests {
                 let (pending_tx, _pending_rx) = oneshot::channel();
                 inner
                     .pending
-                    .insert(key, PendingEntry::unary(pending_tx, false, None));
+                    .insert(key, PendingEntry::unary(pending_tx, false, None, None));
                 expected.push(frame.clone());
                 keys.push(key);
                 tx.try_send(WriteCommand {
@@ -4089,12 +4794,14 @@ mod tests {
         {
             let mut inner = shared.lock_inner();
             inner.writer = Some(live_writer);
-            inner
-                .pending
-                .insert(accepted_key, PendingEntry::unary(accepted_tx, false, None));
-            inner
-                .pending
-                .insert(not_sent_key, PendingEntry::unary(not_sent_tx, false, None));
+            inner.pending.insert(
+                accepted_key,
+                PendingEntry::unary(accepted_tx, false, None, None),
+            );
+            inner.pending.insert(
+                not_sent_key,
+                PendingEntry::unary(not_sent_tx, false, None, None),
+            );
         }
 
         let (tx, rx) = mpsc::channel(1);
@@ -4553,7 +5260,7 @@ mod tests {
             corr: 2,
         };
         let (unary_tx, _unary_rx) = oneshot::channel();
-        pending.insert(unary_key, PendingEntry::unary(unary_tx, false, None));
+        pending.insert(unary_key, PendingEntry::unary(unary_tx, false, None, None));
 
         let (events_tx, _events_rx) = mpsc::channel(1);
         let (closed_tx, _closed_rx) = oneshot::channel();
@@ -4614,10 +5321,10 @@ mod tests {
             inner.route_epochs.insert(9, current);
             inner
                 .pending
-                .insert(stale_key, PendingEntry::unary(stale_tx, false, None));
+                .insert(stale_key, PendingEntry::unary(stale_tx, false, None, None));
             inner
                 .pending
-                .insert(key, PendingEntry::unary(tx, false, None));
+                .insert(key, PendingEntry::unary(tx, false, None, None));
         }
 
         assert!(dispatch_frame(&shared, 1, response_frame(9, 1, 77, b"stale".to_vec())).await);
@@ -4664,7 +5371,7 @@ mod tests {
             inner.route_epochs.insert(handle.channel, handle);
             inner
                 .pending
-                .insert(key, PendingEntry::unary(tx, false, Some(handle)));
+                .insert(key, PendingEntry::unary(tx, false, Some(handle), None));
         }
         let wrong = serde_json::to_vec(&ClientControlResponse::RoutePoll {
             route_channel: handle.channel,
@@ -4720,6 +5427,7 @@ mod tests {
                 admission_class: AdmissionClass::Normal,
                 deadline: Instant::now() + Duration::from_millis(10),
                 retain_late_route_open: false,
+                route_open_reverse_requests: None,
             })
             .await
             .unwrap_err();
@@ -4752,7 +5460,7 @@ mod tests {
             inner.writer = Some(writer);
             inner
                 .pending
-                .insert(key, PendingEntry::unary(tx, true, None));
+                .insert(key, PendingEntry::unary(tx, true, None, None));
         }
         let body = serde_json::to_vec(&ClientControlResponse::RouteOpen {
             route_channel: 12,
@@ -4795,7 +5503,7 @@ mod tests {
             inner.writer = Some(writer);
             inner
                 .pending
-                .insert(key, PendingEntry::unary(tx, true, None));
+                .insert(key, PendingEntry::unary(tx, true, None, None));
         }
         let body = serde_json::to_vec(&ClientControlResponse::RouteOpen {
             route_channel: 13,
@@ -4836,6 +5544,7 @@ mod tests {
                     admission_class: AdmissionClass::Normal,
                     deadline: Instant::now() + Duration::from_secs(1),
                     retain_late_route_open: false,
+                    route_open_reverse_requests: None,
                 })
                 .await
         });
@@ -4854,6 +5563,7 @@ mod tests {
                 admission_class: AdmissionClass::Normal,
                 deadline: Instant::now() + Duration::from_millis(10),
                 retain_late_route_open: false,
+                route_open_reverse_requests: None,
             })
             .await
             .unwrap_err();
