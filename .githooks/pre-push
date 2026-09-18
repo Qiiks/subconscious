@@ -140,4 +140,33 @@ BROCA_PINS
     [ "$moved" = 0 ] && echo "    (all pinned trees unchanged: broca notice can say no-op)" >&2
   fi
 fi
+# ---- IN-FLIGHT CI: name what this push is about to cancel ----
+#
+# GitHub's cancel-in-progress kills the older run on the same branch, so a push
+# on top of a run in flight destroys twenty minutes of matrix work and the loss
+# is SILENT -- the watcher on the older sha reports "cancelled", which reads as
+# a CI fault rather than as something the operator did. Four times in one day
+# (2026-09-18), each time after banking the rule, because a rule you have to
+# remember is applied to whatever you are attending to and this is never it.
+#
+# A WARNING RATHER THAN A REFUSAL, deliberately: superseding an in-flight run is
+# often exactly right (a fix commit for a red run should not wait for the red to
+# finish). The failure being fixed is not "cancelling" but "cancelling without
+# knowing", so this converts a silent loss into a stated one.
+#
+# Degrades silently when gh is absent, unauthenticated, or offline: a pre-push
+# hook must not depend on the network to let you push.
+if command -v gh >/dev/null 2>&1; then
+  branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+  inflight=$(gh run list --branch "$branch" --event push --limit 5 \
+      --json status,headSha,workflowName \
+      --jq '.[] | select(.status=="in_progress" or .status=="queued") | "\(.headSha[0:8]) \(.workflowName)"' \
+      2>/dev/null | head -3)
+  if [ -n "$inflight" ]; then
+    echo "" >&2
+    echo "pre-push NOTICE: a CI run is IN FLIGHT on $branch and this push will cancel it:" >&2
+    echo "$inflight" | sed 's/^/  /' >&2
+    echo "  (cancel-in-progress kills the older run; its watcher will report 'cancelled')" >&2
+  fi
+fi
 exit 0
