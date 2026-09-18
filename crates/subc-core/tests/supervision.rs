@@ -906,7 +906,19 @@ async fn a_silent_module_reports_captured_and_empty_rather_than_uncaptured() {
 /// rightly refuses.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_supervised_module_inherits_the_parent_environment() {
-    let parent_home = std::env::var("HOME").expect("this test needs a HOME to inherit");
+    // The variable is chosen by MEANING, not spelling: whichever one this
+    // platform's `default_data_home()` reads to find the user's home. HOME is a
+    // POSIX concept that does not exist on Windows, where the resolver falls
+    // back to APPDATA then USERPROFILE. Asserting "HOME" on every platform is a
+    // true assertion about a variable the platform never had -- which is how
+    // this test first went red on the Windows leg.
+    #[cfg(windows)]
+    let home_var = "USERPROFILE";
+    #[cfg(not(windows))]
+    let home_var = "HOME";
+
+    let parent_home =
+        std::env::var(home_var).unwrap_or_else(|_| panic!("this test needs {home_var} to inherit"));
 
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
@@ -916,7 +928,7 @@ async fn a_supervised_module_inherits_the_parent_environment() {
             program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
             args: Vec::new(),
             env: vec![
-                ("FAKE_AFT_ECHO_ENV".to_string(), "HOME".to_string()),
+                ("FAKE_AFT_ECHO_ENV".to_string(), home_var.to_string()),
                 ("FAKE_AFT_EXIT_CODE".to_string(), "0".to_string()),
             ],
             reserved: false,
@@ -924,10 +936,11 @@ async fn a_supervised_module_inherits_the_parent_environment() {
         })
         .unwrap();
 
+    let prefix = format!("echo-env {home_var}=");
     let tail = wait_for_tail(&module, Duration::from_secs(5), |tail| {
-        tail.entries.iter().any(
-            |entry| matches!(entry, TailEntry::Line { text, .. } if text.starts_with("echo-env HOME=")),
-        )
+        tail.entries
+            .iter()
+            .any(|entry| matches!(entry, TailEntry::Line { text, .. } if text.starts_with(&prefix)))
     })
     .await;
 
@@ -935,18 +948,17 @@ async fn a_supervised_module_inherits_the_parent_environment() {
         .entries
         .iter()
         .find_map(|entry| match entry {
-            TailEntry::Line { text, .. } if text.starts_with("echo-env HOME=") => {
-                Some(text.clone())
-            }
+            TailEntry::Line { text, .. } if text.starts_with(&prefix) => Some(text.clone()),
             _ => None,
         })
-        .expect("no echo-env HOME line");
+        .unwrap_or_else(|| panic!("no {prefix} line"));
 
     assert_eq!(
         observed,
-        format!("echo-env HOME={parent_home}"),
-        "a supervised module must inherit HOME; without it default_data_home() is \
-         relative and every module derives its store against its own CWD (#104)"
+        format!("{prefix}{parent_home}"),
+        "a supervised module must inherit the user's home variable; without it \
+         default_data_home() is relative and every module derives its store \
+         against its own CWD (#104)"
     );
 }
 
