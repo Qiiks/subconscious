@@ -137,11 +137,11 @@ impl CredentialResolver for ClaustrumCredentialResolver {
             "params": { "handle": handle },
         }))
         .map_err(|_| CredentialResolutionError)?;
-        let identity = BindIdentity {
-            project_root: env::current_dir().map_err(|_| CredentialResolutionError)?,
-            harness: "mcp-stdio-adapter".to_string(),
-            session: "credential-resolution".to_string(),
-        };
+        let identity = BindIdentity::new(
+            env::current_dir().map_err(|_| CredentialResolutionError)?,
+            "mcp-stdio-adapter".to_string(),
+            "credential-resolution".to_string(),
+        );
         let reply = consumer
             .call(
                 RouteTarget::ManagementSurface {

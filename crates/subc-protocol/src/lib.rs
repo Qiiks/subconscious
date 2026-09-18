@@ -81,13 +81,13 @@ pub use frame::{Frame, FrameBuildError};
 ///
 /// EVERY FIELD HERE IS CLIENT-SUPPLIED AND UNATTESTED. The daemon canonicalizes
 /// `project_root` as a path but does not verify that the caller has any relation
-/// to it, and `harness` and `session` are strings the caller chose. A client
-/// holding the connection key can present any values it likes.
+/// to it, and `harness`, `session`, and `project_id` are strings the caller chose.
+/// A client holding the connection key can present any values it likes.
 ///
 /// This sits directly above `Principal`, which is the opposite: stamped BY the
 /// daemon from a launch nonce it minted. The two travel together on every
 /// `route.bind`, so a module reading them side by side is reading one fact it can
-/// trust and three it cannot. THE DISTINCTION IS INVISIBLE FROM THE TYPES, which
+/// trust and four it cannot. THE DISTINCTION IS INVISIBLE FROM THE TYPES, which
 /// is why it is written here.
 ///
 /// So these fields are for SCOPING AND ATTRIBUTION -- which project's state to
@@ -98,10 +98,49 @@ pub use frame::{Frame, FrameBuildError};
 /// subc does not stamp, it must establish that fact itself rather than believe
 /// this struct.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BindIdentity {
     pub project_root: PathBuf,
     pub harness: String,
     pub session: String,
+    /// The entorhinal-registered project id (`pj-…`) for `project_root`, when
+    /// the root is a registered project. Aliases count as registered projects;
+    /// implicit roots do not. Absent means "no stable id, key on the triple",
+    /// not "unknown".
+    ///
+    /// A producer sends the id on every bind of a session or on none. A producer
+    /// that alternates between `Some(id)` and `None` across binds silently forks
+    /// the consumer's lineage into separate stores, with no error at either end.
+    /// Therefore, a producer that cannot answer consistently must answer `None`
+    /// consistently.
+    ///
+    /// Resolve this at most once per session, before its first bind, and persist
+    /// the outcome with the session. ALF's resolver has real `Resolved`, `Unavailable`,
+    /// and `Disabled` outcomes: if unavailable at cold start is re-resolved on a
+    /// later bind, the session can alternate from `None` to `Some(id)`. Send only
+    /// registered or alias resolutions, never implicit, unavailable, or disabled
+    /// fallback ids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+}
+
+impl BindIdentity {
+    /// Constructs an identity with no registered project id.
+    ///
+    /// Use this instead of a struct literal so future additive identity fields do
+    /// not force construction-site migrations across the fleet.
+    pub fn new(
+        project_root: impl Into<PathBuf>,
+        harness: impl Into<String>,
+        session: impl Into<String>,
+    ) -> Self {
+        Self {
+            project_root: project_root.into(),
+            harness: harness.into(),
+            session: session.into(),
+            project_id: None,
+        }
+    }
 }
 
 /// Caller fact stamped by subc on each route.bind relayed to a module.
@@ -154,7 +193,10 @@ pub const PROTOCOL_VERSION: u8 = 2;
 /// version gate (insula shipped exactly that before the referent was written
 /// down). `env!` makes it a property of the compiled binary, not of whatever
 /// source tree sits beside it at run time.
-pub const SUBC_PROTOCOL_CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const WIRE_CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Backward-compatible spelling for [`WIRE_CRATE_VERSION`].
+pub const SUBC_PROTOCOL_CRATE_VERSION: &str = WIRE_CRATE_VERSION;
 
 /// Oldest envelope protocol version this build accepts.
 pub const MIN_SUPPORTED_VERSION: u8 = 2;
@@ -616,17 +658,56 @@ mod tests {
     }
 
     #[test]
-    fn bind_identity_round_trips_json() {
-        let identity = BindIdentity {
-            project_root: PathBuf::from("/tmp/project"),
-            harness: "opencode".to_string(),
-            session: "session-1".to_string(),
-        };
+    fn bind_identity_with_project_id_round_trips_json() {
+        let mut identity = BindIdentity::new("/tmp/project", "opencode", "session-1");
+        identity.project_id = Some("pj-a1b2c3d4".to_string());
 
         let encoded = serde_json::to_vec(&identity).unwrap();
         let decoded: BindIdentity = serde_json::from_slice(&encoded).unwrap();
 
         assert_eq!(decoded, identity);
+    }
+
+    #[test]
+    fn bind_identity_without_project_id_round_trips_json() {
+        let identity = BindIdentity::new("/tmp/project", "opencode", "session-1");
+
+        let encoded = serde_json::to_vec(&identity).unwrap();
+        let decoded: BindIdentity = serde_json::from_slice(&encoded).unwrap();
+
+        assert_eq!(decoded, identity);
+    }
+
+    #[test]
+    fn legacy_bind_identity_without_project_id_decodes() {
+        let decoded: BindIdentity = serde_json::from_value(serde_json::json!({
+            "project_root": "/tmp/project",
+            "harness": "opencode",
+            "session": "session-1"
+        }))
+        .unwrap();
+
+        assert_eq!(decoded.project_id, None);
+    }
+
+    #[test]
+    fn bind_identity_none_omits_project_id_instead_of_serializing_null() {
+        let encoded =
+            serde_json::to_value(BindIdentity::new("/tmp/project", "opencode", "session-1"))
+                .unwrap();
+
+        assert!(encoded.get("project_id").is_none());
+    }
+
+    #[test]
+    fn wire_crate_version_is_a_numeric_three_component_version() {
+        let components = WIRE_CRATE_VERSION.split('.').collect::<Vec<_>>();
+
+        assert!(!WIRE_CRATE_VERSION.is_empty());
+        assert_eq!(components.len(), 3);
+        assert!(components
+            .iter()
+            .all(|component| !component.is_empty() && component.parse::<u64>().is_ok()));
     }
 
     #[test]

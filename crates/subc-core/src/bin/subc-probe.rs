@@ -318,11 +318,11 @@ async fn route_open(
         target: RouteTarget::ToolProvider {
             module_id: module_id.to_string(),
         },
-        identity: BindIdentity {
-            project_root: args.root.clone(),
-            harness: args.harness.clone(),
-            session: args.session.clone(),
-        },
+        identity: BindIdentity::new(
+            args.root.clone(),
+            args.harness.clone(),
+            args.session.clone(),
+        ),
         consumer_identity: None,
         consumer_capabilities: None,
         admission_facts: None,

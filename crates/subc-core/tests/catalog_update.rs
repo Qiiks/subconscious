@@ -462,11 +462,11 @@ async fn open_route(
                 target: RouteTarget::ToolProvider {
                     module_id: module_id.to_string(),
                 },
-                identity: BindIdentity {
-                    project_root: project.path().to_path_buf(),
-                    harness: "opencode".to_string(),
-                    session: "catalog-update-session".to_string(),
-                },
+                identity: BindIdentity::new(
+                    project.path().to_path_buf(),
+                    "opencode".to_string(),
+                    "catalog-update-session".to_string(),
+                ),
                 consumer_identity: None,
                 consumer_capabilities: None,
 

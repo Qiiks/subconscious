@@ -320,6 +320,8 @@ hand-type it.
 
 ## 6. Daemon logging `with_ansi(false)` (subc-core, same window)
 
+**SATISFIED:** the daemon's `cortexkit_log::init` path renders `level.as_str()` and strips ANSI; `daemon_log_line_matches_the_authority_fixture_byte_for_byte_without_ansi` is the standing real-path proof.
+
 Not wire. The non-tty daemon log carries ANSI styling that breaks contiguous
 ASCII matching on level words; the stall-hunt queries that pinned the
 current rendering are closed. Lands in the daemon cut that carries 2a–2c.

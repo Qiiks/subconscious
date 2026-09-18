@@ -1713,11 +1713,7 @@ mod tests {
             target: RouteTarget::ToolProvider {
                 module_id: "aft".to_string(),
             },
-            identity: BindIdentity {
-                project_root: "/tmp/project".into(),
-                harness: "opencode".to_string(),
-                session: "session-1".to_string(),
-            },
+            identity: BindIdentity::new("/tmp/project", "opencode", "session-1"),
             consumer_identity: None,
             consumer_capabilities: None,
             admission_facts: None,

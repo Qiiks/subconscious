@@ -317,11 +317,11 @@ impl PolicyResolver {
         };
         let body = serde_json::to_vec(&request)
             .map_err(|e| PolicyResolveError::fault(format!("request encode: {e}")))?;
-        let route_identity = BindIdentity {
-            project_root: project.bind_root(),
-            harness: POLICY_RESOLVER_HARNESS.to_string(),
-            session: subject.route_session(),
-        };
+        let route_identity = BindIdentity::new(
+            project.bind_root(),
+            POLICY_RESOLVER_HARNESS.to_string(),
+            subject.route_session(),
+        );
         let call_options = CallOptions {
             timeout: self.config.hard_timeout,
             route_retry_deadline: self.config.hard_timeout,

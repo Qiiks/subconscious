@@ -4524,11 +4524,11 @@ mod tests {
             target: RouteTarget::ToolProvider {
                 module_id: module_id.to_string(),
             },
-            identity: BindIdentity {
-                project_root: project_root.path().to_path_buf(),
-                harness: "unit".to_string(),
-                session: "session".to_string(),
-            },
+            identity: BindIdentity::new(
+                project_root.path().to_path_buf(),
+                "unit".to_string(),
+                "session".to_string(),
+            ),
             consumer_identity: None,
             consumer_capabilities,
             admission_facts: None,
@@ -4548,11 +4548,11 @@ mod tests {
             target: RouteTarget::ToolProvider {
                 module_id: module_id.to_string(),
             },
-            identity: BindIdentity {
-                project_root: project_root.path().to_path_buf(),
-                harness: "unit".to_string(),
-                session: format!("session-{corr}"),
-            },
+            identity: BindIdentity::new(
+                project_root.path().to_path_buf(),
+                "unit".to_string(),
+                format!("session-{corr}"),
+            ),
             consumer_identity,
             consumer_capabilities: None,
             admission_facts: facts,

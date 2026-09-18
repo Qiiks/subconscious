@@ -4333,11 +4333,7 @@ where
 fn route_identity(label: &str, corr: u64) -> BindIdentity {
     let project_root = unique_temp_dir(&format!("mcp-route-{label}-{corr}"));
     fs::create_dir_all(&project_root).unwrap();
-    BindIdentity {
-        project_root,
-        harness: "subc-mcp-test".to_string(),
-        session: format!("session-{corr}"),
-    }
+    BindIdentity::new(project_root, "subc-mcp-test", format!("session-{corr}"))
 }
 
 async fn wait_for_stub_event<F>(path: &Path, wait: Duration, matches: F) -> Value

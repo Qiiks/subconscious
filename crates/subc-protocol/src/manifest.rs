@@ -520,7 +520,7 @@ pub struct ManifestProvenance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_lock_digest: Option<String>,
     /// REFERENT: the `subc-protocol` crate version linked into this binary
-    /// (`subc_protocol::SUBC_PROTOCOL_CRATE_VERSION`) — the fleet's shared
+    /// (`subc_protocol::WIRE_CRATE_VERSION`) — the fleet's shared
     /// wire vocabulary, one numbering space for every module. Never a
     /// module's own envelope/payload crate version: that is real information
     /// in a different numbering space, and here it scores as a confident
@@ -885,7 +885,7 @@ fn build_provenance_with_build_git_sha(
         build_git_sha,
         build_git_sha_absence_reason,
         build_lock_digest,
-        wire_crate_version: Some(crate::SUBC_PROTOCOL_CRATE_VERSION.to_string()),
+        wire_crate_version: Some(crate::WIRE_CRATE_VERSION.to_string()),
         store_schema_version: normalize_provenance_fact(store_schema_version),
     })
 }
@@ -1951,7 +1951,7 @@ mod tests {
         // field when it is absent rather than publishing a sentinel.
         assert_eq!(
             real.wire_crate_version.as_deref(),
-            Some(crate::SUBC_PROTOCOL_CRATE_VERSION)
+            Some(crate::WIRE_CRATE_VERSION)
         );
     }
 
@@ -1975,7 +1975,7 @@ mod tests {
                 build_lock_digest: Some(
                     "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string(),
                 ),
-                wire_crate_version: Some(crate::SUBC_PROTOCOL_CRATE_VERSION.to_string()),
+                wire_crate_version: Some(crate::WIRE_CRATE_VERSION.to_string()),
                 store_schema_version: Some("schema-v3".to_string()),
             }
         );
@@ -2070,7 +2070,7 @@ mod tests {
         );
         assert_eq!(
             provenance.wire_crate_version,
-            Some(crate::SUBC_PROTOCOL_CRATE_VERSION.to_string())
+            Some(crate::WIRE_CRATE_VERSION.to_string())
         );
     }
 
@@ -2088,7 +2088,7 @@ mod tests {
         assert_eq!(provenance.store_schema_version, None);
         assert_eq!(
             provenance.wire_crate_version,
-            Some(crate::SUBC_PROTOCOL_CRATE_VERSION.to_string())
+            Some(crate::WIRE_CRATE_VERSION.to_string())
         );
     }
 
@@ -2100,21 +2100,21 @@ mod tests {
                 Some(revision),
                 format!(
                     r#"{{"build_git_sha":"{revision}","wire_crate_version":"{}"}}"#,
-                    crate::SUBC_PROTOCOL_CRATE_VERSION
+                    crate::WIRE_CRATE_VERSION
                 ),
             ),
             (
                 None,
                 format!(
                     r#"{{"wire_crate_version":"{}"}}"#,
-                    crate::SUBC_PROTOCOL_CRATE_VERSION
+                    crate::WIRE_CRATE_VERSION
                 ),
             ),
             (
                 Some("unknown"),
                 format!(
                     r#"{{"wire_crate_version":"{}"}}"#,
-                    crate::SUBC_PROTOCOL_CRATE_VERSION
+                    crate::WIRE_CRATE_VERSION
                 ),
             ),
         ] {
@@ -2172,7 +2172,7 @@ mod tests {
     fn unknown_git_sha_absence_reason_round_trips_byte_faithfully() {
         let wire = format!(
             r#"{{"build_git_sha_absence_reason":"future_stamper_state","wire_crate_version":"{}"}}"#,
-            crate::SUBC_PROTOCOL_CRATE_VERSION
+            crate::WIRE_CRATE_VERSION
         );
         let provenance: ManifestProvenance =
             serde_json::from_str(&wire).expect("future absence reasons remain readable");

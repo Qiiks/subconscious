@@ -1529,11 +1529,11 @@ where
             target: RouteTarget::ToolProvider {
                 module_id: module_id.to_string(),
             },
-            identity: BindIdentity {
-                project_root: project_root.path().to_path_buf(),
-                harness: "daemon-config-test".to_string(),
-                session: format!("session-{corr}"),
-            },
+            identity: BindIdentity::new(
+                project_root.path().to_path_buf(),
+                "daemon-config-test".to_string(),
+                format!("session-{corr}"),
+            ),
             consumer_identity,
             consumer_capabilities: None,
             admission_facts: None,
