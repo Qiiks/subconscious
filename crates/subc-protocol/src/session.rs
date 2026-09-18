@@ -95,7 +95,21 @@ pub enum ModuleControlCommand {
     #[serde(rename = "module.draining")]
     Draining {
         reason: RouteCloseReason,
-        /// Absolute Unix deadline for this drain, measured by the daemon.
+        /// Absolute Unix-millisecond deadline for this drain.
+        ///
+        /// WALL CLOCK, WHILE THE DAEMON ENFORCES THE CEILING ON A
+        /// SUSPEND-EXCLUDING MONOTONIC CLOCK (`Instant`, supervise.rs). Both
+        /// processes share one host so `CLOCK_REALTIME` agrees exactly, and the
+        /// two clocks diverge only across host sleep: `Instant` stops, wall does
+        /// not. So a module that sleeps mid-drain wakes to a deadline further in
+        /// the past than the daemon's own ceiling, computes LESS remaining time
+        /// than it has, and seals early.
+        ///
+        /// That direction is deliberate and is the safe one — a module stopping
+        /// early loses nothing, since the daemon kills at its own ceiling
+        /// regardless. The reverse (a module believing it has time the daemon
+        /// has already spent) is the failure this ordering avoids. A module must
+        /// therefore treat this as "no later than", never as a grant.
         deadline_ms: u64,
     },
 }
