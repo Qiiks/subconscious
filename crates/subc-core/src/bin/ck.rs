@@ -7982,6 +7982,59 @@ mod tests {
         assert!(visible.iter().any(|e| e == "Ufuk's Organization"));
     }
 
+    /// A FIELD NOBODY CLASSIFIED MUST NOT REACH A REDACTED SCREENSHOT.
+    ///
+    /// `--redact` is written as a deny-list -- it names what to remove -- so
+    /// every NEW identifying field on `accountInfo` defaults to VISIBLE, which
+    /// is the wrong direction for this particular flag. QTA raised it with a
+    /// live instance an hour out: a subscription-tier slice reads Anthropic's
+    /// `/api/oauth/profile`, whose response also carries `account.full_name`,
+    /// `account.display_name` and `organization.name`. If any of those are
+    /// served alongside the tier, the existing filter keeps passing, the org
+    /// test keeps going green, and the screenshot has a name in it again.
+    ///
+    /// Today the renderer reads NAMED fields rather than iterating the map, so
+    /// an unclassified field is invisible until someone adds it to the render
+    /// path. THIS TEST IS THE TRIPWIRE ON THAT MOMENT: it puts a plausible
+    /// future identity field in the fixture and requires it absent from
+    /// redacted output, so adding the field to the renderer without classifying
+    /// it fails here rather than in a published screenshot.
+    ///
+    /// WHAT IT CANNOT CATCH, stated so nobody trusts it further than it goes:
+    /// a field added under a name this fixture does not carry. The fixture is a
+    /// sample of the hazard, not a proof of its absence -- the structural
+    /// answer is deny-by-default over `accountInfo`, and QTA's notice
+    /// obligation is what makes the sample stay current.
+    #[test]
+    fn an_unclassified_identity_field_does_not_reach_redacted_output() {
+        let entry = json!({
+            "account": "11111111-2222-3333-4444-555555555555",
+            "accountInfo": {
+                "email": "ufuk@example.com",
+                "orgName": "Ufuk's Organization",
+                "planType": "max",
+                // The fields QTA measured on the profile response that the
+                // tier slice reads. None is rendered today; each is the shape
+                // that would leak if it were added without classification.
+                "fullName": "Ufuk Altinok",
+                "displayName": "Ufuk",
+                "organizationName": "Ufuk's Organization",
+            },
+        });
+
+        let redacted = quota_account_header_extras(&entry, true).join(" | ");
+        for leaked in ["Ufuk", "Altinok", "Organization", "ufuk@example.com"] {
+            assert!(
+                !redacted.contains(leaked),
+                "an identifying value reached redacted output: {leaked:?} in {redacted:?}"
+            );
+        }
+        assert!(
+            redacted.contains("plan: max"),
+            "the plan type identifies nobody and is the point of the screenshot: {redacted:?}"
+        );
+    }
+
     /// The flag is a RENDER flag and structurally cannot reach `--json`: the
     /// JSON branch prints the wire body verbatim and returns before any
     /// redaction runs. Pinned as a parse-level fact so nobody wires `redact`
