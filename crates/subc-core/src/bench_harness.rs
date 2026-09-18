@@ -223,7 +223,7 @@ async fn bench_module_echo_drain(
             body,
         ) {
             let _ = route.client_sink.try_send(response);
-            route.flow.release();
+            route.flow.release_corr(corr);
         }
     }
 }

@@ -8,14 +8,14 @@ use subc_protocol::{
         Bindings, CapabilityDeclarations, Concurrency, ExecutionMode, IdentityBinding,
         IdentityScope, ManagementOperation, ManagementOperationKind, ManifestProvenance,
         ModuleManifest, ObservabilityKind, ObservabilitySurface, ProviderRole, SelfSignalEffect,
-        SelfSignalKind, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
+        SelfSignalKind, SignalAnchor, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
     },
     session::{
-        HealthStatus, ModuleControlPush, ModuleControlRequest, ModuleControlRequestFromModule,
-        ModuleControlResponse, ModuleControlResponseToModule,
+        HealthStatus, ModuleControlCommand, ModuleControlPush, ModuleControlRequest,
+        ModuleControlRequestFromModule, ModuleControlResponse, ModuleControlResponseToModule,
     },
-    BindIdentity, ErrorBody, ModuleHelloAckBody, ModuleHelloBody, Principal, RouteTarget,
-    PROTOCOL_VERSION,
+    BindIdentity, ErrorBody, ModuleHelloAckBody, ModuleHelloBody, Principal, RouteCloseReason,
+    RouteTarget, FLAG_SUBSCRIPTION, PROTOCOL_VERSION,
 };
 
 // Drift-prevention contract: UPDATE_GOLDEN=1 rewrites the committed JSON
@@ -104,6 +104,13 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
     assert_golden(
         "module_control_request_health_check",
         &ModuleControlRequest::HealthCheck {},
+    );
+    assert_golden(
+        "module_control_command_draining",
+        &ModuleControlCommand::Draining {
+            reason: RouteCloseReason::Restart,
+            deadline_ms: 1_725_000_030_000,
+        },
     );
     assert_golden(
         "module_control_response_health_check",
@@ -213,9 +220,16 @@ fn self_signal_declaration_vectors_round_trip_and_refuse_missing_axes() {
         .self_signals
         .as_ref()
         .expect("present self_signals remain present");
-    assert_eq!(signals.len(), 2);
+    assert_eq!(signals.len(), 3);
     assert_eq!(signals[0].effect, SelfSignalEffect::Observe);
     assert_eq!(signals[1].effect, SelfSignalEffect::Mutate);
+    assert_eq!(signals[2].kind, SelfSignalKind::Busy);
+    assert_eq!(
+        signals[2].anchored_to,
+        SignalAnchor::HealthGauges {
+            gauges: vec!["runs_in_flight".to_string(), "opening".to_string()]
+        }
+    );
     assert_eq!(
         serde_json::to_vec(&manifest).expect("self-signal manifest serializes"),
         with_signals_bytes,
@@ -422,6 +436,7 @@ fn protocol_constants_are_published_for_cross_language_comparison() {
         "header_len": subc_protocol::HEADER_LEN,
         "frozen_prefix_len": subc_protocol::FROZEN_PREFIX_LEN,
         "max_frame_body_len": subc_protocol::MAX_FRAME_BODY_LEN,
+        "subscription_flag": FLAG_SUBSCRIPTION,
     });
     let path = golden_path("protocol_constants");
     if std::env::var_os("UPDATE_GOLDEN").is_some() {

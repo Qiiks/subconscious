@@ -1,6 +1,7 @@
 {
   "abandoned": 3,
   "drained": false,
+  "excluded_subscriptions": 0,
   "module_id": "aft-tools",
   "op": "route.closed",
   "reason": "reload",

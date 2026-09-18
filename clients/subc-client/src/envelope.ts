@@ -51,7 +51,8 @@ const FLAG_LAST = 0b0000_1000;
 const FLAG_ADMISSION_MASK = 0b0011_0000;
 const FLAG_ADMISSION_SHIFT = 4;
 export const DAEMON_ORIGIN_FLAG = 0x40;
-const FLAG_RESERVED_MASK = 0b1000_0000;
+export const SUBSCRIPTION_FLAG = 0x80;
+const FLAG_RESERVED_MASK = 0;
 
 /** Build flags from typed components. Admission defaults to NORMAL. */
 export function buildFlags(

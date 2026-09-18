@@ -8,6 +8,7 @@
   "counters": {
     "client_egress_close_delivery_failed": 1,
     "client_frames_dropped_stale_route": 2,
+    "drains_with_undeclared_gauge": 8,
     "goodbye_relay_client_failed": 4,
     "goodbye_relay_module_dropped": 5,
     "goodbye_relay_module_dropped_by_module": {

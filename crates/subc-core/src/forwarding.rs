@@ -2,10 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     error::Error,
     fmt,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
-    },
+    sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard},
     time::Duration,
 };
 
@@ -176,6 +173,7 @@ pub(crate) struct ModuleDrainTarget {
     pub sink: FrameSink,
     pub negotiated_ver: u8,
     pub abandoned_bindings: Vec<GoodbyeTarget>,
+    pub excluded_subscriptions: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -492,7 +490,7 @@ impl ForwardingTable {
         expected_op: &str,
         deadline: Instant,
     ) -> Result<PendingModuleControlRpc, ForwardingError> {
-        self.begin_module_control_rpc_inner(module_id, expected_op, deadline, None)
+        self.begin_module_control_rpc_inner(module_id, expected_op, deadline, None, false)
     }
 
     pub(crate) fn begin_health_probe_rpc_for(
@@ -507,6 +505,23 @@ impl ForwardingTable {
             expected_op,
             deadline,
             Some(probe_started_at),
+            false,
+        )
+    }
+
+    pub(crate) fn begin_drain_health_probe_rpc_for(
+        &self,
+        module_id: &str,
+        expected_op: &str,
+        probe_started_at: Instant,
+        deadline: Instant,
+    ) -> Result<PendingModuleControlRpc, ForwardingError> {
+        self.begin_module_control_rpc_inner(
+            module_id,
+            expected_op,
+            deadline,
+            Some(probe_started_at),
+            true,
         )
     }
 
@@ -516,6 +531,7 @@ impl ForwardingTable {
         expected_op: &str,
         deadline: Instant,
         health_probe_started_at: Option<Instant>,
+        allow_draining: bool,
     ) -> Result<PendingModuleControlRpc, ForwardingError> {
         let mut inner = self.write_inner()?;
         let module = inner
@@ -523,7 +539,7 @@ impl ForwardingTable {
             .get(module_id)
             .cloned()
             .ok_or(ForwardingError::NoModuleConnection)?;
-        if inner.draining_endpoints.contains_key(&module.endpoint) {
+        if !allow_draining && inner.draining_endpoints.contains_key(&module.endpoint) {
             return Err(ForwardingError::ModuleReloading {
                 module_id: module_id.to_string(),
             });
@@ -1287,9 +1303,10 @@ impl ForwardingTable {
             .filter(|route| route.module_endpoint == endpoint)
             .map(|route| Arc::clone(&route.flow))
             .collect::<Vec<_>>();
-        for flow in flows {
-            flow.close();
-        }
+        let excluded_subscriptions = flows
+            .into_iter()
+            .map(|flow| flow.begin_drain())
+            .fold(0u32, u32::saturating_add);
 
         let pending_keys = inner
             .pending_relays
@@ -1341,6 +1358,7 @@ impl ForwardingTable {
             sink: module.sink,
             negotiated_ver: module.negotiated_ver,
             abandoned_bindings,
+            excluded_subscriptions,
         }))
     }
 
@@ -1353,7 +1371,7 @@ impl ForwardingTable {
             .client_to_module
             .values()
             .filter(|route| route.module_endpoint == endpoint)
-            .map(|route| route.flow.in_flight())
+            .map(|route| route.flow.drain_in_flight())
             .sum())
     }
 
@@ -2005,12 +2023,73 @@ fn remove_module_connection_locked(
     released
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RequestCredit {
+    subscription: bool,
+    excluded_from_drain: bool,
+}
+
+#[derive(Debug, Default)]
+struct CreditLedger {
+    by_corr: HashMap<u64, Vec<RequestCredit>>,
+}
+
+impl CreditLedger {
+    fn acquire(&mut self, corr: u64, subscription: bool) {
+        self.by_corr.entry(corr).or_default().push(RequestCredit {
+            subscription,
+            excluded_from_drain: false,
+        });
+    }
+
+    fn release(&mut self, corr: u64) -> bool {
+        let Some(credits) = self.by_corr.get_mut(&corr) else {
+            return false;
+        };
+        let released = credits.pop().is_some();
+        if credits.is_empty() {
+            self.by_corr.remove(&corr);
+        }
+        released
+    }
+
+    fn capture_subscription_exclusions(&mut self) -> u32 {
+        let mut excluded = 0u32;
+        for credit in self.by_corr.values_mut().flatten() {
+            if credit.subscription && !credit.excluded_from_drain {
+                credit.excluded_from_drain = true;
+                excluded = excluded.saturating_add(1);
+            }
+        }
+        excluded
+    }
+
+    #[cfg(test)]
+    fn in_flight(&self) -> usize {
+        self.by_corr.values().map(Vec::len).sum()
+    }
+
+    fn drain_in_flight(&self) -> usize {
+        self.by_corr
+            .values()
+            .flatten()
+            .filter(|credit| !credit.excluded_from_drain)
+            .count()
+    }
+}
+
+#[derive(Debug, Default)]
+struct ChannelFlowState {
+    closed: bool,
+    credits: CreditLedger,
+}
+
 /// Per-channel request-credit accounting shared by the client and module route halves.
 #[derive(Debug)]
 pub(crate) struct ChannelFlow {
     sem: Semaphore,
     window: usize,
-    in_flight: AtomicUsize,
+    state: Mutex<ChannelFlowState>,
 }
 
 impl ChannelFlow {
@@ -2019,53 +2098,76 @@ impl ChannelFlow {
         Self {
             sem: Semaphore::new(window),
             window,
-            in_flight: AtomicUsize::new(0),
+            state: Mutex::new(ChannelFlowState::default()),
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn acquire(&self) -> Result<(), ChannelFlowClosed> {
+        self.acquire_tagged(0, false).await
+    }
+
+    pub(crate) async fn acquire_tagged(
+        &self,
+        corr: u64,
+        subscription: bool,
+    ) -> Result<(), ChannelFlowClosed> {
         let permit = self.sem.acquire().await.map_err(|_| ChannelFlowClosed)?;
-        // Credits are returned by terminal frames on the module->client path, not
-        // by this task's RAII lifetime. Track the outstanding count separately so
-        // a reload drain can close admission while still observing old requests.
-        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.closed {
+            return Err(ChannelFlowClosed);
+        }
+        state.credits.acquire(corr, subscription);
         permit.forget();
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn release(&self) {
-        let mut observed = self.in_flight.load(Ordering::Acquire);
-        loop {
-            if observed == 0 {
-                // Protocol-conforming modules emit exactly one terminal per request.
-                // This guard is a best-effort safety net against window growth, not a
-                // security boundary against malicious peers.
-                warn!(
-                    window = self.window,
-                    available = self.sem.available_permits(),
-                    "flow-control over-release ignored"
-                );
-                return;
-            }
-            match self.in_flight.compare_exchange_weak(
-                observed,
-                observed - 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    if !self.sem.is_closed() {
-                        self.sem.add_permits(1);
-                    }
-                    return;
-                }
-                Err(next) => observed = next,
-            }
+        self.release_corr(0);
+    }
+
+    pub(crate) fn release_corr(&self, corr: u64) {
+        let released = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .credits
+            .release(corr);
+        if !released {
+            // Protocol-conforming modules emit exactly one terminal per request.
+            // This guard is a best-effort safety net against window growth, not a
+            // security boundary against malicious peers.
+            warn!(
+                window = self.window,
+                available = self.sem.available_permits(),
+                "flow-control over-release ignored"
+            );
+            return;
+        }
+        if !self.sem.is_closed() {
+            self.sem.add_permits(1);
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn in_flight(&self) -> usize {
-        self.in_flight.load(Ordering::Acquire)
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .credits
+            .in_flight()
+    }
+
+    pub(crate) fn drain_in_flight(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .credits
+            .drain_in_flight()
     }
 
     #[cfg(test)]
@@ -2073,7 +2175,21 @@ impl ChannelFlow {
         self.sem.available_permits()
     }
 
+    pub(crate) fn begin_drain(&self) -> u32 {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.closed = true;
+        self.sem.close();
+        state.credits.capture_subscription_exclusions()
+    }
+
     pub(crate) fn close(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .closed = true;
         self.sem.close();
     }
 }
@@ -2180,6 +2296,41 @@ mod tests {
 
     use super::*;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn ordinary_long_running_request_is_not_excluded_from_drain() {
+        let mut ledger = CreditLedger::default();
+        ledger.acquire(1, false);
+
+        assert_eq!(ledger.capture_subscription_exclusions(), 0);
+        assert_eq!(ledger.drain_in_flight(), 1);
+    }
+
+    #[test]
+    fn bit_set_subscription_is_excluded_and_counted() {
+        let mut ledger = CreditLedger::default();
+        ledger.acquire(1, true);
+
+        assert_eq!(ledger.capture_subscription_exclusions(), 1);
+        assert_eq!(ledger.drain_in_flight(), 0);
+    }
+
+    #[test]
+    fn subscription_opened_after_drain_snapshot_is_not_excluded() {
+        let mut ledger = CreditLedger::default();
+        ledger.acquire(1, true);
+        assert_eq!(ledger.capture_subscription_exclusions(), 1);
+
+        ledger.acquire(2, true);
+
+        assert_eq!(ledger.drain_in_flight(), 1);
+    }
+
+    #[test]
+    fn drain_with_no_subscriptions_reports_zero_excluded() {
+        let mut ledger = CreditLedger::default();
+        assert_eq!(ledger.capture_subscription_exclusions(), 0);
+    }
 
     #[test]
     fn multi_provider_route_limit_reports_per_client_exhaustion_without_affecting_second_client() {

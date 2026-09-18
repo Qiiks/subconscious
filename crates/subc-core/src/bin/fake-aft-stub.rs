@@ -21,11 +21,12 @@ use subc_protocol::{
     manifest::{
         CapabilityDeclarations, Concurrency, ExecutionMode, IdentityScope, InternalTransport,
         ManagementOperation, ManagementOperationKind, ManifestProvenance, ObservabilityKind,
-        ObservabilitySurface, PipelineAppliesTo, PipelineStageKind, ProviderRole, Tool,
+        ObservabilitySurface, PipelineAppliesTo, PipelineStageKind, ProviderRole,
+        SelfSignalDeclaration, SelfSignalEffect, SelfSignalKind, SignalAnchor, Tool,
     },
     session::{
-        HealthStatus, ModuleControlPush, ModuleControlRequest, ModuleControlResponse,
-        MODULE_CONTROL_OP_HEALTH_CHECK,
+        HealthStatus, ModuleControlCommand, ModuleControlPush, ModuleControlRequest,
+        ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK,
     },
     ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority, PROTOCOL_VERSION,
     SUBC_PROTOCOL_CRATE_VERSION,
@@ -73,6 +74,7 @@ const FAKE_AFT_HEALTH_NEVER_REPLY_FIRST_PATH_ENV: &str = "FAKE_AFT_HEALTH_NEVER_
 const FAKE_AFT_HEALTH_STATUS_ENV: &str = "FAKE_AFT_HEALTH_STATUS";
 const FAKE_AFT_HEALTH_DETAIL_ENV: &str = "FAKE_AFT_HEALTH_DETAIL";
 const FAKE_AFT_HEALTH_METRICS_ENV: &str = "FAKE_AFT_HEALTH_METRICS";
+const FAKE_AFT_BUSY_GAUGES_ENV: &str = "FAKE_AFT_BUSY_GAUGES";
 /// Optional static capability block used only by daemon integration fixtures.
 const FAKE_AFT_CAPABILITIES_ENV: &str = "FAKE_AFT_CAPABILITIES";
 /// Presence (not value) is the trigger: when set, the stub writes
@@ -404,6 +406,7 @@ async fn send_hello(writer: &mpsc::Sender<Frame>, config: &StubConfig) -> Result
             config.concurrency.clone(),
             &config.tools,
             config.capabilities.clone(),
+            &config.busy_gauges,
         ),
         protocol_ver: PROTOCOL_VERSION,
         control_ops: if config.advertise_health {
@@ -476,6 +479,24 @@ async fn handle_frame(
         }
         FrameType::Request if frame.header.channel == 0 => {
             handle_control_request(frame, config, state, writer).await?;
+            Ok(true)
+        }
+        FrameType::Push if frame.header.channel == 0 => {
+            let command = serde_json::from_slice::<ModuleControlCommand>(&frame.body)
+                .map_err(StubError::Json)?;
+            match command {
+                ModuleControlCommand::Draining {
+                    reason,
+                    deadline_ms,
+                } => record_event(
+                    config,
+                    json!({
+                        "kind": "draining",
+                        "reason": reason,
+                        "deadline_ms": deadline_ms,
+                    }),
+                )?,
+            }
             Ok(true)
         }
         FrameType::Error => {
@@ -1282,10 +1303,25 @@ fn manifest(
     concurrency: Concurrency,
     tools: &[String],
     capabilities: Option<CapabilityDeclarations>,
+    busy_gauges: &[String],
 ) -> subc_protocol::manifest::ModuleManifest {
+    let self_signals = (!busy_gauges.is_empty()).then(|| {
+        vec![SelfSignalDeclaration {
+            name: "drain_busy".to_string(),
+            kind: SelfSignalKind::Busy,
+            effect: SelfSignalEffect::Observe,
+            anchored_to: SignalAnchor::HealthGauges {
+                gauges: busy_gauges.to_vec(),
+            },
+            cadence: None,
+            domain: None,
+            note: None,
+        }]
+    });
     subc_protocol::manifest::ModuleManifest::builder(module_id, "0.0.0-fake")
         .provides(vec![provider_role(role, concurrency, tools)])
         .capabilities(capabilities)
+        .self_signals(self_signals)
         .provenance(manifest_provenance())
         .build()
 }
@@ -1439,6 +1475,7 @@ struct StubConfig {
     health_status: HealthStatus,
     health_detail: Option<String>,
     health_metrics: Option<Value>,
+    busy_gauges: Vec<String>,
     /// The launch nonce subc injected for spawn attestation and reserved HELLOs.
     /// A real supervised module reads this from the SUBC_LAUNCH_NONCE env var.
     launch_nonce: Option<String>,
@@ -1576,6 +1613,16 @@ impl StubConfig {
                 .filter(|value| !value.is_empty())
                 .map(|raw| serde_json::from_str::<Value>(&raw).map_err(StubError::Json))
                 .transpose()?,
+            busy_gauges: env::var(FAKE_AFT_BUSY_GAUGES_ENV)
+                .ok()
+                .map(|raw| {
+                    raw.split(',')
+                        .map(str::trim)
+                        .filter(|gauge| !gauge.is_empty())
+                        .map(ToOwned::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default(),
             launch_nonce: env::var(subc_protocol::SUBC_LAUNCH_NONCE_ENV)
                 .ok()
                 .filter(|value| !value.is_empty()),

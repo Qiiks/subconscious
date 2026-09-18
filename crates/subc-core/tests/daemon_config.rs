@@ -385,6 +385,7 @@ async fn rescan_removes_module_and_leaves_other_open_route_undisturbed() {
             "reason": "disable",
             "drained": true,
             "abandoned": 0,
+            "excluded_subscriptions": 0,
             "terminal": true,
         })
     );

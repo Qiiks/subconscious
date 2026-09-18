@@ -15,7 +15,11 @@ use subc_control::{
     TerminalExitKind,
 };
 use subc_protocol::{
-    session::{HealthReport, HealthStatus, ModuleControlRequest, MODULE_CONTROL_OP_HEALTH_CHECK},
+    manifest::{SelfSignalKind, SignalAnchor},
+    session::{
+        HealthReport, HealthStatus, ModuleControlCommand, ModuleControlRequest,
+        MODULE_CONTROL_OP_HEALTH_CHECK,
+    },
     Flags, FrameType, Priority, SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV,
 };
 use tokio::{
@@ -2143,7 +2147,7 @@ async fn run_health_probe_cycle(
     child: &mut Option<SupervisedChild>,
 ) {
     let now_ms = unix_ms_now();
-    match probe_module_health(spec, runtime).await {
+    match probe_module_health(spec, runtime, None).await {
         Ok(report) => {
             handle_health_report(
                 spec,
@@ -2176,6 +2180,7 @@ async fn run_health_probe_cycle(
 async fn probe_module_health(
     spec: &ModuleSpec,
     runtime: &SupervisorRuntimeConfig,
+    drain_deadline: Option<Instant>,
 ) -> Result<HealthReport, HealthProbeError> {
     let Some(forwarding) = runtime.forwarding.as_ref() else {
         return Err(HealthProbeError::misconfigured(
@@ -2183,19 +2188,30 @@ async fn probe_module_health(
         ));
     };
     let probe_started_at = Instant::now();
-    let deadline = probe_started_at + runtime.health.deadline;
-    let pending = forwarding
-        .begin_health_probe_rpc_for(
+    let mut deadline = probe_started_at + runtime.health.deadline;
+    if let Some(drain_deadline) = drain_deadline {
+        deadline = deadline.min(drain_deadline);
+    }
+    let pending = if drain_deadline.is_some() {
+        forwarding.begin_drain_health_probe_rpc_for(
             &spec.module_id,
             MODULE_CONTROL_OP_HEALTH_CHECK,
             probe_started_at,
             deadline,
         )
-        .map_err(|err| {
-            // The endpoint is not registered, so there is no live control lane to
-            // ask. That is the module being absent, not slow.
-            HealthProbeError::lane_dead(format!("failed to begin health.check RPC: {err}"))
-        })?;
+    } else {
+        forwarding.begin_health_probe_rpc_for(
+            &spec.module_id,
+            MODULE_CONTROL_OP_HEALTH_CHECK,
+            probe_started_at,
+            deadline,
+        )
+    }
+    .map_err(|err| {
+        // The endpoint is not registered, so there is no live control lane to
+        // ask. That is the module being absent, not slow.
+        HealthProbeError::lane_dead(format!("failed to begin health.check RPC: {err}"))
+    })?;
     let PendingModuleControlRpc {
         endpoint,
         module_sink,
@@ -2501,6 +2517,7 @@ async fn health_restart_child(
         begin_forwarding_drain_if_configured(
             spec,
             runtime,
+            registry,
             snapshot,
             Some(false),
             RouteCloseReason::Disable,
@@ -2543,6 +2560,7 @@ async fn health_restart_child(
     begin_forwarding_drain_if_configured(
         spec,
         runtime,
+        registry,
         snapshot,
         Some(true),
         RouteCloseReason::Restart,
@@ -3064,6 +3082,7 @@ async fn handle_supervisor_command(
                 begin_forwarding_drain_if_configured(
                     spec,
                     runtime,
+                    registry,
                     snapshot,
                     None,
                     RouteCloseReason::Disable,
@@ -3205,6 +3224,7 @@ async fn restart_child(
     begin_forwarding_drain_with_timeout(
         spec,
         runtime,
+        registry,
         snapshot,
         None,
         RouteCloseReason::Restart,
@@ -3273,6 +3293,7 @@ async fn reload_child(
     begin_forwarding_drain(
         spec,
         runtime,
+        registry,
         snapshot,
         Some(true),
         RouteCloseReason::Reload,
@@ -3467,6 +3488,7 @@ async fn set_child_enabled(
         begin_forwarding_drain_if_configured(
             spec,
             runtime,
+            registry,
             snapshot,
             Some(false),
             RouteCloseReason::Disable,
@@ -3908,23 +3930,126 @@ struct ReloadRegistrationFailure {
     reason: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BusyGaugeObservation {
+    Quiescent,
+    Busy,
+    Omitted,
+}
+
+fn busy_gauge_observation(metrics: Option<&Value>, gauges: &[String]) -> BusyGaugeObservation {
+    let Some(metrics) = metrics.and_then(Value::as_object) else {
+        return BusyGaugeObservation::Omitted;
+    };
+    let mut sum = 0u128;
+    for gauge in gauges {
+        let Some(value) = metrics.get(gauge) else {
+            return BusyGaugeObservation::Omitted;
+        };
+        let Some(value) = value.as_u64() else {
+            return BusyGaugeObservation::Busy;
+        };
+        sum = sum.saturating_add(u128::from(value));
+    }
+    if sum == 0 {
+        BusyGaugeObservation::Quiescent
+    } else {
+        BusyGaugeObservation::Busy
+    }
+}
+
+fn declared_busy_gauges(
+    registry: &Registry,
+    module_id: &str,
+) -> Result<Vec<String>, SuperviseError> {
+    let Some(registration) = registry
+        .get_module(module_id)
+        .map_err(SuperviseError::Registry)?
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(self_signals) = registration.manifest.self_signals else {
+        return Ok(Vec::new());
+    };
+
+    let mut gauges = Vec::new();
+    for declaration in self_signals {
+        if declaration.kind != SelfSignalKind::Busy {
+            continue;
+        }
+        match declaration.anchored_to {
+            SignalAnchor::HealthGauges { gauges: declared } if !declared.is_empty() => {
+                gauges.extend(declared)
+            }
+            _ => {
+                // An invalid Busy anchor is fail-safe: the empty name cannot be
+                // present in a conforming health report, so this drain stays busy.
+                gauges.push(String::new());
+            }
+        }
+    }
+    Ok(gauges)
+}
+
 async fn wait_for_forwarding_quiescence(
     forwarding: &ForwardingTable,
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
     endpoint: crate::ModuleEndpointId,
-    wait: Duration,
+    deadline: Instant,
+    busy_gauges: &[String],
 ) -> Result<bool, SuperviseError> {
-    let deadline = Instant::now() + wait;
+    let mut gauges_quiescent = busy_gauges.is_empty();
+    let mut next_probe_at = Instant::now();
+    let mut omission_counted = false;
+
     loop {
+        let now = Instant::now();
+        if !busy_gauges.is_empty() && now >= next_probe_at && now < deadline {
+            gauges_quiescent = match probe_module_health(spec, runtime, Some(deadline)).await {
+                Ok(report) => match busy_gauge_observation(report.metrics.as_ref(), busy_gauges) {
+                    BusyGaugeObservation::Quiescent => true,
+                    BusyGaugeObservation::Busy => false,
+                    BusyGaugeObservation::Omitted => {
+                        if !omission_counted {
+                            forwarding
+                                .counters()
+                                .increment_drains_with_undeclared_gauge();
+                            omission_counted = true;
+                        }
+                        false
+                    }
+                },
+                Err(err) => {
+                    warn!(
+                        module_id = %spec.module_id,
+                        error = %err,
+                        "drain health.check did not produce declared busy gauges; treating module as busy"
+                    );
+                    false
+                }
+            };
+            next_probe_at = Instant::now() + runtime.health.cadence.max(REGISTRY_RELEASE_POLL);
+        }
+
         let in_flight = forwarding
             .endpoint_in_flight_count(endpoint)
             .map_err(SuperviseError::Forwarding)?;
-        if in_flight == 0 {
+        if in_flight == 0 && gauges_quiescent {
             return Ok(true);
         }
-        if Instant::now() >= deadline {
+
+        let now = Instant::now();
+        if now >= deadline {
             return Ok(false);
         }
-        sleep(REGISTRY_RELEASE_POLL).await;
+        let mut wait = deadline
+            .saturating_duration_since(now)
+            .min(REGISTRY_RELEASE_POLL);
+        if !busy_gauges.is_empty() {
+            wait = wait.min(next_probe_at.saturating_duration_since(now));
+        }
+        sleep(wait).await;
     }
 }
 
@@ -3995,6 +4120,55 @@ fn send_route_goodbyes(forwarding: &ForwardingTable, released_routes: Vec<Goodby
     }
 }
 
+fn send_module_draining(
+    module_id: &str,
+    reason: RouteCloseReason,
+    deadline_ms: u64,
+    target: &ModuleDrainTarget,
+) {
+    let body = match serde_json::to_vec(&ModuleControlCommand::Draining {
+        reason,
+        deadline_ms,
+    }) {
+        Ok(body) => body,
+        Err(err) => {
+            warn!(
+                module_id,
+                error = %err,
+                "failed to encode module draining command"
+            );
+            return;
+        }
+    };
+    let frame = match Frame::build_with_version(
+        target.negotiated_ver,
+        FrameType::Push,
+        control_flags(),
+        0,
+        0,
+        0,
+        body,
+    ) {
+        Ok(frame) => frame,
+        Err(err) => {
+            warn!(
+                module_id,
+                error = %err,
+                "failed to build module draining command frame"
+            );
+            return;
+        }
+    };
+    if let Err(err) = target.sink.try_send(frame) {
+        warn!(
+            module_id,
+            target_connection_id = target.endpoint.connection_id.get(),
+            error = %err,
+            "module draining command was not delivered to peer"
+        );
+    }
+}
+
 fn send_module_goodbye(module_id: &str, forwarding: &ForwardingTable, target: &ModuleDrainTarget) {
     let frame = match Frame::build_with_version(
         target.negotiated_ver,
@@ -4032,9 +4206,17 @@ fn send_module_goodbye(module_id: &str, forwarding: &ForwardingTable, target: &M
     }
 }
 
+#[derive(Clone, Copy)]
+struct ForwardingDrainContext<'a> {
+    spec: &'a ModuleSpec,
+    runtime: &'a SupervisorRuntimeConfig,
+    registry: &'a Registry,
+}
+
 async fn begin_forwarding_drain(
     spec: &ModuleSpec,
     runtime: &SupervisorRuntimeConfig,
+    registry: &Registry,
     snapshot: &SharedSnapshot,
     enabled: Option<bool>,
     reason: RouteCloseReason,
@@ -4048,7 +4230,11 @@ async fn begin_forwarding_drain(
 
     begin_forwarding_drain_with(
         forwarding,
-        spec,
+        ForwardingDrainContext {
+            spec,
+            runtime,
+            registry,
+        },
         snapshot,
         enabled,
         reason,
@@ -4060,6 +4246,7 @@ async fn begin_forwarding_drain(
 async fn begin_forwarding_drain_if_configured(
     spec: &ModuleSpec,
     runtime: &SupervisorRuntimeConfig,
+    registry: &Registry,
     snapshot: &SharedSnapshot,
     enabled: Option<bool>,
     reason: RouteCloseReason,
@@ -4067,6 +4254,7 @@ async fn begin_forwarding_drain_if_configured(
     begin_forwarding_drain_with_timeout(
         spec,
         runtime,
+        registry,
         snapshot,
         enabled,
         reason,
@@ -4081,6 +4269,7 @@ async fn begin_forwarding_drain_if_configured(
 async fn begin_forwarding_drain_with_timeout(
     spec: &ModuleSpec,
     runtime: &SupervisorRuntimeConfig,
+    registry: &Registry,
     snapshot: &SharedSnapshot,
     enabled: Option<bool>,
     reason: RouteCloseReason,
@@ -4090,19 +4279,41 @@ async fn begin_forwarding_drain_with_timeout(
         return Ok(());
     };
 
-    begin_forwarding_drain_with(forwarding, spec, snapshot, enabled, reason, drain_timeout).await
+    begin_forwarding_drain_with(
+        forwarding,
+        ForwardingDrainContext {
+            spec,
+            runtime,
+            registry,
+        },
+        snapshot,
+        enabled,
+        reason,
+        drain_timeout,
+    )
+    .await
 }
 
 async fn begin_forwarding_drain_with(
     forwarding: &ForwardingTable,
-    spec: &ModuleSpec,
+    context: ForwardingDrainContext<'_>,
     snapshot: &SharedSnapshot,
     enabled: Option<bool>,
     reason: RouteCloseReason,
     drain_timeout: Duration,
 ) -> Result<(), SuperviseError> {
+    let ForwardingDrainContext {
+        spec,
+        runtime,
+        registry,
+    } = context;
     debug_assert_ne!(reason, RouteCloseReason::Crash);
     let terminal = matches!(reason, RouteCloseReason::Disable);
+    let drain_started_at = Instant::now();
+    let drain_deadline = drain_started_at + drain_timeout;
+    let deadline_ms =
+        unix_ms_now().saturating_add(u64::try_from(drain_timeout.as_millis()).unwrap_or(u64::MAX));
+    let busy_gauges = declared_busy_gauges(registry, &spec.module_id)?;
 
     // Admission gate first: route.open/commit and route REQUEST admission are closed
     // before the first quiescence check, so the outstanding count can only fall.
@@ -4117,6 +4328,7 @@ async fn begin_forwarding_drain_with(
     })?;
 
     if let Some(target) = drain_target.as_ref() {
+        send_module_draining(&spec.module_id, reason, deadline_ms, target);
         let routes = forwarding
             .endpoint_routes(target.endpoint)
             .map_err(SuperviseError::Forwarding)?;
@@ -4136,8 +4348,15 @@ async fn begin_forwarding_drain_with(
         // anything else. A client holds `closing` as a promise that a verdict is
         // coming; leaving early without `closed` strands it waiting forever, since
         // `closing` carries no timeout of its own.
-        let wait_result =
-            wait_for_forwarding_quiescence(forwarding, target.endpoint, drain_timeout).await;
+        let wait_result = wait_for_forwarding_quiescence(
+            forwarding,
+            spec,
+            runtime,
+            target.endpoint,
+            drain_deadline,
+            &busy_gauges,
+        )
+        .await;
         let drained = drained_after_quiescence_wait(&wait_result);
         if let Err(err) = &wait_result {
             error!(
@@ -4162,6 +4381,7 @@ async fn begin_forwarding_drain_with(
                 reason,
                 drained,
                 abandoned: target.abandoned_bindings.len() as u32,
+                excluded_subscriptions: target.excluded_subscriptions,
                 terminal: Some(terminal),
             },
         );
@@ -4200,6 +4420,7 @@ async fn begin_forwarding_drain_with(
             routes_notified,
             route_goodbyes = route_goodbye_count,
             abandoned_reservations = target.abandoned_bindings.len(),
+            excluded_subscriptions = target.excluded_subscriptions,
             drained,
             "module drain complete; consumers notified via route.closing/route.closed pushes and per-route GOODBYE frames"
         );
@@ -5835,7 +6056,7 @@ mod health_tombstone_tests {
     ) -> ModuleControlRpcCompletion {
         assert!(stall > harness.runtime.health.deadline);
         let deadline = harness.runtime.health.deadline;
-        let probe = probe_module_health(&harness.spec, &harness.runtime);
+        let probe = probe_module_health(&harness.spec, &harness.runtime, None);
         let answer = async {
             let frame = harness.module_rx.recv().await.expect("health.check frame");
             tokio::time::advance(deadline).await;
@@ -5863,7 +6084,7 @@ mod health_tombstone_tests {
 
     async fn time_out_without_answer(harness: &mut ProbeHarness) {
         let deadline = harness.runtime.health.deadline;
-        let probe = probe_module_health(&harness.spec, &harness.runtime);
+        let probe = probe_module_health(&harness.spec, &harness.runtime, None);
         let exhaust_deadline = async {
             let _frame = harness.module_rx.recv().await.expect("health.check frame");
             tokio::time::advance(deadline).await;

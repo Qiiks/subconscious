@@ -334,12 +334,12 @@ pub struct CapabilityDeclarations {
 pub struct SelfSignalDeclaration {
     /// Stable identifier for this declared behavior, such as `codex_keepalive`.
     pub name: String,
-    /// Informative classification only; it never substitutes for `effect` or
-    /// `anchored_to` when an analyst interprets the declaration.
+    /// Signal classification. `Busy` participates in drain quiescence; the
+    /// remaining kinds are descriptive for operators and analysts.
     pub kind: SelfSignalKind,
     /// Whether the signal only observes the surface or changes it.
     pub effect: SelfSignalEffect,
-    /// Whether the behavior follows its own interval or a surface event boundary.
+    /// The cadence, event, or health gauges that anchor this signal.
     pub anchored_to: SignalAnchor,
     /// The effective cadence in force at HELLO time.
     ///
@@ -356,10 +356,12 @@ pub struct SelfSignalDeclaration {
     pub note: Option<String>,
 }
 
-/// Informative class of a self-signal, tolerant of newer wire values.
+/// Class of a self-signal, tolerant of newer wire values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelfSignalKind {
     Keepalive,
+    /// Work that must settle before the daemon considers a module quiescent.
+    Busy,
     Poller,
     Cron,
     Sweep,
@@ -372,6 +374,7 @@ impl SelfSignalKind {
     fn wire_name(&self) -> &str {
         match self {
             Self::Keepalive => "keepalive",
+            Self::Busy => "busy",
             Self::Poller => "poller",
             Self::Cron => "cron",
             Self::Sweep => "sweep",
@@ -399,6 +402,7 @@ impl<'de> Deserialize<'de> for SelfSignalKind {
         let value = String::deserialize(deserializer)?;
         Ok(match value.as_str() {
             "keepalive" => Self::Keepalive,
+            "busy" => Self::Busy,
             "poller" => Self::Poller,
             "cron" => Self::Cron,
             "sweep" => Self::Sweep,
@@ -417,7 +421,7 @@ pub enum SelfSignalEffect {
     Mutate,
 }
 
-/// What establishes a self-signal's cadence relative to the external surface.
+/// What anchors a self-signal to an interval, event, or health state.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SignalAnchor {
@@ -427,6 +431,8 @@ pub enum SignalAnchor {
     /// The behavior follows an external event boundary, which can make its shape
     /// indistinguishable from the surface mechanism without this declaration.
     Event { event: String },
+    /// Health metrics whose non-negative integer values are summed during drain.
+    HealthGauges { gauges: Vec<String> },
 }
 
 /// How a self-signal's effective cadence is declared.

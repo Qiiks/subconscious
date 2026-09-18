@@ -2004,7 +2004,7 @@ async fn module_status_renders_key_value_block_byte_for_byte() {
     assert_eq!(
         rest,
         format!(
-            "0 of 1 in 10m · drain 25 ms · restart backoff 10 ms to 30s\n  last exit: none\n  binary: {binary} ({image})\nmetrics: run `ck health aft`\n"
+            "0 of 1 in 10m · drain 25 ms · restart backoff 10 ms to 30s\n  last exit: none\n  drain gauges: 0 drains with undeclared gauge\n  binary: {binary} ({image})\nmetrics: run `ck health aft`\n"
         )
     );
 
