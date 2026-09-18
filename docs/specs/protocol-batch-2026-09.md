@@ -315,6 +315,14 @@ FUSI #144.)
 
 ## 5. `pub const WIRE_CRATE_VERSION: &str = env!("CARGO_PKG_VERSION")` (subc-protocol)
 
+**SATISFIED, UNDER A BETTER NAME:** the const already exists as
+`SUBC_PROTOCOL_CRATE_VERSION` and already serves this purpose; six sibling
+repos import it. The name this item proposed is worse, not just different: four
+crates in this workspace are wire crates, so `WIRE_CRATE_VERSION` *inside
+subc-protocol* reads as "the version of the wire crates" rather than "the
+version of this one". Keeping the precise name, adding no alias — two spellings
+of one const is a surface to keep synchronised for no gain.
+
 For `ManifestProvenance.wire_crate_version`; PLEX and BROCA refuse to
 hand-type it.
 

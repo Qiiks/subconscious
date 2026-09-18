@@ -193,10 +193,7 @@ pub const PROTOCOL_VERSION: u8 = 2;
 /// version gate (insula shipped exactly that before the referent was written
 /// down). `env!` makes it a property of the compiled binary, not of whatever
 /// source tree sits beside it at run time.
-pub const WIRE_CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// Backward-compatible spelling for [`WIRE_CRATE_VERSION`].
-pub const SUBC_PROTOCOL_CRATE_VERSION: &str = WIRE_CRATE_VERSION;
+pub const SUBC_PROTOCOL_CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Oldest envelope protocol version this build accepts.
 pub const MIN_SUPPORTED_VERSION: u8 = 2;
@@ -701,9 +698,9 @@ mod tests {
 
     #[test]
     fn wire_crate_version_is_a_numeric_three_component_version() {
-        let components = WIRE_CRATE_VERSION.split('.').collect::<Vec<_>>();
+        let components = SUBC_PROTOCOL_CRATE_VERSION.split('.').collect::<Vec<_>>();
 
-        assert!(!WIRE_CRATE_VERSION.is_empty());
+        assert!(!SUBC_PROTOCOL_CRATE_VERSION.is_empty());
         assert_eq!(components.len(), 3);
         assert!(components
             .iter()
