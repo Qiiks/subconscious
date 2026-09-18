@@ -251,7 +251,21 @@ say "rollback $(basename "$rb") matches live (${live_digest%"${live_digest#?????
 
 say "=== place"
 cp "$STAGED" "$DEST.tmp" && mv "$DEST.tmp" "$DEST"
-say "placed sha $(shasum -a 256 "$DEST" | cut -c1-8)"
+# THE PLACED BYTES MUST EQUAL THE STAGED BYTES, and this printed a sha without
+# comparing it until 2026-09-18. Found by grepping this file for the shape of
+# the rollback defect fixed forty lines up rather than by anything failing --
+# the same class, three lines apart, and the audit that found it took ninety
+# seconds.
+#
+# Without it the chain has a gap: the staged artifact is verified against its
+# sidecar and the destination is proven to EXECUTE, but nothing says the thing
+# executing is the thing that was verified. A short write, a full disk, or a
+# racing writer lands a different binary that may still run.
+placed_digest=$(shasum -a 256 "$DEST" | awk '{print $1}')
+staged_digest=$(shasum -a 256 "$STAGED" | awk '{print $1}')
+[ -n "$placed_digest" ] && [ "$placed_digest" = "$staged_digest" ] \
+  || refuse "placed bytes differ from the staged bytes (staged $staged_digest, placed $placed_digest); the destination now holds an unverified binary"
+say "placed sha ${placed_digest%"${placed_digest#????????}"} (equals staged)"
 say "warm-exec at destination: $("$DEST" --version 2>&1 | head -1)"
 
 # PATH face: the operator may invoke this by name, and that resolution is what decides
