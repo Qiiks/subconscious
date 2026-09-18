@@ -148,10 +148,24 @@ ts=$(date -u +%Y%m%dT%H%M%SZ)
 rb="$STAGING/ck-$MODULE.rollback-$ts"
 mkdir -p "$STAGING"
 cp "$DEST" "$rb"
+# THE SNAPSHOT IS COMPARED AGAINST ITS SOURCE, not against a hash taken from
+# itself. Writing the sidecar from the copy and then running `shasum -c` is
+# SELF-CONFIRMING: a truncated or corrupt `cp` is hashed as truncated and
+# matches, so the check reports success on exactly the snapshot that cannot be
+# rolled back to. That was this arm until 2026-09-18, and the comment beside it
+# said "verified" -- a self-confirming claim wearing the words of a measurement.
+# (FUSI found the identical shape in their stage.sh sidecar check; the general
+# test is: break each thing the guard CLAIMS to catch, one at a time.)
+#
+# Source-vs-snapshot equality is the whole proof. The sidecar is still written,
+# because it is what a later operator uses to check the file has not rotted on
+# disk since -- a different question, answered at a different time.
+live_digest=$(shasum -a 256 "$DEST" | awk '{print $1}')
+rb_digest=$(shasum -a 256 "$rb" | awk '{print $1}')
+[ -n "$live_digest" ] && [ "$live_digest" = "$rb_digest" ] \
+  || refuse "rollback snapshot does not match the live binary it was copied from (live $live_digest, snapshot $rb_digest); nothing has been placed"
 (cd "$STAGING" && shasum -a 256 "$(basename "$rb")" > "$(basename "$rb").sha256")
-(cd "$STAGING" && shasum -c "$(basename "$rb").sha256" >/dev/null 2>&1) \
-  || refuse "rollback sidecar does not verify its own snapshot; nothing has been placed"
-say "rollback $(basename "$rb") verified, holds: $("$rb" --version 2>&1 | head -1)"
+say "rollback $(basename "$rb") matches live (${live_digest%"${live_digest#????????}"}), holds: $("$rb" --version 2>&1 | head -1)"
 
 say "=== place"
 cp "$STAGED" "$DEST.tmp" && mv "$DEST.tmp" "$DEST"
