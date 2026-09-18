@@ -288,6 +288,14 @@ fn refuse_writable_ancestor(parent: &Path) -> Result<(), ConnectionFileError> {
 
     let mut component = resolved.as_path();
     loop {
+        // A component whose metadata cannot be read is SKIPPED, not refused, and
+        // the silence is deliberate. Canonicalising above already required
+        // traverse permission on every component, so a failure here is close to
+        // unreachable and is a transient io error rather than evidence about
+        // permissions; refusing on it would convert that error into a confident
+        // verdict about a mode we never observed, which is the same trade the
+        // canonicalise arm declines. Argued at the site because an UNARGUED
+        // fail-open is the one a later reader tightens into a refusal.
         if let Ok(metadata) = fs::metadata(component) {
             let mode = metadata.permissions().mode();
             if mode & GROUP_OR_WORLD_WRITABLE != 0 && mode & STICKY == 0 {
