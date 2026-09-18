@@ -2270,7 +2270,7 @@ async fn module_terminals(
         let started = daemon_started_at_ms
             .map(format_age_from_epoch_ms_now)
             .unwrap_or_else(|| "an unknown time ago".to_string());
-        println!("no exits recorded since the daemon started ({started})");
+        println!("no retained exits (current daemon started {started})");
     } else {
         let rows = entries
             .iter()
@@ -2290,13 +2290,34 @@ async fn module_terminals(
                     .and_then(Value::as_str)
                     .map(humanize_identifier)
                     .unwrap_or_else(|| "unknown".to_string());
-                vec![when, exit, disposition]
+                let incarnation = entry
+                    .get("daemon_incarnation")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-")
+                    .to_string();
+                vec![when, exit, disposition, incarnation]
             })
             .collect();
-        print_table(&["when", "exit", "disposition"], rows);
+        print_table(&["when", "exit", "disposition", "daemon"], rows);
+    }
+    for (field, description) in [
+        (
+            "journal_skipped_lines",
+            "unreadable terminal journal lines skipped",
+        ),
+        ("journal_read_errors", "terminal journal file read errors"),
+        (
+            "journal_write_failures",
+            "terminal journal append failures in this daemon",
+        ),
+    ] {
+        let count = response.get(field).and_then(Value::as_u64).unwrap_or(0);
+        if count > 0 {
+            println!("warning: {count} {description}");
+        }
     }
     if verbose && dropped > 0 {
-        println!("{dropped} earlier exits were dropped from the daemon's retained history");
+        println!("{dropped} exits evicted from the current ring; journal copies may be retained");
     }
     Ok(())
 }

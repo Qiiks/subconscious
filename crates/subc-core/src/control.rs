@@ -13,7 +13,7 @@ use subc_control::{
     ModuleDeclaredProvenance, PollKind, RouteCloseReason, StderrCaptureState, StderrTail,
     StderrTailEntry, SupervisorDaemonProvenance, SupervisorEntry, SupervisorHealthEntry,
     SupervisorModuleProvenance, SupervisorObservedProcess, SupervisorRescanResult, SupervisorRoute,
-    SupervisorRouteConsumer, SupervisorRouteModule, TerminalEntry, TerminalHistory,
+    SupervisorRouteConsumer, SupervisorRouteModule,
 };
 use subc_protocol::{
     error_codes,
@@ -2208,25 +2208,9 @@ impl ControlHandler {
             )?]);
         };
 
-        let snapshot = module.terminal_history();
         let response = ClientControlResponse::SupervisorTerminals {
             module_id,
-            terminals: TerminalHistory {
-                daemon_started_at_ms: snapshot.daemon_started_at_ms,
-                entries: snapshot
-                    .entries
-                    .into_iter()
-                    .map(|entry| TerminalEntry {
-                        exit_code: entry.exit_code,
-                        exit_signal: entry.exit_signal,
-                        at_ms: entry.at_ms,
-                        disposition: entry.disposition,
-                        exit_kind: Some(entry.exit_kind),
-                        disposition_detail: entry.disposition_detail,
-                    })
-                    .collect(),
-                dropped: snapshot.dropped,
-            },
+            terminals: module.durable_terminal_history(),
         };
         Ok(vec![control_response_body_frame(
             &frame,

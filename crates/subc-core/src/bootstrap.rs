@@ -103,6 +103,7 @@ pub struct BootstrapConfig {
     /// unset writes `<module_id>.stderr.log` into the operator's live data home
     /// under its fixture module ids.
     capture_logs_dir: Option<PathBuf>,
+    terminal_journal_path: Option<PathBuf>,
 }
 
 impl BootstrapConfig {
@@ -121,6 +122,7 @@ impl BootstrapConfig {
             watchdog_config: DaemonSelfWatchdogConfig::default(),
             connection_file_source: ConnectionFileSource::Explicit,
             capture_logs_dir: None,
+            terminal_journal_path: None,
         }
     }
 
@@ -129,6 +131,13 @@ impl BootstrapConfig {
     /// path inside their fixture tree.
     pub fn with_capture_logs_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.capture_logs_dir = Some(dir.into());
+        self
+    }
+
+    /// Redirects the daemon-private journal, allowing embedded daemons and tests
+    /// to keep their observations out of the operator's live run directory.
+    pub fn with_terminal_journal_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.terminal_journal_path = Some(path.into());
         self
     }
 
@@ -360,6 +369,7 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
     let reserved_capabilities = config.reserved_capabilities.clone();
     let watchdog_config = config.watchdog_config.clone();
     let capture_logs_dir = config.capture_logs_dir.clone();
+    let terminal_journal_path = config.terminal_journal_path.clone();
     match ensure_singleton_with_config(config).await? {
         Outcome::AlreadyRunning => {
             info!("subc daemon already running");
@@ -377,6 +387,7 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
                 reserved_capabilities,
                 watchdog_config,
                 capture_logs_dir,
+                terminal_journal_path,
             )
             .await
         }
@@ -470,6 +481,7 @@ async fn serve_bound_daemon(
     reserved_capabilities: BTreeMap<String, String>,
     watchdog_config: DaemonSelfWatchdogConfig,
     capture_logs_dir: Option<PathBuf>,
+    terminal_journal_path: Option<PathBuf>,
 ) -> Result<(), BootstrapError> {
     raise_nofile_limit();
 
@@ -492,6 +504,14 @@ async fn serve_bound_daemon(
         .with_forwarding(Arc::clone(&forwarding))
         .with_handle(supervisor_handle.clone())
         .with_connection_file_path(bound.connection_file_path.clone())
+        .with_terminal_journal(
+            terminal_journal_path
+                .unwrap_or_else(|| daemon_config::daemon_run_dir().join("terminals.jsonl")),
+            format!(
+                "{:032x}",
+                u128::from_be_bytes(bound.connection_info.daemon_id)
+            ),
+        )
         .with_capture_logs_dir(
             capture_logs_dir.unwrap_or_else(|| daemon_config::daemon_run_dir().join("logs")),
         );

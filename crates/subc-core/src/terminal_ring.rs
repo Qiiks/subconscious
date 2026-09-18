@@ -1,4 +1,6 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, sync::Arc};
+
+use crate::terminal_journal::{ring_history, TerminalJournal};
 
 use subc_control::{TerminalDisposition, TerminalExitKind};
 
@@ -27,7 +29,7 @@ impl Default for TerminalRingConfig {
 }
 
 /// One observed child exit and the disposition chosen by its supervisor.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TerminalRecord {
     pub exit_code: Option<i32>,
     pub exit_signal: Option<i32>,
@@ -56,6 +58,7 @@ pub struct TerminalHistorySnapshot {
 /// process retains the exits that caused it to exist.
 #[derive(Debug)]
 pub struct TerminalRing {
+    journal: Option<Arc<TerminalJournal>>,
     config: TerminalRingConfig,
     daemon_started_at_ms: u64,
     entries: VecDeque<TerminalRecord>,
@@ -65,10 +68,29 @@ pub struct TerminalRing {
 impl TerminalRing {
     pub fn new(config: TerminalRingConfig, daemon_started_at_ms: u64) -> Self {
         Self {
+            journal: None,
             config,
             daemon_started_at_ms,
             entries: VecDeque::new(),
             dropped: 0,
+        }
+    }
+
+    pub(crate) fn with_journal(mut self, journal: Option<Arc<TerminalJournal>>) -> Self {
+        self.journal = journal;
+        self
+    }
+
+    pub(crate) fn append_journal(&self, module_id: &str, entry: &TerminalRecord) {
+        if let Some(journal) = &self.journal {
+            journal.append(module_id, entry);
+        }
+    }
+
+    pub(crate) fn durable_history(&self, module_id: &str) -> subc_control::TerminalHistory {
+        match &self.journal {
+            Some(journal) => journal.merge(module_id, self.snapshot()),
+            None => ring_history(self.snapshot(), None),
         }
     }
 

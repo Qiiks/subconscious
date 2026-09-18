@@ -23,6 +23,7 @@ pub mod router;
 pub mod server;
 pub mod stderr_tail;
 pub mod supervise;
+mod terminal_journal;
 pub mod terminal_ring;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

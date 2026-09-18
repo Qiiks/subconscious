@@ -1075,6 +1075,7 @@ pub struct Supervisor {
     supervisor_handle: Option<SupervisorHandle>,
     health: HealthConfig,
     daemon_started_at_ms: u64,
+    terminal_journal: Option<Arc<crate::terminal_journal::TerminalJournal>>,
     provenance_probe: ExecutableIdentityProbe,
 }
 
@@ -1091,6 +1092,7 @@ impl Supervisor {
             supervisor_handle: None,
             health: HealthConfig::default(),
             daemon_started_at_ms: unix_ms_now(),
+            terminal_journal: None,
             provenance_probe: ExecutableIdentityProbe::default(),
         }
     }
@@ -1116,6 +1118,18 @@ impl Supervisor {
     /// Enables daemon-owned capture files for supervised stdout and stderr.
     pub fn with_capture_logs_dir(mut self, logs_dir: impl Into<PathBuf>) -> Self {
         self.capture_logs_dir = Some(logs_dir.into());
+        self
+    }
+
+    /// Enables best-effort history shared by every supervised module.
+    pub fn with_terminal_journal(mut self, path: PathBuf, daemon_incarnation: String) -> Self {
+        // A millisecond start stamp can repeat after clock rollback or a rapid
+        // restart. Use the connection file's random daemon_id instead: it already
+        // identifies this daemon lifetime independently of the wall clock.
+        self.terminal_journal = Some(Arc::new(crate::terminal_journal::TerminalJournal::open(
+            path,
+            daemon_incarnation,
+        )));
         self
     }
 
@@ -1281,10 +1295,10 @@ impl Supervisor {
             forwarding: self.forwarding.clone(),
             supervisor_handle: self.supervisor_handle.clone(),
             stderr_ring: Arc::new(Mutex::new(StderrRing::new(StderrTailConfig::default()))),
-            terminal_ring: Arc::new(Mutex::new(TerminalRing::new(
-                TerminalRingConfig::default(),
-                self.daemon_started_at_ms,
-            ))),
+            terminal_ring: Arc::new(Mutex::new(
+                TerminalRing::new(TerminalRingConfig::default(), self.daemon_started_at_ms)
+                    .with_journal(self.terminal_journal.clone()),
+            )),
             #[cfg(test)]
             test_seed_stale_facts_before_enable_spawn: false,
         }
@@ -1432,6 +1446,15 @@ impl SupervisedModule {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .snapshot()
+    }
+
+    /// Retained observations from the current ring and all journal generations.
+    pub fn durable_terminal_history(&self) -> subc_control::TerminalHistory {
+        self.inner
+            .terminal_ring
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .durable_history(&self.inner.module_id)
     }
 
     pub fn status(&self) -> Result<ModuleStatus, SuperviseError> {
@@ -2913,6 +2936,7 @@ async fn supervise_loop(
                             // itself errored (e.g. already reaped) leaves no terminal
                             // record at all -- an empty ring reads as "nothing died".
                             record_terminal(
+                                &spec.module_id,
                                 &runtime.terminal_ring,
                                 &wait_error_exit_report(),
                                 TerminalDisposition::Failed,
@@ -3535,7 +3559,12 @@ async fn on_child_exit(
             }) {
                 error!(module_id = %spec.module_id, error = %err, "failed to record clean module exit");
             }
-            record_terminal(terminal_ring, &exit_report, TerminalDisposition::Stopped);
+            record_terminal(
+                &spec.module_id,
+                terminal_ring,
+                &exit_report,
+                TerminalDisposition::Stopped,
+            );
             let registration_released = match wait_for_registration_release(
                 registry,
                 &spec.module_id,
@@ -3604,6 +3633,7 @@ async fn on_child_exit(
                 );
             }
             record_terminal_with_detail(
+                &spec.module_id,
                 terminal_ring,
                 &exit_report,
                 disposition,
@@ -3659,7 +3689,7 @@ async fn on_child_exit(
                     registration_released: false,
                 };
             }
-            record_terminal(terminal_ring, &exit_report, disposition);
+            record_terminal(&spec.module_id, terminal_ring, &exit_report, disposition);
 
             if should_restart {
                 NextAction::Restart { schedule: None }
@@ -3686,30 +3716,34 @@ async fn on_child_exit(
 }
 
 fn record_terminal(
+    module_id: &str,
     terminal_ring: &Arc<Mutex<TerminalRing>>,
     exit_report: &ExitReport,
     disposition: TerminalDisposition,
 ) {
-    record_terminal_with_detail(terminal_ring, exit_report, disposition, None);
+    record_terminal_with_detail(module_id, terminal_ring, exit_report, disposition, None);
 }
 
 fn record_terminal_with_detail(
+    module_id: &str,
     terminal_ring: &Arc<Mutex<TerminalRing>>,
     exit_report: &ExitReport,
     disposition: TerminalDisposition,
     disposition_detail: Option<String>,
 ) {
-    terminal_ring
+    let mut ring = terminal_ring
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .push(TerminalRecord {
-            exit_code: exit_report.code,
-            exit_signal: exit_report.signal,
-            at_ms: exit_report.at_ms,
-            disposition,
-            exit_kind: exit_report.kind.into(),
-            disposition_detail,
-        });
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let record = TerminalRecord {
+        exit_code: exit_report.code,
+        exit_signal: exit_report.signal,
+        at_ms: exit_report.at_ms,
+        disposition,
+        exit_kind: exit_report.kind.into(),
+        disposition_detail,
+    };
+    ring.append_journal(module_id, &record);
+    ring.push(record);
 }
 
 fn untrack_if_registration_released(
@@ -4741,6 +4775,7 @@ async fn drain_child_to_state(
         }
     })?;
     record_terminal(
+        module_id,
         terminal_ring,
         &exit_report,
         terminal_disposition(final_state),
@@ -5925,6 +5960,7 @@ mod terminal_history_tests {
             0,
         )));
         record_terminal(
+            "wait-error",
             &ring,
             &wait_error_exit_report(),
             TerminalDisposition::Failed,

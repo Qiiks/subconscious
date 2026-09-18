@@ -60,6 +60,7 @@ impl RunningDaemon {
         // environment and writes `<module_id>.stderr.log` into the operator's
         // live data home under fixture module ids.
         let config = BootstrapConfig::new(&connection_file_path, 0)
+            .with_terminal_journal_path(temp_dir.join("run").join("terminals.jsonl"))
             .with_capture_logs_dir(temp_dir.join("run").join("logs"))
             .with_daemon_config_path(&config_path)
             .unwrap();
@@ -1184,10 +1185,13 @@ async fn present_invalid_config_fails_loud_before_daemon_starts() {
     )
     .unwrap();
 
-    let err =
-        run_with_daemon_config_path(BootstrapConfig::new(&connection_file_path, 0), &config_path)
-            .await
-            .unwrap_err();
+    let err = run_with_daemon_config_path(
+        BootstrapConfig::new(&connection_file_path, 0)
+            .with_terminal_journal_path(temp_dir.join("run").join("terminals.jsonl")),
+        &config_path,
+    )
+    .await
+    .unwrap_err();
     let message = err.to_string();
     assert!(message.contains(&config_path.display().to_string()));
     assert!(message.contains("invalid daemon config"));

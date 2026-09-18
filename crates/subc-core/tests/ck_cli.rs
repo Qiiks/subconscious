@@ -870,22 +870,20 @@ fn host_target() -> String {
     }
 }
 
-fn single_row_table(headers: [&str; 3], row: [&str; 3]) -> String {
-    let widths = [
-        headers[0].len().max(row[0].len()),
-        headers[1].len().max(row[1].len()),
-        headers[2].len().max(row[2].len()),
-    ];
-    let render = |cells: [&str; 3]| {
-        format!(
-            "{:<w0$}  {:<w1$}  {:<w2$}\n",
-            cells[0],
-            cells[1],
-            cells[2],
-            w0 = widths[0],
-            w1 = widths[1],
-            w2 = widths[2]
-        )
+fn single_row_table<const N: usize>(headers: [&str; N], row: [&str; N]) -> String {
+    let widths: Vec<_> = headers
+        .iter()
+        .zip(row)
+        .map(|(header, cell)| header.len().max(cell.len()))
+        .collect();
+    let render = |cells: [&str; N]| {
+        cells
+            .iter()
+            .zip(&widths)
+            .map(|(cell, width)| format!("{cell:<width$}"))
+            .collect::<Vec<_>>()
+            .join("  ")
+            + "\n"
     };
     format!("{}{}", render(headers), render(row))
 }
@@ -2027,7 +2025,7 @@ async fn module_terminals_renders_empty_history_byte_for_byte() {
     // Same two-clock age as the status test: form-checked, not byte-matched.
     let rendered = text(&output.stdout);
     let age = rendered
-        .strip_prefix("no exits recorded since the daemon started (")
+        .strip_prefix("no retained exits (current daemon started ")
         .and_then(|rest| rest.strip_suffix(")\n"))
         .expect("one sentence naming the daemon start age");
     assert!(
@@ -2066,8 +2064,8 @@ async fn module_terminals_renders_one_record_byte_for_byte() {
     assert_eq!(
         text(&output.stdout),
         single_row_table(
-            ["when", "exit", "disposition"],
-            [&when, "exit 7", &disposition]
+            ["when", "exit", "disposition", "daemon"],
+            [&when, "exit 7", &disposition, "-"]
         )
     );
 

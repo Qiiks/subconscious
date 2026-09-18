@@ -1289,18 +1289,32 @@ fn is_zero_u64(value: &u64) -> bool {
 /// Bounded terminal history for one module, oldest retained record first.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TerminalHistory {
-    /// Unix milliseconds at daemon start. The history is in-memory and resets with
-    /// the daemon, so an empty list only means "no exits during this incarnation".
+    /// Unix milliseconds at the current daemon's start; entries may predate it.
     pub daemon_started_at_ms: u64,
     pub entries: Vec<TerminalEntry>,
-    /// Earlier terminal exits evicted by the bounded ring.
+    /// Exits evicted by the current daemon's ring, possibly recovered from its
+    /// journal. Not a count of missing exits: expired journal totals are unknown.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub dropped: u64,
+    /// Unparseable or incomplete lines across the shared journal, including
+    /// lines whose module cannot be determined. Zero on older daemons.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub journal_skipped_lines: u64,
+    /// Files that could not be read completely, excluding absent generations.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub journal_read_errors: u64,
+    /// Failed journal appends across all modules in the current daemon.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub journal_write_failures: u64,
 }
 
 /// One terminal child exit and the supervisor action it selected.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TerminalEntry {
+    /// Opaque identity of the daemon that observed this exit; absent on older
+    /// daemons. Different tokens mean different lifetimes, not chronological order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_incarnation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1646,6 +1660,7 @@ mod tests {
     #[test]
     fn legacy_terminal_decoder_ignores_deliberate_severance_kind() {
         let entry = TerminalEntry {
+            daemon_incarnation: Some("daemon-before-restart".into()),
             exit_code: Some(1),
             exit_signal: None,
             at_ms: 1_700_000_000_123,
@@ -1681,6 +1696,20 @@ mod tests {
         assert_eq!(
             future.exit_kind,
             Some(TerminalExitKind::Unknown("future_exit_kind".to_string()))
+        );
+    }
+
+    #[test]
+    fn terminal_incarnation_is_optional_for_older_daemons() {
+        let entry: TerminalEntry = serde_json::from_value(serde_json::json!({
+            "at_ms": 123,
+            "disposition": "stopped"
+        }))
+        .unwrap();
+        let encoded = serde_json::to_value(&entry).unwrap();
+        assert_eq!(
+            (entry.daemon_incarnation, encoded.get("daemon_incarnation")),
+            (None, None)
         );
     }
 
