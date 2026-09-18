@@ -104,7 +104,10 @@ for crate in "${CRATES[@]}"; do
     echo "  $crate: manifest diff failed: $manifest_diff -- refusing" >&2
     exit 2
   fi
-  if printf '%s\n' "$manifest_diff" | grep -qE '^\+version[[:space:]]*='; then
+  # grep -c rather than -q: see verify-running-image.sh. Under pipefail an
+  # early-closing consumer inverts the check on any input large enough that the
+  # producer is still writing -- a big manifest diff is exactly that.
+  if [ "$(printf '%s\n' "$manifest_diff" | grep -cE '^\+version[[:space:]]*=')" -gt 0 ]; then
     continue
   fi
 

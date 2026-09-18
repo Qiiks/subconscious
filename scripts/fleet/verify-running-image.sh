@@ -117,7 +117,14 @@ adhoc=0
 for name in ck-subc ckdev-subc; do
   f="$BIN/$name"
   [ -x "$f" ] || continue
-  if codesign -dv "$f" 2>&1 | grep -q '^Signature=adhoc'; then
+  # COUNT, never `grep -q`, in a pipeline under `set -o pipefail`: grep -q exits
+  # on the first match and closes the pipe, the producer takes SIGPIPE, and the
+  # pipeline returns 141 -- so the check FAILS EXACTLY WHEN THE MATCH IS PRESENT.
+  # Measured on this host: `codesign -dv <adhoc binary> | grep -q '^Signature=adhoc'`
+  # returns 141, so an AD-HOC BINARY READ AS CORRECTLY SIGNED and this alarm --
+  # whose whole job is catching the signing posture that kills TCC grants on the
+  # next placement -- could not fire. grep -c reads to EOF and cannot early-close.
+  if [ "$(codesign -dv "$f" 2>&1 | grep -c '^Signature=adhoc')" -gt 0 ]; then
     printf '  %s: AD-HOC SIGNED -- TCC-responsible binary with no stable DR; grants die on next placement (sign with the identity, identifier pinned)\n' "$name"
     adhoc=1
   fi

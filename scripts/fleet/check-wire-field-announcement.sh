@@ -39,7 +39,10 @@ for c in $commits; do
     | grep -vcE '^[+-]\s*//' || true)
   [ "$fieldish" -eq 0 ] && continue
   checked=$((checked+1))
-  if ! git log -1 --format=%B "$c" | grep -q "CONSUMER-IMPACT:"; then
+  # grep -c rather than -q: under pipefail, -q closes the pipe on the first
+  # match and the producer's SIGPIPE turns a FOUND marker into exit 141, which
+  # `!` then reads as absent. Latent here only because commit bodies are small.
+  if [ "$(git log -1 --format=%B "$c" | grep -c "CONSUMER-IMPACT:")" -eq 0 ]; then
     echo "FAIL: commit $c changes subc-protocol field definitions without a CONSUMER-IMPACT: line"
     git log -1 --format='  %h %s' "$c"
     failed=$((failed+1))
