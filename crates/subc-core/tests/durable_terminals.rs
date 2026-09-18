@@ -2,6 +2,7 @@ use std::{
     fs,
     path::PathBuf,
     process::{Child, Command, Stdio},
+    sync::{Condvar, Mutex, OnceLock},
     thread,
     time::{Duration, Instant},
 };
@@ -9,9 +10,28 @@ use std::{
 use serde_json::{json, Value};
 use subc_core::test_support::TestTempDir;
 
+/// At most two of this file's daemons run at once.
+///
+/// Each test here spawns a REAL `ck-subc`, and the file has seven. The harness
+/// runs tests in parallel, so unlimited they add seven concurrent daemons to a
+/// `--workspace` run that is already spawning daemons in subc-client-rs.
+/// Measured on the merged tree: one full run gave 1395/0, the next a
+/// registration timeout in `subc-client-rs/tests/real_daemon.rs` -- a DIFFERENT
+/// test each time, always "module did not register in catalog within 10s",
+/// never a failure of anything this file asserts.
+///
+/// The failure was OUR load landing on someone else's bound, so the fix belongs
+/// here rather than in their timeout: a bound widened to survive whatever load
+/// arrives next stops meaning anything, and the load is ours to cap.
+fn daemon_gate() -> &'static (Mutex<usize>, Condvar) {
+    static GATE: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();
+    GATE.get_or_init(|| (Mutex::new(0usize), Condvar::new()))
+}
+
 struct Fixture {
     root: TestTempDir,
     child: Option<Child>,
+    holds_permit: bool,
 }
 
 impl Fixture {
@@ -36,7 +56,11 @@ impl Fixture {
             .unwrap(),
         )
         .unwrap();
-        Self { root, child: None }
+        Self {
+            root,
+            child: None,
+            holds_permit: false,
+        }
     }
 
     fn journal(&self) -> PathBuf {
@@ -50,6 +74,15 @@ impl Fixture {
     }
 
     fn boot(&mut self) {
+        if !self.holds_permit {
+            let (lock, cvar) = daemon_gate();
+            let mut live = lock.lock().unwrap_or_else(|p| p.into_inner());
+            while *live >= 2 {
+                live = cvar.wait(live).unwrap_or_else(|p| p.into_inner());
+            }
+            *live += 1;
+            self.holds_permit = true;
+        }
         self.child = Some(
             Command::new(env!("CARGO_BIN_EXE_ck-subc"))
                 .env("XDG_DATA_HOME", self.root.join("data"))
@@ -87,6 +120,13 @@ impl Fixture {
             let _ = child.wait();
         }
         let _ = fs::remove_file(self.connection());
+        if self.holds_permit {
+            let (lock, cvar) = daemon_gate();
+            let mut live = lock.lock().unwrap_or_else(|p| p.into_inner());
+            *live = live.saturating_sub(1);
+            cvar.notify_one();
+            self.holds_permit = false;
+        }
     }
 
     fn try_ck(&self, args: &[&str]) -> Option<String> {
