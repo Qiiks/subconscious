@@ -803,11 +803,32 @@ async fn emit_response(
         body,
     )
     .map_err(StubError::FrameBuild)?;
-    send_outbound(writer, response.clone()).await?;
+    // THE EVENT IS RECORDED BEFORE THE WIRE SEND, DELIBERATELY.
+    //
+    // A test that reads the response off the WIRE and then waits for the stub's
+    // event file is racing this module's teardown: on a drain the daemon reaches
+    // quiescence the moment the response lands, then sends GOODBYE and the serve
+    // loop returns. With the record after the send there is a window where the
+    // client has its answer and the event is never written (not late, never), so
+    // the waiting test fails on an absence meaning the stub exited, which is
+    // indistinguishable from the module never having responded.
+    //
+    // Recording first makes a delivered response IMPLY the event exists, so the
+    // wait cannot outlive its evidence. It also TIGHTENS the ordering assertions
+    // rather than loosening them: moving a terminal event earlier can only make
+    // draining-before-terminal harder to satisfy, so a pass still proves the
+    // drain notice preceded settlement.
+    //
+    // Prompted by a Windows flake where the client had its response and the event
+    // file held neither the terminal nor the preceding draining event. The exact
+    // Windows mechanism is UNPROVEN (the VM was unreachable; no reproduction on
+    // Linux or macOS), but this race is real on every platform by inspection, so
+    // this removes a dependency rather than countering a mechanism it cannot name.
     record_terminal(config, "response", None, channel, corr)?;
+    send_outbound(writer, response.clone()).await?;
     if config.double_terminal {
-        send_outbound(writer, response).await?;
         record_terminal(config, "response", None, channel, corr)?;
+        send_outbound(writer, response).await?;
     }
     Ok(())
 }
