@@ -142,8 +142,9 @@ final class EnvelopeRevisionTests: XCTestCase {
         XCTAssertTrue(daemon.daemonOrigin)
 
         bytes = encodeHeader(valid)
-        bytes[6] = 0b1000_0000
-        assertDecodeError(.reservedFlagBits(flags: 0b1000_0000), bytes: bytes)
+        bytes[6] = SUBSCRIPTION_FLAG
+        let subscription = try decodeHeader(bytes)
+        XCTAssertEqual(subscription.flags & SUBSCRIPTION_FLAG, SUBSCRIPTION_FLAG)
 
         bytes = encodeHeader(valid)
         bytes[6] = 0b0000_0110

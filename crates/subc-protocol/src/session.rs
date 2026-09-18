@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::{
     manifest::{CapabilityDeclarations, ProviderRole},
-    BindIdentity, Principal, RouteTarget,
+    BindIdentity, Principal, RouteCloseReason, RouteTarget,
 };
 
 pub const MODULE_CONTROL_OP_HEALTH_CHECK: &str = "health.check";
@@ -86,6 +86,18 @@ pub enum ModuleControlRequest {
     },
     #[serde(rename = "health.check")]
     HealthCheck {},
+}
+
+/// One-way subc-to-module channel-0 control command.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "op")]
+pub enum ModuleControlCommand {
+    #[serde(rename = "module.draining")]
+    Draining {
+        reason: RouteCloseReason,
+        /// Absolute Unix deadline for this drain, measured by the daemon.
+        deadline_ms: u64,
+    },
 }
 
 /// Module-to-subc channel-0 response body.

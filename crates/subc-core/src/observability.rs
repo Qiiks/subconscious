@@ -102,6 +102,7 @@ pub struct DaemonCounters {
     goodbye_relay_module_dropped_by_module: Arc<Mutex<HashMap<String, u64>>>,
     route_released_epoch_fenced: Arc<AtomicU64>,
     route_release_stale_skipped: Arc<AtomicU64>,
+    drains_with_undeclared_gauge: Arc<AtomicU64>,
 }
 
 /// Ten one-minute buckets make sustained module-to-client route drops visible
@@ -252,6 +253,12 @@ impl DaemonCounters {
                 .load(Ordering::Relaxed)
                 .into(),
         );
+        snapshot.insert(
+            "drains_with_undeclared_gauge".into(),
+            self.drains_with_undeclared_gauge
+                .load(Ordering::Relaxed)
+                .into(),
+        );
         Value::Object(snapshot)
     }
 
@@ -307,6 +314,11 @@ impl DaemonCounters {
 
     pub(crate) fn increment_route_release_stale_skipped(&self) {
         self.route_release_stale_skipped
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn increment_drains_with_undeclared_gauge(&self) {
+        self.drains_with_undeclared_gauge
             .fetch_add(1, Ordering::Relaxed);
     }
 }

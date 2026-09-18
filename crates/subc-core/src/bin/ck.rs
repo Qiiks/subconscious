@@ -1935,6 +1935,7 @@ async fn module_status(
         .rpc_value(ClientControlRequest::ServerDescribe {})
         .await?;
     let frame_drops = module_frame_drop_count(&describe, module_id);
+    let undeclared_gauge_drains = drains_with_undeclared_gauge_count(&describe);
 
     if json_output {
         print_json(&json!({ "module": module, "health": health_entry }))?;
@@ -1951,6 +1952,7 @@ async fn module_status(
             &module,
             health_entry.as_ref(),
             frame_drops,
+            undeclared_gauge_drains,
             observed,
             verbose,
         );
@@ -5127,6 +5129,7 @@ fn print_status_table(
     module: &Value,
     health: Option<&Value>,
     frame_drops: Option<u64>,
+    undeclared_gauge_drains: Option<u64>,
     observed: Option<&Value>,
     verbose: bool,
 ) {
@@ -5156,6 +5159,10 @@ fn print_status_table(
         format_effective_policy(module)
     );
     println!("  last exit: {}", format_last_exit(module));
+    println!(
+        "  {}",
+        format_undeclared_gauge_drains(undeclared_gauge_drains)
+    );
 
     let binary = observed
         .and_then(|value| value.get("spawned_from"))
@@ -5296,6 +5303,21 @@ fn format_exit(signal: Option<i64>, code: Option<i64>) -> Option<String> {
 
 fn humanize_identifier(value: &str) -> String {
     value.replace(['_', '-'], " ")
+}
+
+fn drains_with_undeclared_gauge_count(describe: &Value) -> Option<u64> {
+    describe
+        .get("counters")
+        .and_then(Value::as_object)?
+        .get("drains_with_undeclared_gauge")
+        .and_then(Value::as_u64)
+}
+
+fn format_undeclared_gauge_drains(count: Option<u64>) -> String {
+    match count {
+        Some(count) => format!("drain gauges: {count} drains with undeclared gauge"),
+        None => "drain gauges: undeclared-gauge drain count unavailable".to_string(),
+    }
 }
 
 fn module_frame_drop_count(describe: &Value, module_id: &str) -> Option<u64> {
@@ -7105,6 +7127,17 @@ mod tests {
         });
         assert_eq!(module_frame_drop_count(&describe, "alpha"), Some(3));
         assert_eq!(module_frame_drop_count(&describe, "idle"), None);
+    }
+
+    #[test]
+    fn module_status_renders_undeclared_gauge_drain_counter_for_operators() {
+        let describe = json!({
+            "counters": { "drains_with_undeclared_gauge": 4 }
+        });
+        assert_eq!(
+            format_undeclared_gauge_drains(drains_with_undeclared_gauge_count(&describe)),
+            "drain gauges: 4 drains with undeclared gauge"
+        );
     }
 
     #[test]

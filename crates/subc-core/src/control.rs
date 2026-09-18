@@ -604,6 +604,7 @@ impl ControlHandler {
                     reason: RouteCloseReason::CapabilityDenied,
                     drained: false,
                     abandoned: 0,
+                    excluded_subscriptions: 0,
                     terminal: Some(false),
                 },
             );
@@ -822,6 +823,7 @@ impl ControlHandler {
                     reason: RouteCloseReason::Crash,
                     drained: false,
                     abandoned: 0,
+                    excluded_subscriptions: 0,
                     terminal: Some(terminal),
                 },
             );
@@ -7705,6 +7707,7 @@ mod tests {
                 reason: RouteCloseReason::CapabilityDenied,
                 drained: false,
                 abandoned: 0,
+                excluded_subscriptions: 0,
                 terminal: Some(false),
             }
         );

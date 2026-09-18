@@ -13,7 +13,7 @@
 //!    0      4    len       u32     # of BODY bytes after this 21-byte header
 //!    4      1    ver       u8      envelope version
 //!    5      1    type      u8      frame kind (see FrameType)
-//!    6      1    flags     u8     bit0 BINARY · bits1-2 PRIORITY · bit3 LAST · bits4-5 ADMISSION · bit6 DAEMON_ORIGIN · bit7 reserved
+//!    6      1    flags     u8     bit0 BINARY · bits1-2 PRIORITY · bit3 LAST · bits4-5 ADMISSION · bit6 DAEMON_ORIGIN · bit7 SUBSCRIPTION
 //!    7      2    channel   u16     route = (component, session); 0 = subc itself
 //!    9      4    epoch     u32     per-slot binding epoch; 0 on channel 0
 //!   13      8    corr      u64     correlation id; CANCEL carries the target call's corr
@@ -76,6 +76,19 @@ pub mod error_codes {
 }
 
 pub use frame::{Frame, FrameBuildError};
+
+/// Why subc is closing a module's client routes.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteCloseReason {
+    Reload,
+    Restart,
+    Disable,
+    Crash,
+    /// A live route became forbidden because newly attested capability metadata
+    /// matched its supervised opening module's deny edge.
+    CapabilityDenied,
+}
 
 /// Per-route bind identity shared by client-facing and module-facing control.
 ///
@@ -384,9 +397,10 @@ const FLAG_LAST: u8 = 0b0000_1000; // bit 3
 const FLAG_ADMISSION_MASK: u8 = 0b0011_0000; // bits 4-5
 const FLAG_ADMISSION_SHIFT: u8 = 4;
 pub const FLAG_DAEMON_ORIGIN: u8 = 0b0100_0000;
-const FLAG_RESERVED_MASK: u8 = 0b1000_0000; // bit 7 must be zero
+/// A request credit the client explicitly declares as a held-open subscription.
+pub const FLAG_SUBSCRIPTION: u8 = 0b1000_0000;
 
-/// The `flags` byte (offset 6): binary, priority, last, admission, then reserved bits.
+/// The `flags` byte (offset 6): binary, priority, last, admission, daemon origin, subscription.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Flags(pub u8);
 
@@ -431,9 +445,9 @@ impl Flags {
         AdmissionClass::from_bits((self.0 & FLAG_ADMISSION_MASK) >> FLAG_ADMISSION_SHIFT)
     }
 
-    /// True if the reserved bit 7 is set.
-    pub fn has_reserved_bits(self) -> bool {
-        self.0 & FLAG_RESERVED_MASK != 0
+    /// True when a request was explicitly opened as a held-open subscription.
+    pub fn is_subscription(self) -> bool {
+        self.0 & FLAG_SUBSCRIPTION != 0
     }
 
     /// True when the frame was authored by the daemon.
@@ -498,7 +512,7 @@ pub enum DecodeError {
     TooShortForHeader { have: usize, need: usize },
     /// `type` byte is not a known `FrameType`.
     UnknownFrameType { byte: u8 },
-    /// A reserved flag bit (6-7) is set.
+    /// A reserved flag bit is set (retained for older decoder error compatibility).
     ReservedFlagBits { flags: u8 },
     /// Priority bits 1-2 hold the reserved value `0b11`.
     ReservedPriorityBits { flags: u8 },
@@ -587,9 +601,6 @@ pub fn decode_header(bytes: &[u8]) -> Result<EnvelopeHeader, DecodeError> {
     let ty =
         FrameType::from_u8(bytes[5]).ok_or(DecodeError::UnknownFrameType { byte: bytes[5] })?;
     let flags = Flags(bytes[6]);
-    if flags.has_reserved_bits() {
-        return Err(DecodeError::ReservedFlagBits { flags: bytes[6] });
-    }
     if flags.priority().is_none() {
         return Err(DecodeError::ReservedPriorityBits { flags: bytes[6] });
     }
@@ -868,15 +879,13 @@ mod tests {
     }
 
     #[test]
-    fn reject_reserved_flag_bits() {
+    fn subscription_flag_decodes_and_tags_the_request() {
         let mut b = [0u8; HEADER_LEN];
         b[4] = PROTOCOL_VERSION;
         b[5] = FrameType::Request as u8;
-        b[6] = 0b1000_0000; // reserved bit 7 set
-        assert_eq!(
-            decode_header(&b),
-            Err(DecodeError::ReservedFlagBits { flags: 0b1000_0000 })
-        );
+        b[6] = FLAG_SUBSCRIPTION;
+        let decoded = decode_header(&b).unwrap();
+        assert!(decoded.flags.is_subscription());
     }
 
     #[test]

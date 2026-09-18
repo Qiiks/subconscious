@@ -20,6 +20,8 @@ use subc_protocol::{
     BindIdentity, RouteTarget,
 };
 
+pub use subc_protocol::RouteCloseReason;
+
 macro_rules! open_string_enum {
     (
         $(#[$meta:meta])*
@@ -388,6 +390,9 @@ pub enum ClientControlPush {
         /// Pending route.bind relays forced down before that wait. They are not
         /// covered by `drained`, even when live routes quiesced.
         abandoned: u32,
+        /// Subscription credits captured and excluded from this drain's wire predicate.
+        #[serde(default)]
+        excluded_subscriptions: u32,
         /// Whether subc will leave this module down until operator action.
         ///
         /// The claim covers daemon-owned recovery only. `None` is accepted only
@@ -396,19 +401,6 @@ pub enum ClientControlPush {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         terminal: Option<bool>,
     },
-}
-
-/// Why subc is closing a module's client routes.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum RouteCloseReason {
-    Reload,
-    Restart,
-    Disable,
-    Crash,
-    /// A live route became forbidden because newly attested capability metadata
-    /// matched its supervised opening module's deny edge.
-    CapabilityDenied,
 }
 
 /// A module's retained stderr, oldest entry first.
@@ -1754,11 +1746,18 @@ mod tests {
     }
 
     #[test]
-    fn new_route_closed_decoder_accepts_old_daemon_without_terminal() {
+    fn new_route_closed_decoder_defaults_fields_absent_from_old_daemon() {
         let old_wire = r#"{"op":"route.closed","module_id":"aft-tools","reason":"crash","drained":false,"abandoned":0}"#;
         let decoded: ClientControlPush = serde_json::from_str(old_wire).unwrap();
         match decoded {
-            ClientControlPush::RouteClosed { terminal, .. } => assert_eq!(terminal, None),
+            ClientControlPush::RouteClosed {
+                excluded_subscriptions,
+                terminal,
+                ..
+            } => {
+                assert_eq!(excluded_subscriptions, 0);
+                assert_eq!(terminal, None);
+            }
             other => panic!("unexpected push: {other:?}"),
         }
         assert!(!serde_json::to_string(&decoded)
@@ -1780,7 +1779,7 @@ mod tests {
             },
         }
 
-        let wire = r#"{"op":"route.closed","module_id":"aft-tools","reason":"crash","drained":false,"abandoned":0,"terminal":true}"#;
+        let wire = r#"{"op":"route.closed","module_id":"aft-tools","reason":"crash","drained":false,"abandoned":0,"excluded_subscriptions":3,"terminal":true}"#;
         let decoded: LegacyClientControlPush = serde_json::from_str(wire).unwrap();
         match decoded {
             LegacyClientControlPush::RouteClosed {

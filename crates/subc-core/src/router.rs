@@ -470,7 +470,7 @@ impl Router {
                     return Ok(());
                 }
                 if releases_credit {
-                    route.flow.release();
+                    route.flow.release_corr(corr);
                 }
                 return Ok(());
             }
@@ -636,7 +636,11 @@ impl ForwardBackend {
         // the original request's credit is freed only by the module's terminal frame.
         let acquired_credit = frame_type == FrameType::Request;
         if acquired_credit {
-            if let Err(err) = route.flow.acquire().await {
+            if let Err(err) = route
+                .flow
+                .acquire_tagged(corr, frame.header.flags.is_subscription())
+                .await
+            {
                 if self
                     .forwarding
                     .endpoint_is_draining(route.module_endpoint)
@@ -666,7 +670,7 @@ impl ForwardBackend {
             RouterError::backend_with_epoch(channel, route.client_epoch, corr, err.to_string())
         });
         if acquired_credit && result.is_err() {
-            route.flow.release();
+            route.flow.release_corr(corr);
         }
         result
     }

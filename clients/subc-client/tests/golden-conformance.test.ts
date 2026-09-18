@@ -20,6 +20,7 @@ import {
   HEADER_LEN,
   MAX_FRAME_BODY_LEN,
   PROTOCOL_VERSION,
+  SUBSCRIPTION_FLAG,
 } from "../src/envelope";
 
 // The Rust golden fixtures are canonical serializations of the wire shapes both
@@ -78,7 +79,10 @@ describe("Rust golden fixtures", () => {
 
     for (const fixture of Object.values(fixtures)) {
       expect(typeof fixture.terminal).toBe("boolean");
+      expect(typeof fixture.excluded_subscriptions).toBe("number");
     }
+    expect(fixtures.drained.excluded_subscriptions).toBe(2);
+    expect(fixtures.abandoned.excluded_subscriptions).toBe(0);
     expect(fixtures.drained.terminal).toBe(false);
     expect(fixtures.abandoned.terminal).toBe(false);
     expect(fixtures.disable.terminal).toBe(true);
@@ -322,11 +326,17 @@ describe("Rust golden fixtures", () => {
       }),
     ) as CatalogEntry;
 
-    expect(entry.self_signals).toHaveLength(2);
+    expect(entry.self_signals).toHaveLength(3);
     expect(entry.self_signals?.[0]?.effect).toBe("observe");
     expect(entry.self_signals?.[1]?.effect).toBe("mutate");
     expect(entry.self_signals?.[1]?.anchored_to).toEqual({
       event: { event: "window_expiry" },
+    });
+    expect(entry.self_signals?.[2]).toMatchObject({
+      kind: "busy",
+      anchored_to: {
+        health_gauges: { gauges: ["runs_in_flight", "opening"] },
+      },
     });
 
     const legacyManifest = loadGolden("module_manifest_without_self_signals");
@@ -357,6 +367,7 @@ describe("Rust golden fixtures", () => {
     expect(constants.header_len).toBe(HEADER_LEN);
     expect(constants.frozen_prefix_len).toBe(FROZEN_PREFIX_LEN);
     expect(constants.max_frame_body_len).toBe(MAX_FRAME_BODY_LEN);
+    expect(constants.subscription_flag).toBe(SUBSCRIPTION_FLAG);
   });
 
   test("the transcribed timing budgets match the golden contract fixture", () => {

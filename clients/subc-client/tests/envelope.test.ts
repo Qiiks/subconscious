@@ -16,6 +16,7 @@ import {
   MAX_FRAME_BODY_LEN,
   PROTOCOL_VERSION,
   Priority,
+  SUBSCRIPTION_FLAG,
   type EnvelopeHeader,
   type Frame,
 } from "../src/envelope.js";
@@ -153,21 +154,19 @@ describe("21-byte envelope header", () => {
     const unknown = encodeHeader(header(0, FrameType.Request, 0, 0, 0, 0n));
     unknown[5] = 99;
     expect(() => decodeHeader(unknown)).toThrow(/unknown frame type byte 99/);
-    const reserved = encodeHeader(header(0, FrameType.Request, 0b1000_0000, 0, 0, 0n));
-    expect(() => decodeHeader(reserved)).toThrow(/reserved flag bits/);
     const priority = encodeHeader(header(0, FrameType.Request, 0b0000_0110, 0, 0, 0n));
     expect(() => decodeHeader(priority)).toThrow(/reserved priority bits/);
   });
 
-  test("accepts daemon-origin Error headers while retaining bit 7 rejection", () => {
+  test("accepts daemon-origin and subscription flag bits", () => {
     const old = encodeHeader(header(0, FrameType.Error, 0, 7, 1, 0n));
     expect(hasDaemonOrigin(decodeHeader(old).flags)).toBe(false);
 
     const daemon = encodeHeader(header(0, FrameType.Error, DAEMON_ORIGIN_FLAG, 7, 1, 0n));
     expect(hasDaemonOrigin(decodeHeader(daemon).flags)).toBe(true);
 
-    const reserved = encodeHeader(header(0, FrameType.Error, 0b1000_0000, 7, 1, 0n));
-    expect(() => decodeHeader(reserved)).toThrow(/reserved flag bits/);
+    const subscription = encodeHeader(header(0, FrameType.Request, SUBSCRIPTION_FLAG, 7, 1, 0n));
+    expect(decodeHeader(subscription).flags & SUBSCRIPTION_FLAG).toBe(SUBSCRIPTION_FLAG);
   });
 
   test("enforces pure-header length and encodes body after byte 21", () => {

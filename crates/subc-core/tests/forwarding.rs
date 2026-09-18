@@ -21,7 +21,7 @@ use subc_protocol::{
     manifest::{Concurrency, ExecutionMode, IdentityScope, ModuleManifest, ProviderRole, Tool},
     session::HealthStatus,
     BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority,
-    RouteTarget, PROTOCOL_VERSION,
+    RouteTarget, FLAG_SUBSCRIPTION, PROTOCOL_VERSION,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
@@ -1731,7 +1731,7 @@ async fn supervisor_restart_with_zero_drain_override_cuts_the_inflight_request()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn route_lifecycle_enqueues_closing_drain_closed_then_released_goodbyes() {
+async fn draining_notice_precedes_quiescence_wait_and_route_lifecycle_stays_ordered() {
     let server = TestServer::start().await;
     let supervisor = supervisor_with_drain_timeout(
         &server,
@@ -1740,10 +1740,11 @@ async fn route_lifecycle_enqueues_closing_drain_closed_then_released_goodbyes() 
         Duration::from_millis(250),
     );
     let module_id = "fake-aft-supervisor-reload-happy";
-    let module = spawn_stub_with_env(
+    let (module, events_path) = spawn_stub_with_events(
         &server,
         &supervisor,
         module_id,
+        "draining-before-wait",
         [
             ("FAKE_AFT_DELAY_FROM_BODY", "1"),
             // Receipt evidence for the drain race below: the stub PUSHes on the
@@ -1817,6 +1818,19 @@ async fn route_lifecycle_enqueues_closing_drain_closed_then_released_goodbyes() 
     );
     let response = read_frame_timeout(&mut route_client).await;
     assert_response(&response, ack.route_channel, slow_corr, slow_payload);
+    wait_for_stub_event(&events_path, SETUP_TIMEOUT, |event| {
+        event_is_terminal(event, "response", ack.route_channel, slow_corr)
+    })
+    .await;
+    let events = stub_events(&events_path);
+    let draining_position = event_position(&events, |event| event["kind"] == "draining");
+    let terminal_position = event_position(&events, |event| {
+        event_is_terminal(event, "response", ack.route_channel, slow_corr)
+    });
+    assert!(
+        draining_position < terminal_position,
+        "draining command must reach the module before the in-flight request settles"
+    );
     let closed = read_frame_timeout(&mut route_client).await;
     assert_route_lifecycle_push(
         &closed,
@@ -2360,7 +2374,7 @@ async fn concurrent_supervisor_ops_remain_coherent() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn supervisor_reload_drain_timeout_forces_teardown_and_respawns() {
+async fn ordinary_long_running_request_is_not_excluded_and_holds_drain() {
     let server = TestServer::start().await;
     let supervisor = supervisor_with_drain_timeout(
         &server,
@@ -2449,6 +2463,156 @@ async fn supervisor_reload_drain_timeout_forces_teardown_and_respawns() {
     wait_for_registration(&server.registry, module_id, SETUP_TIMEOUT).await;
 
     module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bit_set_subscription_is_excluded_and_reported_by_route_closed() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor_with_drain_timeout(
+        &server,
+        1,
+        Duration::from_millis(10),
+        Duration::from_millis(25),
+    );
+    let module_id = "fake-aft-subscription-drain";
+    let (module, events_path) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_id,
+        "subscription-drain",
+        [("FAKE_AFT_DELAY_FROM_BODY", "1")],
+    )
+    .await;
+
+    let project = TestProject::new();
+    let mut route_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let ack = attach_on_stream(
+        &mut route_client,
+        &project,
+        461,
+        "ses-subscription-drain",
+        module_id,
+    )
+    .await;
+    let held_corr = 462;
+    let held_payload =
+        br#"{"delay_ms":500,"uncancellable":true,"jsonrpc":"2.0","id":"subscription"}"#;
+    write_frame(
+        &mut route_client,
+        &subscription_request(ack.route_channel, ack.route_epoch, held_corr, held_payload),
+    )
+    .await
+    .unwrap();
+    route_client.flush().await.unwrap();
+    wait_for_stub_event(&events_path, SETUP_TIMEOUT, |event| {
+        event_is_request_received(event, ack.route_channel, held_corr)
+    })
+    .await;
+
+    let mut control_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    write_frame(
+        &mut control_client,
+        &control_request_frame(
+            463,
+            ClientControlRequest::SupervisorReload {
+                module_id: module_id.to_string(),
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    control_client.flush().await.unwrap();
+
+    let closing = read_frame_timeout(&mut route_client).await;
+    assert_route_lifecycle_push(
+        &closing,
+        "route.closing",
+        module_id,
+        "reload",
+        None,
+        None,
+        None,
+    );
+    let closed = read_frame_timeout(&mut route_client).await;
+    assert_route_closed_with_excluded_subscriptions(&closed, module_id, true, 1);
+    let goodbye = read_frame_timeout(&mut route_client).await;
+    assert_eq!(goodbye.header.ty, FrameType::Goodbye);
+    assert_eq!(goodbye.header.channel, ack.route_channel);
+
+    let applied = read_supervisor_ack_on_stream(&mut control_client, 463, module_id).await;
+    assert!(applied);
+    wait_for_registration(&server.registry, module_id, SETUP_TIMEOUT).await;
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn omitted_declared_gauge_is_busy_and_increments_counter() {
+    let (drained, undeclared_gauge_drains, _) =
+        exercise_declared_busy_drain("fake-aft-busy-omitted", "runs_in_flight", "{}").await;
+
+    assert!(
+        !drained,
+        "an omitted declared gauge must keep the drain busy"
+    );
+    assert_eq!(
+        undeclared_gauge_drains, 1,
+        "the omission must increment the operator-visible counter"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_integer_declared_gauge_is_busy() {
+    let (drained, undeclared_gauge_drains, _) = exercise_declared_busy_drain(
+        "fake-aft-busy-non-integer",
+        "runs_in_flight",
+        r#"{"runs_in_flight":0.5}"#,
+    )
+    .await;
+
+    assert!(!drained);
+    assert_eq!(undeclared_gauge_drains, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_declared_busy_gauges_are_summed() {
+    let (drained_while_opening, counter, _) = exercise_declared_busy_drain(
+        "fake-aft-busy-two-positive",
+        "runs_in_flight,opening",
+        r#"{"runs_in_flight":0,"opening":1}"#,
+    )
+    .await;
+    assert!(!drained_while_opening);
+    assert_eq!(counter, 0);
+
+    let (drained_when_both_zero, counter, _) = exercise_declared_busy_drain(
+        "fake-aft-busy-two-zero",
+        "runs_in_flight,opening",
+        r#"{"runs_in_flight":0,"opening":0}"#,
+    )
+    .await;
+    assert!(drained_when_both_zero);
+    assert_eq!(counter, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn busy_forever_is_still_torn_down_at_the_drain_ceiling() {
+    let (drained, undeclared_gauge_drains, elapsed) = exercise_declared_busy_drain(
+        "fake-aft-busy-forever",
+        "runs_in_flight",
+        r#"{"runs_in_flight":1}"#,
+    )
+    .await;
+
+    assert!(!drained);
+    assert_eq!(undeclared_gauge_drains, 0);
+    assert!(
+        elapsed >= Duration::from_millis(40) && elapsed < Duration::from_secs(1),
+        "a perpetually busy module must be torn down at the configured drain ceiling: {elapsed:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5479,9 +5643,35 @@ fn attach_frame(corr: u64, attach: ClientControlRequest) -> Frame {
 }
 
 fn data_request(channel: u16, epoch: u32, corr: u64, body: &[u8]) -> Frame {
+    data_request_with_flags(
+        channel,
+        epoch,
+        corr,
+        body,
+        Flags::new(false, Priority::Interactive, false),
+    )
+}
+
+fn subscription_request(channel: u16, epoch: u32, corr: u64, body: &[u8]) -> Frame {
+    data_request_with_flags(
+        channel,
+        epoch,
+        corr,
+        body,
+        Flags(Flags::new(false, Priority::Interactive, false).0 | FLAG_SUBSCRIPTION),
+    )
+}
+
+fn data_request_with_flags(
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    body: &[u8],
+    flags: Flags,
+) -> Frame {
     Frame::build(
         FrameType::Request,
-        Flags::new(false, Priority::Interactive, false),
+        flags,
         channel,
         epoch,
         corr,
@@ -5752,12 +5942,37 @@ fn assert_route_lifecycle_push(
     if let Some(abandoned) = abandoned {
         expected["abandoned"] = serde_json::json!(abandoned);
     }
+    if op == "route.closed" {
+        expected["excluded_subscriptions"] = serde_json::json!(0);
+    }
     if let Some(terminal) = terminal {
         expected["terminal"] = Value::Bool(terminal);
     }
     assert_eq!(
         serde_json::from_slice::<Value>(&frame.body).unwrap(),
         expected
+    );
+}
+
+fn assert_route_closed_with_excluded_subscriptions(
+    frame: &Frame,
+    module_id: &str,
+    drained: bool,
+    excluded_subscriptions: u32,
+) {
+    assert_eq!(frame.header.ty, FrameType::Push);
+    assert_eq!(frame.header.channel, 0);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&frame.body).unwrap(),
+        serde_json::json!({
+            "op": "route.closed",
+            "module_id": module_id,
+            "reason": "reload",
+            "drained": drained,
+            "abandoned": 0,
+            "excluded_subscriptions": excluded_subscriptions,
+            "terminal": false,
+        })
     );
 }
 
@@ -5965,6 +6180,108 @@ fn health_config(
         on_degraded,
         on_failing,
         critical,
+    }
+}
+
+async fn exercise_declared_busy_drain(
+    module_id: &str,
+    busy_gauges: &str,
+    health_metrics: &str,
+) -> (bool, u64, Duration) {
+    let server = TestServer::start().await;
+    let supervisor = supervisor_with_drain_timeout(
+        &server,
+        1,
+        Duration::from_millis(10),
+        Duration::from_millis(40),
+    );
+    let module = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        module_id,
+        [
+            ("FAKE_AFT_ADVERTISE_HEALTH", "1"),
+            ("FAKE_AFT_BUSY_GAUGES", busy_gauges),
+            ("FAKE_AFT_HEALTH_METRICS", health_metrics),
+        ],
+    )
+    .await;
+
+    let project = TestProject::new();
+    let mut route_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let ack = attach_on_stream(
+        &mut route_client,
+        &project,
+        801,
+        "ses-busy-drain",
+        module_id,
+    )
+    .await;
+    let mut control_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let drain_started_at = Instant::now();
+    write_frame(
+        &mut control_client,
+        &control_request_frame(
+            802,
+            ClientControlRequest::SupervisorReload {
+                module_id: module_id.to_string(),
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    control_client.flush().await.unwrap();
+
+    let closing = read_frame_timeout(&mut route_client).await;
+    assert_route_lifecycle_push(
+        &closing,
+        "route.closing",
+        module_id,
+        "reload",
+        None,
+        None,
+        None,
+    );
+    let closed = read_frame_timeout(&mut route_client).await;
+    let closed_body = serde_json::from_slice::<Value>(&closed.body).unwrap();
+    let drained = closed_body["drained"].as_bool().unwrap();
+    assert_eq!(closed_body["excluded_subscriptions"], 0);
+    let goodbye = read_frame_timeout(&mut route_client).await;
+    assert_eq!(goodbye.header.ty, FrameType::Goodbye);
+    assert_eq!(goodbye.header.channel, ack.route_channel);
+
+    let applied = read_supervisor_ack_on_stream(&mut control_client, 802, module_id).await;
+    assert!(applied);
+    wait_for_registration(&server.registry, module_id, SETUP_TIMEOUT).await;
+
+    let mut diagnostic_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let counter = server_counter(&mut diagnostic_client, 803, "drains_with_undeclared_gauge").await;
+    let elapsed = drain_started_at.elapsed();
+    module.stop().await.unwrap();
+    (drained, counter, elapsed)
+}
+
+async fn server_counter(stream: &mut TcpStream, corr: u64, name: &str) -> u64 {
+    write_frame(
+        stream,
+        &control_request_frame(corr, ClientControlRequest::ServerDescribe {}),
+    )
+    .await
+    .unwrap();
+    stream.flush().await.unwrap();
+    let frame = read_frame_timeout(stream).await;
+    match serde_json::from_slice::<ClientControlResponse>(&frame.body).unwrap() {
+        ClientControlResponse::ServerDescribe { counters, .. } => counters
+            .and_then(|value| value.get(name).cloned())
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        other => panic!("unexpected server.describe response: {other:?}"),
     }
 }
 

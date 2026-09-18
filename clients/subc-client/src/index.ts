@@ -47,6 +47,7 @@ export {
   Priority,
   AdmissionClass,
   DAEMON_ORIGIN_FLAG,
+  SUBSCRIPTION_FLAG,
   PROTOCOL_VERSION,
   HEADER_LEN,
   buildFrame,
