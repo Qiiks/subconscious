@@ -6267,6 +6267,78 @@ async fn exercise_declared_busy_drain(
     (drained, counter, elapsed)
 }
 
+/// An ACCEPTED route.open is recorded. Refusals have been logged and counted
+/// since the attestation work; accepts were invisible, so the daemon stamped a
+/// principal on every bind and wrote none of them down -- which left a
+/// credential vault unable to name the sender of a call that reached it.
+///
+/// The assertion is on the COUNTER KEY, which is the principal the daemon
+/// stamped, not on a total: a count alone cannot tell an attested supervised
+/// caller from an unattested key-holder, and that distinction is the whole
+/// reason the trace exists. This client presents no consumer_identity, so it is
+/// `direct` by definition.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_accepted_route_open_is_counted_under_the_stamped_principal() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let (module, _events_path) = spawn_stub_with_events_path(
+        &server,
+        &supervisor,
+        "fake-aft-accept-trace",
+        "accept-trace",
+    )
+    .await;
+
+    let mut diagnostic_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let before = server_counter_key(
+        &mut diagnostic_client,
+        900,
+        "route_open_accepted_by_principal",
+        "direct",
+    )
+    .await;
+
+    let project = TestProject::new();
+    let (_client, _ack) = attach_client(&server, &project, 901, "ses-accept-trace").await;
+
+    let after = server_counter_key(
+        &mut diagnostic_client,
+        902,
+        "route_open_accepted_by_principal",
+        "direct",
+    )
+    .await;
+    module.stop().await.unwrap();
+
+    assert_eq!(
+        after,
+        before + 1,
+        "an accepted route.open must be counted under the principal the daemon stamped"
+    );
+}
+
+/// Read one key out of a keyed counter map, 0 when the map or key is absent.
+async fn server_counter_key(stream: &mut TcpStream, corr: u64, map: &str, key: &str) -> u64 {
+    write_frame(
+        stream,
+        &control_request_frame(corr, ClientControlRequest::ServerDescribe {}),
+    )
+    .await
+    .unwrap();
+    stream.flush().await.unwrap();
+    let frame = read_frame_timeout(stream).await;
+    match serde_json::from_slice::<ClientControlResponse>(&frame.body).unwrap() {
+        ClientControlResponse::ServerDescribe { counters, .. } => counters
+            .and_then(|value| value.get(map).cloned())
+            .and_then(|value| value.get(key).cloned())
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        other => panic!("unexpected server.describe response: {other:?}"),
+    }
+}
+
 async fn server_counter(stream: &mut TcpStream, corr: u64, name: &str) -> u64 {
     write_frame(
         stream,

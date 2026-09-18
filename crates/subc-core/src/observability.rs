@@ -93,6 +93,7 @@ pub struct DaemonCounters {
     // they deliberately reset on restart instead of becoming durable daemon state.
     module_frames_dropped_no_route_by_module: Arc<Mutex<HashMap<String, u64>>>,
     route_open_refused_by_code: Arc<Mutex<HashMap<String, u64>>>,
+    route_open_accepted_by_principal: Arc<Mutex<HashMap<String, u64>>>,
     module_frames_dropped_no_route_window: Arc<Mutex<DropWindow>>,
     module_requests_dropped_stale_route: Arc<AtomicU64>,
     client_frames_dropped_stale_route: Arc<AtomicU64>,
@@ -206,6 +207,11 @@ impl DaemonCounters {
             "route_open_refused_by_code",
             &self.route_open_refused_by_code,
         );
+        insert_nonempty_counts(
+            &mut snapshot,
+            "route_open_accepted_by_principal",
+            &self.route_open_accepted_by_principal,
+        );
         snapshot.insert(
             "module_requests_dropped_stale_route".into(),
             self.module_requests_dropped_stale_route
@@ -277,6 +283,19 @@ impl DaemonCounters {
     pub(crate) fn increment_route_open_refused(&self, code: &'static str) {
         debug_assert!(ROUTE_OPEN_REFUSAL_COUNTER_CODES.contains(&code));
         increment_keyed_count(&self.route_open_refused_by_code, code);
+    }
+
+    /// Count an accepted route.open by the principal the daemon stamped.
+    ///
+    /// THE KEY SPACE IS CLOSED BY CONSTRUCTION, unlike the refusal counter which
+    /// needs an explicit allowlist: a principal is `direct` or
+    /// `reserved:<module_id>`, and a module id was already refused at HELLO
+    /// unless it is a single path component free of control characters. So an
+    /// untrusted string cannot expand this map without first passing module-id
+    /// validation, and the bound is the number of modules rather than the number
+    /// of distinct strings a caller can invent.
+    pub(crate) fn increment_route_open_accepted(&self, principal: &str) {
+        increment_keyed_count(&self.route_open_accepted_by_principal, principal);
     }
 
     pub(crate) fn increment_module_requests_dropped_stale_route(&self) {

@@ -1560,6 +1560,37 @@ impl ControlHandler {
         );
     }
 
+    /// Record an ACCEPTED route.open.
+    ///
+    /// Refusals have been logged and counted since the attestation work; accepts
+    /// were invisible, so the daemon knew every principal it stamped and wrote
+    /// none of them down. The party that attests the identity was the only party
+    /// not recording it, which left a credential vault unable to name the sender
+    /// of a call that reached it (claustrum #43) and left the launch-nonce
+    /// concurrency question unanswerable from the outside.
+    ///
+    /// FIELD NAMES MATCH `route.open refused` DELIBERATELY, so one grep over
+    /// `code`/`module_id`/`connection_id` returns both directions of the same
+    /// decision rather than two shapes a reader has to join by hand.
+    ///
+    /// `peer_addr` is NOT here and cannot be: `SO_PEERCRED`/`LOCAL_PEERPID` are
+    /// unix-socket options and subc is loopback TCP, so there is no peer identity
+    /// to record. The ephemeral port would decay within minutes and answer only a
+    /// live question. The identity question is instead answered by counting
+    /// distinct live connections presenting one module's `consumer_identity` --
+    /// "is anyone else holding this secret" rather than "is this the right
+    /// process".
+    fn observe_route_open_accept(&self, ctx: &RouteCtx, module_id: &str, principal: &str) {
+        self.counters.increment_route_open_accepted(principal);
+        info!(
+            target: "subc_core::control",
+            principal,
+            module_id = ?module_id,
+            connection_id = ctx.connection_id.get(),
+            "route.open accepted"
+        );
+    }
+
     fn supervised_absent_route_open_refusal_frame(
         &self,
         ctx: &RouteCtx,
@@ -1903,6 +1934,13 @@ impl ControlHandler {
             module_epoch,
             "reserved route handle pair"
         );
+        // Rendered BEFORE the move into the relay, because the accept arm below
+        // is where it is logged and the principal is gone by then.
+        let principal_label = match &principal {
+            Principal::Reserved { module_id } => format!("reserved:{module_id}"),
+            Principal::Direct => "direct".to_string(),
+            other => format!("{other:?}"),
+        };
         let relay = ModuleControlRequest::RouteBind {
             route_channel: module_channel,
             epoch: module_epoch,
@@ -1957,6 +1995,7 @@ impl ControlHandler {
         match timeout_at(relay_deadline, receiver).await {
             Ok(Ok(RouteBindRelayOutcome::Accepted)) => {
                 reservation.disarm();
+                self.observe_route_open_accept(ctx, &target_module_id, &principal_label);
                 Ok(Vec::new())
             }
             Ok(Ok(RouteBindRelayOutcome::Rejected(body))) => {
