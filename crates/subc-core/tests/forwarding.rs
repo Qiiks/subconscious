@@ -1737,7 +1737,7 @@ async fn draining_notice_precedes_quiescence_wait_and_route_lifecycle_stays_orde
         &server,
         1,
         Duration::from_millis(10),
-        Duration::from_millis(250),
+        DRAIN_BUDGET_COVERING_AN_INFLIGHT_REQUEST,
     );
     let module_id = "fake-aft-supervisor-reload-happy";
     let (module, events_path) = spawn_stub_with_events(
@@ -1890,7 +1890,7 @@ async fn route_lifecycle_sends_one_push_per_connection_when_routes_share_client(
         &server,
         1,
         Duration::from_millis(10),
-        Duration::from_millis(250),
+        DRAIN_BUDGET_COVERING_AN_INFLIGHT_REQUEST,
     );
     let module_id = "fake-aft-supervisor-reload-dedup";
     let module = spawn_stub(&server, &supervisor, module_id).await;
@@ -1994,7 +1994,7 @@ async fn supervisor_reload_rejects_new_work_during_drain() {
         &server,
         1,
         Duration::from_millis(10),
-        Duration::from_millis(300),
+        DRAIN_BUDGET_COVERING_AN_INFLIGHT_REQUEST,
     );
     let module_id = "fake-aft-supervisor-reload-rejects";
     let (module, events_path) = spawn_stub_with_events(
@@ -2622,7 +2622,7 @@ async fn quiesced_drain_reports_abandoned_bindings_without_claiming_they_drained
         &server,
         1,
         Duration::from_millis(10),
-        Duration::from_millis(250),
+        DRAIN_BUDGET_COVERING_AN_INFLIGHT_REQUEST,
     );
     let module_id = "fake-aft-supervisor-reload-abandoned";
     let (module, events_path) = spawn_stub_with_events(
@@ -5975,6 +5975,29 @@ fn assert_route_closed_with_excluded_subscriptions(
         })
     );
 }
+
+/// A drain budget that comfortably covers an in-flight request, for tests that
+/// assert the drain WAITED rather than timed out.
+///
+/// Any test reading a `Response` after the `route.closing` push depends on the
+/// drain succeeding. The budget must therefore exceed the stub's delay by a
+/// margin that survives the SLOWEST runner, not the developer machine — the
+/// stub's reply plus its event-file write both land inside the budget, and a
+/// loaded hosted Windows runner has crossed a 5x margin twice:
+///
+///   0.17.45   concurrent_supervisor_ops_remain_coherent            500 ms vs 100 ms
+///   0.18.9    draining_notice_precedes_quiescence_wait_and_...     250 ms vs  50 ms
+///
+/// The second failed one line over from the first's fix, which is why this is a
+/// named constant rather than a third widened literal: the next test that needs
+/// a successful drain picks the right value up by name instead of copying a
+/// number whose margin nobody re-derives.
+///
+/// Widening costs nothing on the passing path — the drain still completes in
+/// roughly the stub's delay when the request is fast, so the assertion is
+/// unchanged and a genuine ordering defect still fails it. Tests that assert
+/// `drained: false` deliberately use a SHORT budget and must not use this.
+const DRAIN_BUDGET_COVERING_AN_INFLIGHT_REQUEST: Duration = Duration::from_secs(5);
 
 fn assert_push(frame: &Frame, route_channel: u16) {
     assert_eq!(frame.header.ty, FrameType::Push);
