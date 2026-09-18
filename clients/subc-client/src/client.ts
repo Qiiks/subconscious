@@ -22,12 +22,15 @@ import {
   FrameType,
   hasBinary,
   Priority,
+  SUBSCRIPTION_FLAG,
   type Frame,
 } from "./envelope.js";
 import {
   belongsToConnection,
   createRouteHandle,
   newConnectionToken,
+  reverseRequestHandler,
+  ReverseRequestRegistry,
   RouteHandle,
   sameRouteHandle,
   StaleRouteHandleError,
@@ -109,8 +112,11 @@ export interface ConsumerIdentity {
 export interface RouteOpenOptions {
   /** Optional override for the consumer identity; by default the SUBC_MODULE_ID and SUBC_LAUNCH_NONCE environment variables are used when both are non-empty. Set null to send route.open without consumer_identity. */
   consumerIdentity?: ConsumerIdentity | null;
-  /** Optional consumer-declared reverse-request capabilities for this route.open. This is a declaration, not a verified privilege; providers must treat an omitted field as no reverse-request capability. Known MCP method-family values today are "elicitation", "sampling", and "roots". */
-  consumerCapabilities?: string[];
+  /**
+   * Handlers prepared before route.open. The client derives consumer_capabilities
+   * from this registry; callers cannot declare a capability without a handler.
+   */
+  reverseRequests?: ReverseRequestRegistry;
 }
 
 export interface CatalogCapabilityRequirement {
@@ -193,6 +199,8 @@ export interface ManagedCallOptions extends RequestOptions {
   targetKind?: ManagedRouteKind;
   /** Optional override for the consumer identity; by default the SUBC_MODULE_ID and SUBC_LAUNCH_NONCE environment variables are used when both are non-empty. Set null to send route.open without consumer_identity. */
   consumerIdentity?: ConsumerIdentity | null;
+  /** Reverse-request handlers used by the managed route and all of its reconnect reopens. */
+  reverseRequests?: ReverseRequestRegistry;
 }
 
 export interface SubscribeOptions {
@@ -221,6 +229,8 @@ export interface CloseRouteOptions {
 export interface ManagedCloseRouteOptions extends CloseRouteOptions {
   /** Consumer identity used by the cached managed route. */
   consumerIdentity?: ConsumerIdentity | null;
+  /** The registry whose derived capability set identifies the cached route. */
+  reverseRequests?: ReverseRequestRegistry;
 }
 
 /**
@@ -468,6 +478,7 @@ interface CachedRoute {
   target: Extract<RouteTarget, { kind: ManagedRouteKind }>;
   identity: BindIdentity;
   consumerIdentity?: ConsumerIdentity;
+  reverseRequests: ReverseRequestRegistry;
   handle: RouteHandle | null;
   opening: Promise<RouteHandle> | null;
   /**
@@ -566,13 +577,15 @@ export class SubcClient {
   /** Open a route and return its connection-bound immutable handle. */
   async routeOpen(target: RouteTarget, identity: BindIdentity, opts: RouteOpenOptions = {}): Promise<RouteHandle> {
     const consumerIdentity = routeOpenConsumerIdentity(opts);
-    const consumerCapabilities = opts.consumerCapabilities;
+    const reverseRequests = opts.reverseRequests ?? new ReverseRequestRegistry();
+    reverseRequests.seal();
+    const consumerCapabilities = reverseRequests.capabilities();
     const body = this.encode({
       op: "route.open",
       target,
       identity,
       ...(consumerIdentity ? { consumer_identity: consumerIdentity } : {}),
-      ...(consumerCapabilities !== undefined ? { consumer_capabilities: consumerCapabilities } : {}),
+      ...(consumerCapabilities.length > 0 ? { consumer_capabilities: consumerCapabilities } : {}),
     });
 
     let installed: RouteHandle | null = null;
@@ -582,7 +595,7 @@ export class SubcClient {
       if (typeof parsed.route_channel !== "number" || typeof parsed.route_epoch !== "number") {
         throw new SubcError(`route.open returned no route handle: ${JSON.stringify(parsed)}`);
       }
-      installed = this.installRoute(parsed.route_channel, parsed.route_epoch);
+      installed = this.installRoute(parsed.route_channel, parsed.route_epoch, reverseRequests);
       return true;
     };
     const closeLateRoute = (frame: Frame): void => {
@@ -749,7 +762,7 @@ export class SubcClient {
       this.pending.set(key, subscriptionPending);
       const frame = buildFrame(
         FrameType.Request,
-        buildFlags(false, priority, false, admission),
+        buildFlags(false, priority, false, admission) | SUBSCRIPTION_FLAG,
         handle.channel,
         handle.epoch,
         corr,
@@ -857,7 +870,12 @@ export class SubcClient {
     identity: BindIdentity,
     opts: ManagedCloseRouteOptions = {},
   ): Promise<void> {
-    const key = routeCacheKey(target, identity, routeOpenConsumerIdentity(opts));
+    const key = routeCacheKey(
+      target,
+      identity,
+      routeOpenConsumerIdentity(opts),
+      (opts.reverseRequests ?? new ReverseRequestRegistry()).capabilities(),
+    );
     const cached = this.routes.get(key);
     if (!cached) return;
     cached.closed = true;
@@ -1139,7 +1157,9 @@ export class SubcClient {
       { kind: ManagedRouteKind }
     >;
     const consumerIdentity = routeOpenConsumerIdentity(opts);
-    const key = routeCacheKey(target, identity, consumerIdentity);
+    const reverseRequests = opts.reverseRequests ?? new ReverseRequestRegistry();
+    reverseRequests.seal();
+    const key = routeCacheKey(target, identity, consumerIdentity, reverseRequests.capabilities());
     let cached = this.routes.get(key);
     if (!cached) {
       cached = {
@@ -1148,6 +1168,7 @@ export class SubcClient {
         target,
         identity,
         consumerIdentity,
+        reverseRequests,
         handle: null,
         opening: null,
       };
@@ -1178,6 +1199,7 @@ export class SubcClient {
       try {
         const handle = await this.routeOpen(cached.target, cached.identity, {
           consumerIdentity: cached.consumerIdentity ?? null,
+          reverseRequests: cached.reverseRequests,
         });
         if (cached.closed) {
           this.liveRoutes.delete(handle.channel);
@@ -1401,6 +1423,7 @@ export class SubcClient {
       try {
         const handle = await this.routeOpen(cached.target, cached.identity, {
           consumerIdentity: cached.consumerIdentity ?? null,
+          reverseRequests: cached.reverseRequests,
         });
         if (cached.closed) {
           this.liveRoutes.delete(handle.channel);
@@ -1502,6 +1525,11 @@ export class SubcClient {
         this.ingressEpochDropCount += 1;
         return;
       }
+    }
+
+    if (frame.header.ty === FrameType.Request && handle) {
+      this.dispatchReverseRequest(frame, handle);
+      return;
     }
 
     const key = pendingKey(handle, frame.header.corr);
@@ -1607,6 +1635,95 @@ export class SubcClient {
     this.settle(key, pending, () => pending.reject(pending.classifyFailure?.(err) ?? err));
   }
 
+  private dispatchReverseRequest(frame: Frame, handle: RouteHandle): void {
+    const method = reverseRequestMethod(frame.body);
+    const methodFamily = method?.split("/", 1)[0];
+    const handler = methodFamily ? reverseRequestHandler(handle, methodFamily) : undefined;
+    const sock = this.sock;
+    const generation = this.generation;
+
+    const reply = async (): Promise<void> => {
+      if (!handler || !method) {
+        await this.sendReverseError(
+          frame,
+          handle,
+          "reverse_request_unhandled",
+          methodFamily
+            ? `no reverse-request handler is registered for ${methodFamily}`
+            : "reverse request has no valid method",
+          sock,
+          generation,
+        );
+        return;
+      }
+
+      let body: Uint8Array;
+      try {
+        body = await handler(frame.body, { corr: frame.header.corr, method });
+        if (!(body instanceof Uint8Array)) {
+          throw new TypeError("reverse-request handler must return a Uint8Array");
+        }
+      } catch (error) {
+        await this.sendReverseError(
+          frame,
+          handle,
+          "reverse_request_unhandled",
+          error instanceof Error ? error.message : String(error),
+          sock,
+          generation,
+        );
+        return;
+      }
+
+      await this.sendReverseReply(frame, handle, FrameType.Response, body, sock, generation);
+    };
+
+    void reply().catch((error) => {
+      if (this.sock === sock && this.generation === generation && !this.closeStarted) {
+        debug("failed to answer reverse request: %s", causeMessage(error));
+      }
+    });
+  }
+
+  private async sendReverseError(
+    request: Frame,
+    handle: RouteHandle,
+    code: string,
+    message: string,
+    sock: SubcSocket,
+    generation: number,
+  ): Promise<void> {
+    await this.sendReverseReply(request, handle, FrameType.Error, this.encode({ code, message }), sock, generation);
+  }
+
+  private async sendReverseReply(
+    request: Frame,
+    handle: RouteHandle,
+    type: FrameType.Response | FrameType.Error,
+    body: Uint8Array,
+    sock: SubcSocket,
+    generation: number,
+  ): Promise<void> {
+    if (
+      this.sock !== sock ||
+      this.generation !== generation ||
+      !this.isLiveHandle(handle) ||
+      this.closeStarted ||
+      this.closedErr
+    ) {
+      return;
+    }
+    const frame = buildFrame(
+      type,
+      buildFlags(false, Priority.Interactive, false),
+      handle.channel,
+      handle.epoch,
+      request.header.corr,
+      body,
+    );
+    await writeBorrowed(sock, encodeFrame(frame), Date.now() + DEFAULT_REQUEST_TIMEOUT_MS);
+  }
+
   private errorFromFrame(frame: Frame): SubcError {
     try {
       const parsed = JSON.parse(Buffer.from(frame.body).toString("utf8")) as {
@@ -1663,8 +1780,12 @@ export class SubcClient {
     return this.ingressEpochDropCount;
   }
 
-  private installRoute(channel: number, epoch: number): RouteHandle {
-    const handle = createRouteHandle(channel, epoch, this.connectionToken);
+  private installRoute(
+    channel: number,
+    epoch: number,
+    reverseRequests = new ReverseRequestRegistry(),
+  ): RouteHandle {
+    const handle = createRouteHandle(channel, epoch, this.connectionToken, reverseRequests);
     this.liveRoutes.set(channel, handle);
     return handle;
   }
@@ -1813,12 +1934,14 @@ export function isValidCapabilityIdentifier(identifier: string): boolean {
 function routeCacheKey(
   target: Extract<RouteTarget, { kind: ManagedRouteKind }>,
   identity: BindIdentity,
-  consumerIdentity?: ConsumerIdentity,
+  consumerIdentity: ConsumerIdentity | undefined,
+  consumerCapabilities: readonly string[],
 ): string {
   const consumerPart = consumerIdentity
     ? `${consumerIdentity.module_id}\0${consumerIdentity.launch_nonce}`
     : "";
-  return `${target.kind}\0${target.module_id}\0${identity.project_root}\0${identity.harness}\0${identity.session}\0${consumerPart}`;
+  const capabilitiesPart = [...consumerCapabilities].sort().join("\0");
+  return `${target.kind}\0${target.module_id}\0${identity.project_root}\0${identity.harness}\0${identity.session}\0${consumerPart}\0${capabilitiesPart}`;
 }
 
 function routeOpenConsumerIdentity(opts: RouteOpenOptions = {}): ConsumerIdentity | undefined {
@@ -1844,4 +1967,13 @@ function causeMessage(cause: unknown): string {
 
 function pendingKey(handle: RouteHandle | null, corr: bigint): string {
   return handle ? `${handle.channel}:${handle.epoch}:${corr}` : `0:0:${corr}`;
+}
+
+function reverseRequestMethod(body: Uint8Array): string | undefined {
+  try {
+    const parsed = JSON.parse(Buffer.from(body).toString("utf8")) as { method?: unknown };
+    return typeof parsed.method === "string" && parsed.method.length > 0 ? parsed.method : undefined;
+  } catch {
+    return undefined;
+  }
 }

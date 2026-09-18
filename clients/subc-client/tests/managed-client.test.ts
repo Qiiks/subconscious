@@ -14,7 +14,9 @@ import {
   FrameType,
   HEADER_LEN,
   Priority,
+  ReverseRequestRegistry,
   SERVER_PROOF_DOMAIN,
+  SUBSCRIPTION_FLAG,
   SocketClosedError,
   SubcCallError,
   SubcClient,
@@ -36,6 +38,8 @@ interface FakeStats {
   routeOpens: number;
   dataRequests: number;
   dataBodies: unknown[];
+  dataFlags: number[];
+  reverseReplies: Frame[];
   requestFrames: { channel: number; controlOp?: string }[];
   // The consumer_identity sent on each route.open, in order (undefined when absent),
   // so a test can assert the principal survives a reconnect reopen.
@@ -92,6 +96,7 @@ interface FakeDaemonOptions {
   // unanswered is explained by OUR own in-flight control op.
   holdCatalogList?: boolean;
   catalogModules?: CatalogEntry[];
+  reverseRequest?: { body: Uint8Array; corr: bigint };
 }
 
 interface FakeDaemon {
@@ -104,6 +109,8 @@ function newStats(): FakeStats {
     routeOpens: 0,
     dataRequests: 0,
     dataBodies: [],
+    dataFlags: [],
+    reverseReplies: [],
     requestFrames: [],
     routeOpenConsumerIdentities: [],
     connections: 0,
@@ -234,6 +241,124 @@ describe("SubcClient capability resolution", () => {
         code: "invalid_capability_identifier",
       });
       expect(stats.requestFrames).toEqual([]);
+    } finally {
+      client.close();
+    }
+  });
+});
+
+describe("subscription request flag", () => {
+  test("ordinary call envelope has bit 7 clear and subscribe envelope has bit 7 set", async () => {
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    const daemon = await startFakeDaemon({ stats });
+    writeConnectionFile(connFile, daemon.port);
+
+    const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY });
+    try {
+      await client.call("flags-provider", "ordinary");
+      const handle = await client.routeOpen(
+        { kind: "tool_provider", module_id: "flags-provider" },
+        IDENTITY,
+      );
+      const subscription = client.subscribe(handle, { method: "held" }, () => undefined);
+      await subscription.closed;
+
+      expect(stats.dataFlags).toHaveLength(2);
+      expect(stats.dataFlags[0]! & SUBSCRIPTION_FLAG).toBe(0);
+      expect(stats.dataFlags[1]! & SUBSCRIPTION_FLAG).toBe(SUBSCRIPTION_FLAG);
+    } finally {
+      client.close();
+    }
+  });
+});
+
+describe("reverse-request lane", () => {
+  test("no handler returns reverse_request_unhandled instead of dropping the request", async () => {
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    const reverseBody = encodeJson({ jsonrpc: "2.0", id: 7, method: "elicitation/create", params: { prompt: "ok?" } });
+    const daemon = await startFakeDaemon({
+      stats,
+      reverseRequest: { body: reverseBody, corr: 900n },
+    });
+    writeConnectionFile(connFile, daemon.port);
+
+    const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY });
+    try {
+      await expect(client.call("reverse-provider", "echo")).resolves.toEqual({ method: "echo" });
+      await waitFor(() => stats.reverseReplies.length === 1, "unhandled reverse reply");
+      expect(stats.reverseReplies[0]!.header.ty).toBe(FrameType.Error);
+      expect(parseJson(stats.reverseReplies[0]!.body)).toMatchObject({ code: "reverse_request_unhandled" });
+    } finally {
+      client.close();
+    }
+  });
+
+  test("round trip preserves raw body and corr and returns raw handler bytes", async () => {
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    const reverseBody = encodeJson({ jsonrpc: "2.0", id: "raw", method: "elicitation/create", params: { z: 1, a: 2 } });
+    const reverseResponse = encodeJson({ jsonrpc: "2.0", id: "raw", result: { action: "accept" } });
+    const reverseRequests = new ReverseRequestRegistry();
+    let seenBody: Uint8Array | undefined;
+    let seenCorr: bigint | undefined;
+    let seenMethod: string | undefined;
+    reverseRequests.onRequest("elicitation", (body, ctx) => {
+      seenBody = body;
+      seenCorr = ctx.corr;
+      seenMethod = ctx.method;
+      return reverseResponse;
+    });
+    const daemon = await startFakeDaemon({
+      stats,
+      reverseRequest: { body: reverseBody, corr: 901n },
+    });
+    writeConnectionFile(connFile, daemon.port);
+
+    const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY });
+    try {
+      await expect(client.call("reverse-provider", "echo", undefined, { reverseRequests })).resolves.toEqual({ method: "echo" });
+      await waitFor(() => stats.reverseReplies.length === 1, "handled reverse reply");
+      expect(Array.from(seenBody ?? [])).toEqual(Array.from(reverseBody));
+      expect(seenCorr).toBe(901n);
+      expect(seenMethod).toBe("elicitation/create");
+      expect(stats.reverseReplies[0]!.header.ty).toBe(FrameType.Response);
+      expect(stats.reverseReplies[0]!.header.corr).toBe(901n);
+      expect(Array.from(stats.reverseReplies[0]!.body)).toEqual(Array.from(reverseResponse));
+    } finally {
+      client.close();
+    }
+  });
+
+  test("throwing handler returns typed refusal while sibling in-flight requests still resolve", async () => {
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    const reverseRequests = new ReverseRequestRegistry();
+    reverseRequests.onRequest("sampling", () => {
+      throw new Error("person prompt exploded");
+    });
+    const daemon = await startFakeDaemon({
+      stats,
+      reverseRequest: {
+        body: encodeJson({ jsonrpc: "2.0", id: 8, method: "sampling/createMessage", params: {} }),
+        corr: 902n,
+      },
+    });
+    writeConnectionFile(connFile, daemon.port);
+
+    const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY });
+    try {
+      const first = client.call("reverse-provider", "first", undefined, { reverseRequests });
+      const sibling = client.call("reverse-provider", "sibling", undefined, { reverseRequests });
+      await expect(Promise.all([first, sibling])).resolves.toEqual([{ method: "first" }, { method: "sibling" }]);
+      await waitFor(() => stats.reverseReplies.length === 1, "throwing-handler reverse reply");
+      expect(stats.reverseReplies[0]!.header.ty).toBe(FrameType.Error);
+      expect(parseJson(stats.reverseReplies[0]!.body)).toEqual({
+        code: "reverse_request_unhandled",
+        message: "person prompt exploded",
+      });
+      expect(stats.connections).toBe(1);
     } finally {
       client.close();
     }
@@ -1049,6 +1174,7 @@ async function handleFakeConnection(socket: Socket, options: FakeDaemonOptions):
   // half-open mode: once tripped, this connection reads forever and answers
   // NOTHING (Pings included) — TCP stays open, the peer is effectively gone.
   let deaf = false;
+  let reverseRequestSent = false;
 
   for (;;) {
     const frame = await readFrame(reader, deadline);
@@ -1057,6 +1183,14 @@ async function handleFakeConnection(socket: Socket, options: FakeDaemonOptions):
       // The real daemon always answers channel-0 Pings (subc-core control.rs);
       // the liveness probe's exonerate arm depends on it.
       await writeFrame(socket, pongFrame(frame), deadline);
+      continue;
+    }
+    if (
+      options.reverseRequest &&
+      frame.header.corr === options.reverseRequest.corr &&
+      (frame.header.ty === FrameType.Response || frame.header.ty === FrameType.Error)
+    ) {
+      options.stats.reverseReplies.push(frame);
       continue;
     }
     if (frame.header.ty !== FrameType.Request) continue;
@@ -1139,8 +1273,25 @@ async function handleFakeConnection(socket: Socket, options: FakeDaemonOptions):
     }
 
     options.stats.dataRequests += 1;
+    options.stats.dataFlags.push(frame.header.flags);
     const body = parseJson(frame.body);
     options.stats.dataBodies.push(body);
+
+    if (options.reverseRequest && !reverseRequestSent) {
+      reverseRequestSent = true;
+      await writeFrame(
+        socket,
+        buildFrame(
+          FrameType.Request,
+          buildFlags(false, Priority.Interactive, false),
+          frame.header.channel,
+          frame.header.epoch,
+          options.reverseRequest.corr,
+          options.reverseRequest.body,
+        ),
+        deadline,
+      );
+    }
 
     if (options.dataMode === "drop") {
       socket.destroy();

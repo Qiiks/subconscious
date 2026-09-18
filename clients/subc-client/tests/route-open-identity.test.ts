@@ -3,6 +3,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import {
   SUBC_LAUNCH_NONCE_ENV,
   SUBC_MODULE_ID_ENV,
+  ReverseRequestRegistry,
   SubcClient,
   type BindIdentity,
   type RouteTarget,
@@ -45,12 +46,15 @@ describe("SubcClient route.open consumer identity", () => {
     });
   });
 
-  test("serializes consumer_capabilities in snake_case when provided", async () => {
+  test("registered handlers derive route.open consumer_capabilities", async () => {
     delete process.env[SUBC_MODULE_ID_ENV];
     delete process.env[SUBC_LAUNCH_NONCE_ENV];
+    const reverseRequests = new ReverseRequestRegistry();
+    reverseRequests.onRequest("roots", () => new Uint8Array());
+    reverseRequests.onRequest("elicitation", () => new Uint8Array());
 
     const { client, captured } = routeOpenHarness();
-    await client.routeOpen(TARGET, IDENTITY, { consumerCapabilities: ["elicitation", "roots"] });
+    await client.routeOpen(TARGET, IDENTITY, { reverseRequests });
 
     expect(captured()).toEqual({
       op: "route.open",
@@ -58,6 +62,17 @@ describe("SubcClient route.open consumer identity", () => {
       identity: IDENTITY,
       consumer_capabilities: ["elicitation", "roots"],
     });
+  });
+
+  test("route.open omits consumer_capabilities when no handlers are registered", async () => {
+    delete process.env[SUBC_MODULE_ID_ENV];
+    delete process.env[SUBC_LAUNCH_NONCE_ENV];
+
+    const { client, captured } = routeOpenHarness();
+    await client.routeOpen(TARGET, IDENTITY, { reverseRequests: new ReverseRequestRegistry() });
+
+    const body = captured() as Record<string, unknown>;
+    expect("consumer_capabilities" in body).toBe(false);
   });
 });
 
