@@ -887,6 +887,69 @@ async fn a_silent_module_reports_captured_and_empty_rather_than_uncaptured() {
 /// The tail has to outlive the process whose death it explains.
 ///
 /// A ring recreated per spawn would be empty exactly when asked, and the restart
+/// A supervised module INHERITS the daemon's environment.
+///
+/// The parent's own HOME is the fixture, so this needs no environment mutation:
+/// whatever this process has, the child must have. With HOME and XDG_DATA_HOME
+/// both unset, `default_data_home()` returns the RELATIVE `.local/share` and
+/// every module derives a store path against its own CWD; `ck` also loses the
+/// daemon, because connection-file discovery reads HOME and XDG_RUNTIME_DIR.
+/// That was live from 0.17.41 to 0.18.3 via `env_clear()`, reported as #104.
+///
+/// The witness is the child reporting the variable directly (FAKE_AFT_ECHO_ENV)
+/// rather than the child's downstream behaviour: a module that silently degrades
+/// without HOME looks exactly like one that was configured.
+///
+/// The companion arm -- that ambient CK_LOG does NOT reach the child -- is a unit
+/// test on the command plan (`supervise::tests`), because asserting it here would
+/// require mutating this process's environment, which `forbid(unsafe_code)`
+/// rightly refuses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_supervised_module_inherits_the_parent_environment() {
+    let parent_home = std::env::var("HOME").expect("this test needs a HOME to inherit");
+
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module = supervisor
+        .spawn(ModuleSpec {
+            module_id: "env-inherit-probe".to_string(),
+            program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
+            args: Vec::new(),
+            env: vec![
+                ("FAKE_AFT_ECHO_ENV".to_string(), "HOME".to_string()),
+                ("FAKE_AFT_EXIT_CODE".to_string(), "0".to_string()),
+            ],
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+        })
+        .unwrap();
+
+    let tail = wait_for_tail(&module, Duration::from_secs(5), |tail| {
+        tail.entries.iter().any(
+            |entry| matches!(entry, TailEntry::Line { text, .. } if text.starts_with("echo-env HOME=")),
+        )
+    })
+    .await;
+
+    let observed = tail
+        .entries
+        .iter()
+        .find_map(|entry| match entry {
+            TailEntry::Line { text, .. } if text.starts_with("echo-env HOME=") => {
+                Some(text.clone())
+            }
+            _ => None,
+        })
+        .expect("no echo-env HOME line");
+
+    assert_eq!(
+        observed,
+        format!("echo-env HOME={parent_home}"),
+        "a supervised module must inherit HOME; without it default_data_home() is \
+         relative and every module derives its store against its own CWD (#104)"
+    );
+}
+
 /// boundary has to be visible in-band -- which side of a restart a line falls on
 /// is unanswerable from a count.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

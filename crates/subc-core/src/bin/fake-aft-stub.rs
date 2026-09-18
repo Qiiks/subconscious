@@ -89,6 +89,16 @@ const FAKE_AFT_EXIT_CODE_ENV: &str = "FAKE_AFT_EXIT_CODE";
 /// `{pid}` token, substituted with this process's pid, for tests that must
 /// distinguish which generation across a restart produced a line.
 const FAKE_AFT_STDERR_LINE_ENV: &str = "FAKE_AFT_STDERR_LINE";
+/// Comma-separated env keys the stub echoes to stderr as `echo-env <KEY>=<value>`,
+/// with the literal `<UNSET>` when absent.
+///
+/// The absent case is the reason this exists: a test asserting what a supervised
+/// child INHERITS cannot use the child's own behaviour as the witness, because a
+/// child that silently degrades looks identical to one that was configured. This
+/// reports the variable's presence directly, so "the daemon passed HOME" and "the
+/// daemon cleared the environment" are different observations rather than the
+/// same silence.
+const FAKE_AFT_ECHO_ENV: &str = "FAKE_AFT_ECHO_ENV";
 const FAKE_AFT_BUILD_COMMIT_ENV: &str = "FAKE_AFT_BUILD_COMMIT";
 const FAKE_AFT_BUILD_LOCK_DIGEST_ENV: &str = "FAKE_AFT_BUILD_LOCK_DIGEST";
 const FAKE_AFT_STORE_SCHEMA_VERSION_ENV: &str = "FAKE_AFT_STORE_SCHEMA_VERSION";
@@ -136,6 +146,10 @@ type InFlightRegistry = Arc<Mutex<HashMap<InFlightKey, oneshot::Sender<()>>>>;
 
 #[tokio::main]
 async fn main() -> Result<(), StubError> {
+    // Before every branch, so the witness is available on the normal supervised
+    // path and not only to the exit-only shapes.
+    echo_requested_env();
+
     if let Some(fixture) = fixture_from_sidecar()? {
         return run_fixture(fixture).await;
     }
@@ -192,6 +206,21 @@ async fn run_fixture(fixture: FixtureSpec) -> Result<(), StubError> {
 /// Writes the configured stderr line (if any), optionally spawns the orphan
 /// writer, then exits with `exit_code`. Never touches `--subc`, the
 /// connection file, or the network.
+/// Report the presence and value of each requested env key on stderr, so a test
+/// can distinguish "inherited" from "cleared" rather than inferring it from the
+/// child's downstream behaviour.
+fn echo_requested_env() {
+    let Ok(keys) = env::var(FAKE_AFT_ECHO_ENV) else {
+        return;
+    };
+    for key in keys.split(',').map(str::trim).filter(|key| !key.is_empty()) {
+        match env::var(key) {
+            Ok(value) => eprintln!("echo-env {key}={value}"),
+            Err(_) => eprintln!("echo-env {key}=<UNSET>"),
+        }
+    }
+}
+
 async fn run_exit_only(exit_code: i32) -> Result<(), StubError> {
     if let Ok(line) = env::var(FAKE_AFT_STDERR_LINE_ENV) {
         if !line.is_empty() {

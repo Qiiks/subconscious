@@ -31,7 +31,9 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    daemon_config::{CAPTURE_KEEP_ENV, CAPTURE_MAX_AGE_DAYS_ENV, CAPTURE_MAX_FILE_MB_ENV},
+    daemon_config::{
+        CAPTURE_KEEP_ENV, CAPTURE_MAX_AGE_DAYS_ENV, CAPTURE_MAX_FILE_MB_ENV, CK_LOG_ENV,
+    },
     forwarding::{
         CloseReason, ForwardingError, ForwardingTable, GoodbyeTarget, ModuleControlRpcOutcome,
         ModuleDrainTarget, PendingModuleControlRpc,
@@ -3725,26 +3727,14 @@ fn untrack_if_registration_released(
     }
 }
 
-fn spawn_child(
-    spec: &ModuleSpec,
-    connection_file_path: Option<&std::path::Path>,
-    handle: Option<&SupervisorHandle>,
-    ring: &Arc<Mutex<StderrRing>>,
-    capture_logs_dir: Option<&std::path::Path>,
-) -> Result<SupervisedChild, SuperviseError> {
-    let mut command = Command::new(&spec.program);
-    command.args(&spec.args);
-    // Supervised modules run with a service-manager-minimal environment. In
-    // particular, an operator's ambient CK_LOG must not leak into an otherwise
-    // unconfigured module.
-    command.env_clear();
-    #[cfg(windows)]
-    if let Some(system_root) = std::env::var_os("SystemRoot") {
-        command.env("SystemRoot", system_root);
-    }
-    if let Some(connection_file_path) = connection_file_path {
-        command.arg(SUBC_ARG).arg(connection_file_path);
-    }
+/// The child's environment plan: inherit the parent's, drop ambient `CK_LOG`,
+/// then apply the module's configured entries minus daemon-private capture keys.
+///
+/// Separated from `spawn_child` only so it can be asserted without spawning a
+/// process — a duplicate of this logic in a test would pass while the real one
+/// drifted, which is the defect class this function exists to avoid.
+fn apply_child_env(command: &mut Command, spec: &ModuleSpec) {
+    command.env_remove(CK_LOG_ENV);
     for (key, value) in &spec.env {
         // cortexkit-log currently exposes retention only as a Rust struct, not
         // environment names. These values are daemon-private sink metadata and
@@ -3756,6 +3746,50 @@ fn spawn_child(
             continue;
         }
         command.env(key, value);
+    }
+}
+
+fn spawn_child(
+    spec: &ModuleSpec,
+    connection_file_path: Option<&std::path::Path>,
+    handle: Option<&SupervisorHandle>,
+    ring: &Arc<Mutex<StderrRing>>,
+    capture_logs_dir: Option<&std::path::Path>,
+) -> Result<SupervisedChild, SuperviseError> {
+    let mut command = Command::new(&spec.program);
+    command.args(&spec.args);
+    // AMBIENT `CK_LOG` MUST NOT LEAK INTO AN OTHERWISE UNCONFIGURED MODULE — but
+    // that is the whole of the intent, so remove that one key rather than the
+    // environment.
+    //
+    // This was `env_clear()` from 0.17.41 until 0.18.3, which achieved the goal
+    // and took the POSIX environment with it. Modules spawned that way had no
+    // HOME, XDG_RUNTIME_DIR, TMPDIR or USER, and the consequences ran past
+    // logging:
+    //
+    //   * `connection_file::discover` reads XDG_RUNTIME_DIR and HOME, so with
+    //     both unset it fell back to the temp dir alone and `ck` could not find
+    //     a daemon running on the same machine from inside any module's process
+    //     tree — reporting a path the file has never lived at, which reads as
+    //     "the daemon did not write its file".
+    //   * `default_data_home()` with HOME and XDG_DATA_HOME both unset returns
+    //     the RELATIVE `.local/share`, so a module deriving its own store path
+    //     resolved it against its own CWD. That is the store-fragmentation
+    //     defect the daemon already refuses in config (`parse_doc` rejects a
+    //     relative `storage.data_home`) arriving by derivation instead.
+    //   * anything a module spawns inherited it: git without ~/.gitconfig,
+    //     cargo without CARGO_HOME, ssh, python user dirs — all degrading
+    //     quietly rather than erroring.
+    //
+    // Reported by iceteaSA as #104 after deploying 0.18.2, where `ck daemon`
+    // offered one candidate under /tmp while the file sat in /run/user/1000.
+    //
+    // A configured module is unaffected either way: `module_spec()` puts the
+    // resolved CK_LOG into `spec.env`, which is applied below and therefore
+    // wins over anything ambient.
+    apply_child_env(&mut command, spec);
+    if let Some(connection_file_path) = connection_file_path {
+        command.arg(SUBC_ARG).arg(connection_file_path);
     }
     command.env(SUBC_MODULE_ID_ENV, &spec.module_id);
 
@@ -6174,6 +6208,96 @@ mod health_tombstone_tests {
                 1
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod child_env_tests {
+    use super::{apply_child_env, ModuleSpec};
+    use std::{ffi::OsStr, path::PathBuf};
+    use tokio::process::Command;
+
+    fn spec(env: Vec<(String, String)>) -> ModuleSpec {
+        ModuleSpec {
+            module_id: "env-plan".to_string(),
+            program: PathBuf::from("/nonexistent"),
+            args: Vec::new(),
+            env,
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+        }
+    }
+
+    /// Ambient `CK_LOG` is REMOVED for an unconfigured module, and a configured
+    /// one still gets its own.
+    ///
+    /// This is the narrow goal `env_clear()` was reached for, and the reason the
+    /// fix is `env_remove` rather than deleting the line: an operator's ambient
+    /// filter silently becoming an unconfigured module's log level is a real
+    /// defect, just a much smaller one than clearing the environment.
+    ///
+    /// Asserted on the command plan rather than a spawned child because proving
+    /// the ABSENCE of an inherited variable needs the parent's environment
+    /// mutated, and `forbid(unsafe_code)` refuses that. `get_envs()` reports a
+    /// removal as `(key, None)`, which is exactly the distinction wanted: not
+    /// "absent because nobody set it" but "explicitly unset for the child".
+    #[test]
+    fn ambient_ck_log_is_removed_and_a_configured_one_survives() {
+        let mut command = Command::new("/nonexistent");
+        apply_child_env(&mut command, &spec(Vec::new()));
+        let removed = command
+            .as_std()
+            .get_envs()
+            .any(|(key, value)| key == OsStr::new("CK_LOG") && value.is_none());
+        assert!(
+            removed,
+            "ambient CK_LOG must be explicitly removed for an unconfigured module"
+        );
+
+        let mut configured = Command::new("/nonexistent");
+        apply_child_env(
+            &mut configured,
+            &spec(vec![("CK_LOG".to_string(), "debug".to_string())]),
+        );
+        let effective = configured
+            .as_std()
+            .get_envs()
+            .filter(|(key, _)| *key == OsStr::new("CK_LOG"))
+            .last()
+            .map(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()));
+        assert_eq!(
+            effective,
+            Some(Some("debug".to_string())),
+            "a module's configured CK_LOG must survive the ambient removal"
+        );
+    }
+
+    /// Daemon-private capture retention keys never reach the child.
+    ///
+    /// cortexkit-log exposes retention as a Rust struct with no environment
+    /// names, so these entries are supervisor metadata. Passing them through
+    /// would invent a public child-process contract by accident.
+    #[test]
+    fn daemon_private_capture_keys_are_not_passed_to_the_child() {
+        let mut command = Command::new("/nonexistent");
+        apply_child_env(
+            &mut command,
+            &spec(vec![
+                (super::CAPTURE_KEEP_ENV.to_string(), "5".to_string()),
+                ("KEPT".to_string(), "yes".to_string()),
+            ]),
+        );
+        let keys: Vec<String> = command
+            .as_std()
+            .get_envs()
+            .filter(|(_, value)| value.is_some())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        assert!(keys.contains(&"KEPT".to_string()), "got {keys:?}");
+        assert!(
+            !keys.contains(&super::CAPTURE_KEEP_ENV.to_string()),
+            "daemon-private capture key leaked to the child: {keys:?}"
+        );
     }
 }
 

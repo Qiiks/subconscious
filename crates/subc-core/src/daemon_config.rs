@@ -17,7 +17,7 @@ use crate::{HealthAction, HealthConfig, ModuleSpec, RestartPolicy};
 
 const DAEMON_CONFIG_RELATIVE_PATH: &str = "cortexkit/subc.jsonc";
 const SUPPORTED_CONFIG_VERSION: u32 = 1;
-const CK_LOG_ENV: &str = "CK_LOG";
+pub(crate) const CK_LOG_ENV: &str = "CK_LOG";
 pub(crate) const CAPTURE_MAX_FILE_MB_ENV: &str = "__SUBC_CAPTURE_LOG_MAX_FILE_MB";
 pub(crate) const CAPTURE_KEEP_ENV: &str = "__SUBC_CAPTURE_LOG_KEEP";
 pub(crate) const CAPTURE_MAX_AGE_DAYS_ENV: &str = "__SUBC_CAPTURE_LOG_MAX_AGE_DAYS";
