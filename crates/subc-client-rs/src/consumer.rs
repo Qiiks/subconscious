@@ -19,8 +19,8 @@ use subc_control::{
 };
 use subc_protocol::{
     error_codes, manifest::is_valid_capability_identifier, AdmissionClass, BindIdentity, ErrorBody,
-    Flags, Frame, FrameBuildError, FrameType, Priority, RouteTarget, FLAG_SUBSCRIPTION,
-    SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV,
+    Flags, Frame, FrameBuildError, FrameType, Priority, RouteTarget, SUBC_LAUNCH_NONCE_ENV,
+    SUBC_MODULE_ID_ENV,
 };
 
 use crate::RouteHandle;
@@ -2558,13 +2558,29 @@ impl Shared {
             (generation, corr, writer)
         };
 
+        // BIT 7 IS NOT EMITTED YET, DELIBERATELY. `FLAG_SUBSCRIPTION` is
+        // allocated and the daemon reads it, but every decoder built against
+        // subc-protocol <= 0.20.0 treats bit 7 as a RESERVED-BIT TRIPWIRE and
+        // REFUSES the frame rather than ignoring a bit it does not know. The
+        // splice forwards the flags byte verbatim, so the rejection lands at the
+        // far end, inside a module whose author opted into nothing, as a decode
+        // error on a frame the daemon considered well-formed.
+        //
+        // Restoring the `| FLAG_SUBSCRIPTION` below is PHASE 2 of a two-phase
+        // fleet operation and must not happen until Phase 1 is done and
+        // CENSUSED: every module linking a subc-protocol whose decoder ACCEPTS
+        // bit 7. Bit 6 (DAEMON_ORIGIN) was done exactly this way, in separate
+        // PRs, for exactly this reason.
+        //
+        // Reached from `PolicyResolver::install_push_receiver` without any
+        // caller writing `subscribe`, which is why the blast radius is wider
+        // than the subscribe call sites.
         let frame = Frame::build(
             FrameType::Request,
             Flags(
                 Flags::new(false, priority, false)
                     .with_admission_class(admission_class)
-                    .0
-                    | FLAG_SUBSCRIPTION,
+                    .0,
             ),
             channel,
             epoch,
@@ -4341,6 +4357,10 @@ impl From<FrameBuildError> for CallError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Imported HERE rather than at the crate root because production code no
+    // longer emits bit 7 (see the send_subscription comment); only the guard test
+    // that keeps it un-emitted still names it. Phase 2 moves it back up.
+    use subc_protocol::FLAG_SUBSCRIPTION;
 
     #[derive(Clone)]
     struct InstrumentedWriter {
@@ -4492,8 +4512,20 @@ mod tests {
         (request, handle)
     }
 
+    /// NEITHER a call NOR a subscribe emits bit 7 yet, and the subscribe arm is
+    /// the load-bearing one.
+    ///
+    /// This test previously asserted the OPPOSITE for subscribes. It was
+    /// inverted when the emission retreated, because a decoder built against
+    /// subc-protocol <= 0.20.0 refuses bit 7 outright and the daemon forwards the
+    /// flags byte verbatim to a module that never opted in. Emission is Phase 2
+    /// of a two-phase fleet operation and the census has not happened.
+    ///
+    /// So this test EXISTS TO RED when someone restores `| FLAG_SUBSCRIPTION`
+    /// without doing Phase 1 first. Its name says what it protects; do not
+    /// "fix" it by flipping the assertion back.
     #[tokio::test]
-    async fn ordinary_call_envelope_has_bit_7_clear_and_subscribe_envelope_has_bit_7_set() {
+    async fn neither_call_nor_subscribe_emits_bit_7_until_the_fleet_tolerates_it() {
         let (shared, mut receiver, handle) = reverse_test_shared(ReverseRequestRegistry::new());
         let call_shared = Arc::clone(&shared);
         let call = tokio::spawn(async move {
@@ -4546,7 +4578,9 @@ mod tests {
         let held = receiver.recv().await.unwrap();
         assert_eq!(
             held.frame.header.encode()[6] & FLAG_SUBSCRIPTION,
-            FLAG_SUBSCRIPTION
+            0,
+            "a held-open subscribe must NOT set bit 7 until every module's decoder \
+             accepts it; restoring emission here is Phase 2 and needs a fleet census"
         );
         drop(subscription);
         release_reverse_request_registry(handle);
