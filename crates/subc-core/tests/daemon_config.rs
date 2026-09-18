@@ -55,7 +55,12 @@ impl RunningDaemon {
             fs::write(&config_path, config_doc).unwrap();
         }
 
+        // Child stdout/stderr capture files land wherever this points. Without
+        // the override the supervisor resolves the REAL run directory from the
+        // environment and writes `<module_id>.stderr.log` into the operator's
+        // live data home under fixture module ids.
         let config = BootstrapConfig::new(&connection_file_path, 0)
+            .with_capture_logs_dir(temp_dir.join("run").join("logs"))
             .with_daemon_config_path(&config_path)
             .unwrap();
         let task = tokio::spawn(run_with_config(config));
@@ -1186,6 +1191,54 @@ async fn present_invalid_config_fails_loud_before_daemon_starts() {
     assert!(message.contains(&config_path.display().to_string()));
     assert!(message.contains("invalid daemon config"));
     assert!(!connection_file_path.exists());
+}
+
+/// The supervisor writes each child's stdout/stderr into
+/// `<capture dir>/<module_id>.stderr.log`. That directory is derived from the
+/// ENVIRONMENT unless a caller overrides it, so an in-process test daemon that
+/// does not override it writes its fixture module ids into the operator's live
+/// `~/.local/share/cortexkit/run/logs/` — which is where five fixture files
+/// (good-aft, disabled-aft, capability-consumer, ck-rescan-added,
+/// daemon-aft) were found on this host on 2026-09-16.
+///
+/// This asserts the capture file appears under the FIXTURE tree. Drop the
+/// `with_capture_logs_dir` call in `RunningDaemon::start` and it reds: the file
+/// is written to the real run directory instead, and nothing here finds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn child_stderr_capture_is_written_inside_the_fixture_tree() {
+    let module_id = "capture-redirect-aft";
+    let daemon = RunningDaemon::start(
+        "daemon-config-capture-redirect",
+        Some(config_doc([stub_module(module_id, true, [])])),
+    )
+    .await;
+
+    wait_for_supervisor_entry(
+        &daemon.connection_file_path,
+        module_id,
+        |entry| entry.live,
+        STATE_TIMEOUT,
+    )
+    .await;
+
+    let expected = daemon
+        .connection_file_path
+        .parent()
+        .unwrap()
+        .join("run")
+        .join("logs")
+        .join(format!("{module_id}.stderr.log"));
+
+    let deadline = Instant::now() + STATE_TIMEOUT;
+    while !expected.exists() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        expected.exists(),
+        "child capture file not found under the fixture tree at {}; \
+         if this reds, the capture directory fell back to the real run dir",
+        expected.display()
+    );
 }
 
 fn config_doc<const N: usize>(modules: [Value; N]) -> String {

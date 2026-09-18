@@ -96,6 +96,13 @@ pub struct BootstrapConfig {
     reserved_capabilities: BTreeMap<String, String>,
     watchdog_config: DaemonSelfWatchdogConfig,
     connection_file_source: ConnectionFileSource,
+    /// Directory the supervisor writes per-module stdout/stderr capture files
+    /// into. `None` resolves to the real run directory, which is what a shipped
+    /// daemon wants and what an IN-PROCESS TEST DAEMON MUST NOT USE: the path
+    /// is derived from the environment at spawn time, so a test that leaves it
+    /// unset writes `<module_id>.stderr.log` into the operator's live data home
+    /// under its fixture module ids.
+    capture_logs_dir: Option<PathBuf>,
 }
 
 impl BootstrapConfig {
@@ -113,7 +120,16 @@ impl BootstrapConfig {
             reserved_capabilities: BTreeMap::new(),
             watchdog_config: DaemonSelfWatchdogConfig::default(),
             connection_file_source: ConnectionFileSource::Explicit,
+            capture_logs_dir: None,
         }
+    }
+
+    /// Redirects per-module stdout/stderr capture files out of the real run
+    /// directory. Tests that start an in-process daemon must call this with a
+    /// path inside their fixture tree.
+    pub fn with_capture_logs_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.capture_logs_dir = Some(dir.into());
+        self
     }
 
     pub fn from_env() -> Result<Self, BootstrapError> {
@@ -343,6 +359,7 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
     let route_bind_relay_default_ms = config.route_bind_relay_default_ms;
     let reserved_capabilities = config.reserved_capabilities.clone();
     let watchdog_config = config.watchdog_config.clone();
+    let capture_logs_dir = config.capture_logs_dir.clone();
     match ensure_singleton_with_config(config).await? {
         Outcome::AlreadyRunning => {
             info!("subc daemon already running");
@@ -359,6 +376,7 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
                 route_bind_relay_default_ms,
                 reserved_capabilities,
                 watchdog_config,
+                capture_logs_dir,
             )
             .await
         }
@@ -451,6 +469,7 @@ async fn serve_bound_daemon(
     route_bind_relay_default_ms: Option<u64>,
     reserved_capabilities: BTreeMap<String, String>,
     watchdog_config: DaemonSelfWatchdogConfig,
+    capture_logs_dir: Option<PathBuf>,
 ) -> Result<(), BootstrapError> {
     raise_nofile_limit();
 
@@ -473,7 +492,9 @@ async fn serve_bound_daemon(
         .with_forwarding(Arc::clone(&forwarding))
         .with_handle(supervisor_handle.clone())
         .with_connection_file_path(bound.connection_file_path.clone())
-        .with_capture_logs_dir(daemon_config::daemon_run_dir().join("logs"));
+        .with_capture_logs_dir(
+            capture_logs_dir.unwrap_or_else(|| daemon_config::daemon_run_dir().join("logs")),
+        );
     // Collect per-module route.bind relay overrides BEFORE handing the
     // `configured_modules` vector to the supervisor (which only needs each
     // module's `drain_timeout_ms`). Each entry was filled in by parse-time

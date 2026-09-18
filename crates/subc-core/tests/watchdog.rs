@@ -238,7 +238,9 @@ impl RunningDaemon {
         let temp_dir = unique_temp_dir(name);
         let connection_file_path = temp_dir.join("subc-conn.json");
         let task = tokio::spawn(run_with_config(
-            BootstrapConfig::new(&connection_file_path, 0).with_watchdog_config(watchdog_config),
+            BootstrapConfig::new(&connection_file_path, 0)
+                .with_capture_logs_dir(temp_dir.join("run").join("logs"))
+                .with_watchdog_config(watchdog_config),
         ));
         wait_for_responsive_daemon(&connection_file_path, START_TIMEOUT).await;
 
