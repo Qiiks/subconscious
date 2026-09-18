@@ -1797,11 +1797,7 @@ fn fast_subscribe_options() -> SubscribeOptions {
 fn consumer_identity(session: &str) -> BindIdentity {
     let project_root = unique_temp_dir("subc-client-rs-consumer-project");
     fs::create_dir_all(&project_root).unwrap();
-    BindIdentity {
-        project_root,
-        harness: "subc-client-rs-consumer-test".to_string(),
-        session: session.to_string(),
-    }
+    BindIdentity::new(project_root, "subc-client-rs-consumer-test", session)
 }
 
 fn tool_target(module_id: &str) -> RouteTarget {
@@ -2010,11 +2006,7 @@ where
             "target": RouteTarget::ToolProvider {
                 module_id: module_id.to_string(),
             },
-            "identity": BindIdentity {
-                project_root,
-                harness: "subc-client-rs-test".to_string(),
-                session: "clean-api".to_string(),
-            },
+            "identity": BindIdentity::new(project_root, "subc-client-rs-test", "clean-api"),
         }),
     )
     .await;

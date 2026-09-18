@@ -1996,11 +1996,11 @@ mod tests {
             target: RouteTarget::ToolProvider {
                 module_id: "provider".to_string(),
             },
-            identity: BindIdentity {
-                project_root: PathBuf::from("/tmp/project"),
-                harness: "test".to_string(),
-                session: "bind".to_string(),
-            },
+            identity: BindIdentity::new(
+                PathBuf::from("/tmp/project"),
+                "test".to_string(),
+                "bind".to_string(),
+            ),
             principal: None,
             consumer_capabilities: None,
             admission_facts: None,

@@ -2090,11 +2090,11 @@ async fn attach_session(subc: &SubcClient, hello: &ShimHello) -> Result<Attached
     let config = read_gateway_config(&hello.project_root, &hello.harness)?;
     let catalog = catalog_list(subc).await?;
     let desired = desired_session_from_catalog(&config.effective, &catalog.modules)?;
-    let identity = BindIdentity {
-        project_root: hello.project_root.clone(),
-        harness: hello.harness.clone(),
-        session: bind_session_from_hello(hello)?,
-    };
+    let identity = BindIdentity::new(
+        hello.project_root.clone(),
+        hello.harness.clone(),
+        bind_session_from_hello(hello)?,
+    );
 
     let relay_session = Arc::new(RelaySession::new(identity.session.clone()));
     let mut routes = HashMap::new();
@@ -3837,13 +3837,10 @@ impl SubcPromptRouteClient {
                 "thalamus management surface",
             ),
         };
-        let identity = match bind_session {
-            Some(session) => BindIdentity {
-                session,
-                ..self.identity.clone()
-            },
-            None => self.identity.clone(),
-        };
+        let mut identity = self.identity.clone();
+        if let Some(session) = bind_session {
+            identity.session = session;
+        }
         let route = open_route(
             &self.subc,
             target,
@@ -5969,11 +5966,11 @@ mod tests {
                     },
                 },
             },
-            BindIdentity {
-                project_root: PathBuf::from("/tmp/subc-mcp-tombstone-test"),
-                harness: DEFAULT_HARNESS.to_owned(),
-                session: "tombstone-test-session".to_owned(),
-            },
+            BindIdentity::new(
+                PathBuf::from("/tmp/subc-mcp-tombstone-test"),
+                DEFAULT_HARNESS.to_owned(),
+                "tombstone-test-session".to_owned(),
+            ),
             inner,
         )
     }
@@ -6034,11 +6031,11 @@ mod tests {
         async fn open_against_error_body(error_body: Vec<u8>) -> BoxError {
             let (client_stream, mut server_stream) = connected_tcp_stream_pair().await;
             let subc = SubcClient::start(client_stream);
-            let identity = BindIdentity {
-                project_root: PathBuf::from("/tmp/subc-mcp-refusal"),
-                harness: DEFAULT_HARNESS.to_string(),
-                session: "shim-session".to_string(),
-            };
+            let identity = BindIdentity::new(
+                PathBuf::from("/tmp/subc-mcp-refusal"),
+                DEFAULT_HARNESS.to_string(),
+                "shim-session".to_string(),
+            );
             let server = tokio::spawn(async move {
                 let frame = read_frame(&mut server_stream).await.unwrap().unwrap();
                 let response = build_frame(
@@ -6104,11 +6101,11 @@ mod tests {
     ) {
         let (client_stream, mut server_stream) = connected_tcp_stream_pair().await;
         let subc = SubcClient::start(client_stream);
-        let identity = BindIdentity {
-            project_root: PathBuf::from("/tmp/subc-mcp-route-open"),
-            harness: DEFAULT_HARNESS.to_string(),
-            session: "shim-session".to_string(),
-        };
+        let identity = BindIdentity::new(
+            PathBuf::from("/tmp/subc-mcp-route-open"),
+            DEFAULT_HARNESS.to_string(),
+            "shim-session".to_string(),
+        );
         let expected_for_server = expected.clone();
         let (close_tx, close_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {

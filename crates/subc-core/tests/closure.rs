@@ -536,11 +536,11 @@ where
 {
     let request = ClientControlRequest::RouteOpen {
         target,
-        identity: BindIdentity {
-            project_root: project.path().to_path_buf(),
-            harness: "opencode".to_string(),
-            session: format!("closure-{}", corr),
-        },
+        identity: BindIdentity::new(
+            project.path().to_path_buf(),
+            "opencode".to_string(),
+            format!("closure-{}", corr),
+        ),
         consumer_identity: None,
         consumer_capabilities: None,
         admission_facts: None,

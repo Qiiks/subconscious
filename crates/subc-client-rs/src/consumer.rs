@@ -4250,11 +4250,11 @@ mod tests {
             let target = RouteTarget::ToolProvider {
                 module_id: "retry-polarity".to_string(),
             };
-            let identity = BindIdentity {
-                project_root: PathBuf::from("/tmp/project"),
-                harness: "test".to_string(),
-                session: code.to_string(),
-            };
+            let identity = BindIdentity::new(
+                PathBuf::from("/tmp/project"),
+                "test".to_string(),
+                code.to_string(),
+            );
             let options = CallOptions {
                 timeout: Duration::from_secs(2),
                 route_retry: RetryBackoff {
@@ -4345,11 +4345,7 @@ mod tests {
             &RouteTarget::ToolProvider {
                 module_id: "m".into(),
             },
-            &BindIdentity {
-                project_root: PathBuf::from("/tmp/p"),
-                harness: "h".into(),
-                session: "s".into(),
-            },
+            &BindIdentity::new(PathBuf::from("/tmp/p"), "h", "s"),
             None,
             None,
         );
@@ -4382,11 +4378,7 @@ mod tests {
             &RouteTarget::ToolProvider {
                 module_id: "absent".into(),
             },
-            &BindIdentity {
-                project_root: PathBuf::from("/tmp/p"),
-                harness: "h".into(),
-                session: "s".into(),
-            },
+            &BindIdentity::new(PathBuf::from("/tmp/p"), "h", "s"),
             None,
             None,
         );
@@ -4401,11 +4393,7 @@ mod tests {
             module_id: "a\0b".into(),
             service_id: "svc".into(),
         };
-        let identity = BindIdentity {
-            project_root: PathBuf::from("/tmp/project"),
-            harness: "h".into(),
-            session: "s".into(),
-        };
+        let identity = BindIdentity::new(PathBuf::from("/tmp/project"), "h", "s");
         let key = RouteKey::new(&target, &identity, None, None);
         assert_eq!(key.project_root, PathBuf::from("/tmp/project"));
         assert!(matches!(key.target, RouteTargetKey::InternalService { .. }));
@@ -4424,11 +4412,11 @@ mod tests {
                     &RouteTarget::ToolProvider {
                         module_id: format!("module-{channel}"),
                     },
-                    &BindIdentity {
-                        project_root: PathBuf::from("/tmp/project"),
-                        harness: "test".into(),
-                        session: format!("session-{channel}"),
-                    },
+                    &BindIdentity::new(
+                        PathBuf::from("/tmp/project"),
+                        "test",
+                        format!("session-{channel}"),
+                    ),
                     None,
                     None,
                 );
@@ -4526,11 +4514,7 @@ mod tests {
         let target = RouteTarget::ToolProvider {
             module_id: "aft".into(),
         };
-        let identity = BindIdentity {
-            project_root: PathBuf::from("/tmp/project"),
-            harness: "h".into(),
-            session: "s".into(),
-        };
+        let identity = BindIdentity::new(PathBuf::from("/tmp/project"), "h", "s");
         let left = RouteKey::new(
             &target,
             &identity,
@@ -4888,11 +4872,11 @@ mod tests {
         let target = RouteTarget::ToolProvider {
             module_id: "flow-controlled".to_string(),
         };
-        let identity = BindIdentity {
-            project_root: PathBuf::from("/tmp/project"),
-            harness: "test".to_string(),
-            session: "deadline".to_string(),
-        };
+        let identity = BindIdentity::new(
+            PathBuf::from("/tmp/project"),
+            "test".to_string(),
+            "deadline".to_string(),
+        );
         let consumer_identity = Some(ConsumerIdentity {
             module_id: "caller".to_string(),
             launch_nonce: "nonce".to_string(),
@@ -4991,11 +4975,11 @@ mod tests {
         let target = RouteTarget::ToolProvider {
             module_id: "admitted-target".to_string(),
         };
-        let identity = BindIdentity {
-            project_root: PathBuf::from("/tmp/project"),
-            harness: "test".to_string(),
-            session: "admitted".to_string(),
-        };
+        let identity = BindIdentity::new(
+            PathBuf::from("/tmp/project"),
+            "test".to_string(),
+            "admitted".to_string(),
+        );
         let task = tokio::spawn(async move {
             consumer
                 .open_route_with_admission_facts(
@@ -5056,11 +5040,11 @@ mod tests {
         let target = RouteTarget::ToolProvider {
             module_id: "single-flight".to_string(),
         };
-        let identity = BindIdentity {
-            project_root: PathBuf::from("/tmp/project"),
-            harness: "test".to_string(),
-            session: "route-open".to_string(),
-        };
+        let identity = BindIdentity::new(
+            PathBuf::from("/tmp/project"),
+            "test".to_string(),
+            "route-open".to_string(),
+        );
         let opts = CallOptions {
             timeout: Duration::from_millis(25),
             consumer_identity: Some(ConsumerIdentity {
@@ -5164,11 +5148,11 @@ mod tests {
                     &RouteTarget::ToolProvider {
                         module_id: "subscriptions".to_string(),
                     },
-                    &BindIdentity {
-                        project_root: PathBuf::from("/tmp/project"),
-                        harness: "test".to_string(),
-                        session: "subscription".to_string(),
-                    },
+                    &BindIdentity::new(
+                        PathBuf::from("/tmp/project"),
+                        "test".to_string(),
+                        "subscription".to_string(),
+                    ),
                     None,
                     None,
                 ),

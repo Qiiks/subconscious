@@ -308,6 +308,9 @@ fn discovery_candidates_with_environment(
         return vec![path.to_path_buf()];
     }
 
+    let env_named = env_named.filter(|value| !value.is_empty());
+    let runtime_dir = runtime_dir.filter(|value| !value.is_empty());
+
     // SUBC_CONNECTION_FILE names the daemon the caller means, so it is EXCLUSIVE
     // rather than first-in-a-list. It used to be pushed ahead of the discovery
     // candidates, which reads as honouring it and is not: a path that is set and
@@ -709,6 +712,49 @@ mod tests {
             error.to_string().contains(&named.display().to_string()),
             "the failure must name the operator-selected rig path"
         );
+        fs::remove_dir_all(root).expect("remove test directory");
+    }
+
+    #[test]
+    fn empty_environment_paths_are_unset_and_fallback_candidates_are_absolute() {
+        let root = unique_temp_dir("empty-candidates");
+        let runtime = root.join("runtime");
+        let home = root.join("home");
+        let temp = root.join("temp");
+        let empty = OsStr::new("");
+
+        let without_named_override = discovery_candidates_with_environment(
+            None,
+            None,
+            Some(runtime.as_os_str()),
+            Some(home.as_os_str()),
+            &temp,
+        );
+        let with_empty_named_override = discovery_candidates_with_environment(
+            None,
+            Some(empty),
+            Some(runtime.as_os_str()),
+            Some(home.as_os_str()),
+            &temp,
+        );
+        assert_eq!(with_empty_named_override, without_named_override);
+
+        let without_runtime =
+            discovery_candidates_with_environment(None, None, None, Some(home.as_os_str()), &temp);
+        let with_empty_runtime = discovery_candidates_with_environment(
+            None,
+            None,
+            Some(empty),
+            Some(home.as_os_str()),
+            &temp,
+        );
+        assert_eq!(with_empty_runtime, without_runtime);
+        assert!(
+            with_empty_named_override.iter().all(|path| path.is_absolute())
+                && with_empty_runtime.iter().all(|path| path.is_absolute()),
+            "every fallback candidate must be absolute: {with_empty_named_override:?} {with_empty_runtime:?}"
+        );
+
         fs::remove_dir_all(root).expect("remove test directory");
     }
 

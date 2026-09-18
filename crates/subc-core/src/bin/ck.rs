@@ -1252,11 +1252,7 @@ impl CkClient {
             target: RouteTarget::ManagementSurface {
                 module_id: module_id.to_string(),
             },
-            identity: BindIdentity {
-                project_root,
-                harness: CK_HARNESS.to_string(),
-                session: "quota".to_string(),
-            },
+            identity: BindIdentity::new(project_root, CK_HARNESS, "quota"),
             consumer_identity: None,
             consumer_capabilities: None,
             admission_facts: None,

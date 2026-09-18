@@ -3065,11 +3065,11 @@ async fn route_open_vanished_project_root_attaches_under_its_recorded_identity()
         target: RouteTarget::ToolProvider {
             module_id: module_id.to_string(),
         },
-        identity: BindIdentity {
-            project_root: vanished_root,
-            harness: "opencode".to_string(),
-            session: "ses-vanished-project-root".to_string(),
-        },
+        identity: BindIdentity::new(
+            vanished_root,
+            "opencode".to_string(),
+            "ses-vanished-project-root".to_string(),
+        ),
         consumer_identity: None,
         consumer_capabilities: None,
         admission_facts: None,
@@ -3124,11 +3124,11 @@ async fn route_open_unreconstructable_project_root_returns_error_without_provide
         target: RouteTarget::ToolProvider {
             module_id: module_id.to_string(),
         },
-        identity: BindIdentity {
-            project_root: unreconstructable,
-            harness: "opencode".to_string(),
-            session: "ses-invalid-project-root".to_string(),
-        },
+        identity: BindIdentity::new(
+            unreconstructable,
+            "opencode".to_string(),
+            "ses-invalid-project-root".to_string(),
+        ),
         consumer_identity: None,
         consumer_capabilities: None,
         admission_facts: None,
@@ -5454,11 +5454,11 @@ fn attach_request_with_consumer_identity(
         target: RouteTarget::ToolProvider {
             module_id: module_id.to_string(),
         },
-        identity: BindIdentity {
-            project_root: project.path().to_path_buf(),
-            harness: "opencode".to_string(),
-            session: session.to_string(),
-        },
+        identity: BindIdentity::new(
+            project.path().to_path_buf(),
+            "opencode".to_string(),
+            session.to_string(),
+        ),
         consumer_identity,
         consumer_capabilities: None,
         admission_facts: None,

@@ -168,6 +168,19 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
     );
 }
 
+#[test]
+fn legacy_bind_identity_golden_without_project_id_decodes() {
+    let value: Value = serde_json::from_str(
+        &fs::read_to_string(golden_path("bind_identity")).expect("golden identity is readable"),
+    )
+    .expect("golden identity is JSON");
+    assert!(value.get("project_id").is_none());
+
+    let identity: BindIdentity =
+        serde_json::from_value(value).expect("legacy identity without project_id decodes");
+    assert_eq!(identity.project_id, None);
+}
+
 #[derive(Deserialize)]
 struct LegacyModuleManifest {
     module_id: String,
@@ -517,11 +530,11 @@ fn golden_path(name: &str) -> PathBuf {
 }
 
 fn bind_identity() -> BindIdentity {
-    BindIdentity {
-        project_root: PathBuf::from("/tmp/subc/project"),
-        harness: "opencode".to_string(),
-        session: "session-0001".to_string(),
-    }
+    BindIdentity::new(
+        PathBuf::from("/tmp/subc/project"),
+        "opencode".to_string(),
+        "session-0001".to_string(),
+    )
 }
 
 fn error_body() -> ErrorBody {

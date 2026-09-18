@@ -229,11 +229,11 @@ fn target() -> RouteTarget {
 }
 
 fn identity() -> BindIdentity {
-    BindIdentity {
-        project_root: PathBuf::from("/tmp/subc-client-rs-liveness-probe"),
-        harness: "subc-client-rs-test".to_string(),
-        session: "liveness-probe".to_string(),
-    }
+    BindIdentity::new(
+        PathBuf::from("/tmp/subc-client-rs-liveness-probe"),
+        "subc-client-rs-test".to_string(),
+        "liveness-probe".to_string(),
+    )
 }
 
 async fn start_fake_daemon(mode: DataMode) -> FakeDaemon {
