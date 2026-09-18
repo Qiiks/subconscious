@@ -2792,3 +2792,67 @@ fn management_surface_manifest(module_id: &str, operations: &[&str]) -> ModuleMa
     }];
     manifest
 }
+
+/// `serve()` MUST RETURN WHEN THE DAEMON'S CONNECTION CLOSES. It must not
+/// reconnect.
+///
+/// Four modules (broca, cerebellum, astrocyte, plexus) independently hang their
+/// entire graceful shutdown off this return: WAL seals, browser-session
+/// teardown, refresher joins, scheduler stops. None of them is told by the
+/// daemon that it is going away — on a daemon cut nothing is sent, the socket
+/// simply ends — so this return IS the fleet's shutdown signal.
+///
+/// Nothing asserted it until now, and the gap was worse than absent: many tests
+/// here kill the daemon and then `serve_task.await`, so the property is
+/// EXERCISED everywhere. But if `serve()` ever reconnected instead of returning,
+/// those awaits would HANG rather than fail, and a hang reads as a slow suite or
+/// a flake rather than as a named defect. Exercised-with-a-hang-as-its-failure
+/// mode is not coverage.
+///
+/// So this test bounds the return. A reconnecting `serve()` fails here by name,
+/// in five seconds, saying what it broke — and every module owner reading the
+/// failure learns their shutdown never fires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn serve_returns_when_the_daemon_connection_closes_rather_than_reconnecting() {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        binary_path(&workspace, "ck-subc"),
+        &["build", "-p", "subc-core", "--bins"],
+    );
+
+    let temp_dir = unique_temp_dir("subc-client-rs-serve-returns-on-eof");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    write_empty_config(&config_dir);
+
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    let module_id = "subc-client-rs-serve-returns-on-eof";
+    let (_handle, serve_task) = spawn_inline_module(
+        &daemon.connection_file,
+        inline_module_manifest(module_id, &["a"]),
+    )
+    .await;
+    wait_for_catalog_module(&daemon.connection_file, module_id, START_TIMEOUT).await;
+
+    // The daemon dies with no GOODBYE and no warning, which is exactly what a
+    // `launchctl bootout` does: subc-core installs no signal handler, so the
+    // process is terminated outright and every module's socket just ends.
+    daemon.kill_and_wait();
+
+    // The BOUND is the assertion. Without it a reconnecting serve() hangs here
+    // forever and the suite reports a timeout, which names nothing.
+    let returned = tokio::time::timeout(Duration::from_secs(5), serve_task).await;
+    let joined = returned.expect(
+        "serve() did not return within 5s of the daemon's connection closing. \
+         Every module's graceful shutdown hangs off this return -- if serve() now \
+         reconnects or waits, their WAL seals and teardown hooks never run on a \
+         daemon cut, silently.",
+    );
+    assert!(
+        joined.expect("serve task panicked").is_ok(),
+        "serve() must return Ok on a clean connection close, not an error"
+    );
+}
