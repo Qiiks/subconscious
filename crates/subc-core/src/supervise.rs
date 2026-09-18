@@ -1604,7 +1604,22 @@ impl SupervisedModule {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.inner
             .commands
-            .send(SupervisorCommand::Retire { reply: reply_tx })
+            .send(SupervisorCommand::Retire { reply: reply_tx, tree: false })
+            .await
+            .map_err(|_| SuperviseError::CommandClosed {
+                module_id: self.inner.module_id.clone(),
+            })?;
+        reply_rx.await.map_err(|_| SuperviseError::CommandClosed {
+            module_id: self.inner.module_id.clone(),
+        })?
+    }
+
+    /// Retire the owned process tree inside its supervisor loop, before the
+    /// module parent is drained and descendants become detached.
+    pub(crate) async fn retire_tree(&self) -> Result<(), SuperviseError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.inner.commands
+            .send(SupervisorCommand::Retire { reply: reply_tx, tree: true })
             .await
             .map_err(|_| SuperviseError::CommandClosed {
                 module_id: self.inner.module_id.clone(),
@@ -1761,6 +1776,7 @@ enum SupervisorCommand {
     },
     Retire {
         reply: oneshot::Sender<Result<(), SuperviseError>>,
+        tree: bool,
     },
     Restart {
         /// Operator override for this one restart's drain budget, in ms. `None`
@@ -3059,8 +3075,32 @@ async fn handle_supervisor_command(
             }
             false
         }
-        SupervisorCommand::Retire { reply } => {
+        SupervisorCommand::Retire { reply, tree } => {
             let result = async {
+                if tree {
+                    #[cfg(windows)]
+                    if let Some(pid) = child.as_ref().and_then(SupervisedChild::id) {
+                        let mut command = Command::new("taskkill.exe");
+                        command.args(["/PID", &pid.to_string(), "/T", "/F"])
+                            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+                            .kill_on_drop(true).creation_flags(0x0800_0000);
+                        let status = timeout(Duration::from_secs(10), command.status())
+                            .await
+                            .map_err(|_| SuperviseError::Kill {
+                                module_id: spec.module_id.clone(),
+                                source: io::Error::new(io::ErrorKind::TimedOut, "tree retirement timed out"),
+                            })?
+                            .map_err(|source| SuperviseError::Kill {
+                                module_id: spec.module_id.clone(), source,
+                            })?;
+                        if !status.success() {
+                            return Err(SuperviseError::Kill {
+                                module_id: spec.module_id.clone(),
+                                source: io::Error::other(format!("tree retirement exited {status}")),
+                            });
+                        }
+                    }
+                }
                 begin_forwarding_drain_if_configured(
                     spec,
                     runtime,
@@ -3087,7 +3127,7 @@ async fn handle_supervisor_command(
             if registration_released {
                 process_liveness.untrack_if_current(&spec.module_id, snapshot);
             }
-            false
+            tree && registration_released
         }
         SupervisorCommand::Restart {
             drain_timeout_ms,
@@ -3770,6 +3810,13 @@ fn spawn_child(
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     command.kill_on_drop(true);
+    // The daemon runs detached from any console. On Windows a child spawned
+    // without this flag allocates a fresh console window per supervised module
+    // (visible console flashes on every respawn, which is every crash restart).
+    // CREATE_NO_WINDOW keeps the child console-free without disturbing the
+    // stderr pipe above or stdout inheritance below.
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
     let mut child = command.spawn().map_err(|source| SuperviseError::Spawn {
         program: spec.program.clone(),
         source,

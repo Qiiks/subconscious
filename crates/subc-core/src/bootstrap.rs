@@ -28,8 +28,8 @@ use crate::{
     daemon_config::{self, ConfiguredModule, DaemonConfigError},
     server::{serve_listeners, ServerAuth, ServerError},
     supervise::HealthConfig,
-    ConnectedClients, ControlHandler, DaemonSelfWatchdog, DaemonSelfWatchdogConfig,
-    ForwardingTable, Registry, RestartPolicy, Router, Supervisor, SupervisorHandle,
+    ConnectedClients, ControlHandler, DaemonSelfWatchdog, DaemonSelfWatchdogConfig, ForwardingTable, HolderMonitor,
+    Registry, RestartPolicy, Router, Supervisor, SupervisorHandle,
     SupervisorProcessLiveness,
 };
 use std::sync::Arc;
@@ -495,7 +495,7 @@ async fn serve_bound_daemon(
         .unwrap_or(u64::MAX);
     let mut control = ControlHandler::with_forwarding(Arc::clone(&registry), forwarding)
         .with_process_liveness(process_liveness)
-        .with_supervisor(supervisor_handle)
+        .with_supervisor(supervisor_handle.clone())
         .with_connected_clients(connected_clients.clone())
         .with_storage_config(storage_config)
         .with_admission_facts_config(admission_facts.carrier_module_id, admission_facts.targets)
@@ -542,6 +542,7 @@ async fn serve_bound_daemon(
         .spawn(),
     );
 
+
     for configured in configured_modules {
         let enabled = configured.enabled;
         let health = configured.health;
@@ -582,6 +583,23 @@ async fn serve_bound_daemon(
 
     control.refresh_capability_requirements();
     Arc::clone(&control).spawn_capability_deadline_loop();
+
+    let mut holder_task = HolderMonitor::spawn_if_owned(
+        bound.connection_file_path.clone(), supervisor_handle,
+    ).map(AbortOnDrop::new);
+    if let Some(task) = holder_task.as_mut() {
+        tokio::select! {
+            result = serve_task.join() => {
+                return result.map_err(BootstrapError::ServeJoin)?.map_err(BootstrapError::Serve);
+            }
+            result = task.join() => {
+                let _retired = result.map_err(BootstrapError::ServeJoin)?;
+                drop(serve_task);
+                drop(_watchdog_task);
+                return Ok(());
+            }
+        }
+    }
 
     serve_task
         .join()
