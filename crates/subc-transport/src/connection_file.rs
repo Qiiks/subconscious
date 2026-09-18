@@ -168,6 +168,10 @@ pub enum ConnectionFileError {
         path: PathBuf,
         mode: u32,
     },
+    InsecureParentDirectory {
+        component: PathBuf,
+        mode: u32,
+    },
 }
 
 pub fn write_atomic(
@@ -188,6 +192,8 @@ pub fn write_atomic(
         .ok_or_else(|| ConnectionFileError::MissingFileName {
             path: path.to_path_buf(),
         })?;
+    ensure_parent_directory(parent)?;
+    refuse_writable_ancestor(parent)?;
     // Sweep temps stranded by an earlier writer before creating our own. The
     // error path below removes this call's temp, but nothing removes one left by
     // a process that died BETWEEN create and rename -- and a connection file
@@ -207,6 +213,102 @@ pub fn write_atomic(
         let _ = fs::remove_file(&temp_path);
     }
     result
+}
+
+/// Create the connection file's parent with owner-only permissions when it is
+/// absent.
+///
+/// The daemon OWNS this directory, so it can make the misconfiguration
+/// unproducible rather than only reporting it — which is strictly stronger than
+/// the check below and is available to us precisely because we choose the path.
+/// A caller that names its own destination has only the check.
+///
+/// An existing directory is left alone: changing modes under an operator is a
+/// bigger act than refusing, and `refuse_writable_ancestor` reports it.
+fn ensure_parent_directory(parent: &Path) -> Result<(), ConnectionFileError> {
+    if parent.exists() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    let created = {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)
+    };
+    #[cfg(not(unix))]
+    let created = fs::create_dir_all(parent);
+
+    created.map_err(|source| ConnectionFileError::Io {
+        op: "create connection-file parent",
+        path: parent.to_path_buf(),
+        source,
+    })
+}
+
+/// Refuse to publish key material beneath a directory another user can write.
+///
+/// A LINT AGAINST MISCONFIGURATION, NOT A SECURITY BOUNDARY. It does nothing
+/// against a same-uid adversary, who can read the finished 0600 file anyway. It
+/// catches the cross-uid case, which the same-uid concession does NOT cover: a
+/// group- or world-writable ancestor lets another user UNLINK the 0600 file and
+/// substitute their own, because directory write permission governs create and
+/// unlink rather than the target's mode. The file's own mode does not close it
+/// and neither does its ownership.
+///
+/// EVERY ANCESTOR, UP TO `/`. Stopping at `$HOME` or an XDG base would read the
+/// bound from the environment, so it would be attacker-influenceable and
+/// undefined when unset. It is also incorrect: an attacker who can unlink in ANY
+/// ancestor renames an intermediate directory aside and substitutes their own
+/// tree, so a 0700 leaf under a 0777 grandparent protects nothing. Every
+/// component or the guarantee does not compose.
+///
+/// CANONICALISE FIRST. An unresolved walk checks the modes of a path that is not
+/// the one we write through: a symlink component pointing somewhere permissive
+/// defeats the walk while every individual `stat` passes.
+///
+/// STICKY EXEMPTS. `/tmp` and `/Users/Shared` are 1777 by design; without the
+/// exemption this fires on correctly-configured systems, and a check that
+/// refuses healthy configuration gets disabled — after which it protects nothing
+/// at all.
+#[cfg(unix)]
+fn refuse_writable_ancestor(parent: &Path) -> Result<(), ConnectionFileError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    const GROUP_OR_WORLD_WRITABLE: u32 = 0o022;
+    const STICKY: u32 = 0o1000;
+
+    // A parent that cannot be canonicalised is reported by the write itself with
+    // its own io::Error; refusing here would replace a precise errno with a
+    // permissions verdict about a path we could not resolve.
+    let Ok(resolved) = fs::canonicalize(parent) else {
+        return Ok(());
+    };
+
+    let mut component = resolved.as_path();
+    loop {
+        if let Ok(metadata) = fs::metadata(component) {
+            let mode = metadata.permissions().mode();
+            if mode & GROUP_OR_WORLD_WRITABLE != 0 && mode & STICKY == 0 {
+                return Err(ConnectionFileError::InsecureParentDirectory {
+                    component: component.to_path_buf(),
+                    mode: mode & 0o7777,
+                });
+            }
+        }
+        match component.parent() {
+            Some(next) => component = next,
+            None => return Ok(()),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn refuse_writable_ancestor(_parent: &Path) -> Result<(), ConnectionFileError> {
+    // Windows ACLs are not a mode bitmask and the Unix reasoning does not carry.
+    // Stated rather than silently skipped so the absence is a decision.
+    Ok(())
 }
 
 /// Remove `.<file_name>.<pid>.<hex>.tmp` siblings older than ten minutes.
@@ -596,6 +698,13 @@ impl fmt::Display for ConnectionFileError {
                 "connection file {} has insecure permissions {mode:#o}; expected owner-only 0600",
                 path.display()
             ),
+            Self::InsecureParentDirectory { component, mode } => write!(
+                f,
+                "refusing to publish the connection file: ancestor {} is mode {mode:#o}, \
+                 which lets another user replace the file regardless of its own 0600 mode; \
+                 this is a misconfiguration check, not a defence against a same-uid caller",
+                component.display()
+            ),
         }
     }
 }
@@ -608,6 +717,7 @@ impl Error for ConnectionFileError {
             Self::Random(_) => None,
             Self::MissingParent { .. }
             | Self::MissingFileName { .. }
+            | Self::InsecureParentDirectory { .. }
             | Self::UnsupportedSchema { .. }
             | Self::WireVersionMismatch { .. }
             | Self::Invalid { .. }
@@ -651,6 +761,95 @@ mod tests {
         let path = unique_temp_path().with_extension(label);
         fs::create_dir_all(&path).expect("create test directory");
         path
+    }
+
+    /// A GROUP-writable ancestor must refuse, and the passing control on the same
+    /// fixture minus the group bit is what makes this test discriminate.
+    ///
+    /// Both arms are here because the refusal MESSAGE is not the property: a test
+    /// matching on message text passes through a removed check whenever the
+    /// wording survives, which is how the adjacent guard in claustrum kept three
+    /// green tests while examining only `0o002`. The arms differ by one bit on
+    /// one directory and nothing else.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_writable_ancestor_refuses_and_the_same_tree_without_the_bit_publishes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for (ancestor_mode, expect_refusal) in [(0o770, true), (0o750, false)] {
+            let root = unique_temp_dir(&format!("ancestor-{ancestor_mode:o}"));
+            let ancestor = root.join("ancestor");
+            let leaf = ancestor.join("run");
+            fs::create_dir_all(&leaf).expect("create leaf");
+            fs::set_permissions(&leaf, fs::Permissions::from_mode(0o700))
+                .expect("tighten the leaf so only the ancestor differs");
+            fs::set_permissions(&ancestor, fs::Permissions::from_mode(ancestor_mode))
+                .expect("set ancestor mode");
+
+            let result = write_atomic(leaf.join(CONNECTION_FILE_NAME), &sample_info());
+
+            match (expect_refusal, result) {
+                (true, Err(ConnectionFileError::InsecureParentDirectory { component, mode })) => {
+                    let expected = ancestor.canonicalize().unwrap_or_else(|_| ancestor.clone());
+                    assert_eq!(component, expected);
+                    assert_eq!(mode & 0o020, 0o020, "the group bit is what refused");
+                }
+                (true, other) => panic!("a group-writable ancestor must refuse, got {other:?}"),
+                (false, Ok(())) => {}
+                (false, other) => panic!("0o750 is not writable by another user: {other:?}"),
+            }
+
+            let _ = fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o700));
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    /// `/tmp` is 1777 by design. Without the sticky exemption this check fires on
+    /// every correctly-configured system, and a check that refuses healthy
+    /// configuration gets disabled -- after which it protects nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_sticky_world_writable_ancestor_publishes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = unique_temp_dir("ancestor-sticky");
+        let ancestor = root.join("sticky");
+        let leaf = ancestor.join("run");
+        fs::create_dir_all(&leaf).expect("create leaf");
+        fs::set_permissions(&leaf, fs::Permissions::from_mode(0o700)).expect("tighten leaf");
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o1777)).expect("sticky 1777");
+
+        let published = write_atomic(leaf.join(CONNECTION_FILE_NAME), &sample_info());
+        assert!(
+            published.is_ok(),
+            "a sticky 1777 ancestor is /tmp's own shape and must publish: {published:?}"
+        );
+
+        let _ = fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o700));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The daemon owns this directory, so the misconfiguration is unproducible
+    /// rather than merely reported when the directory does not yet exist.
+    #[cfg(unix)]
+    #[test]
+    fn an_absent_parent_is_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = unique_temp_dir("absent-parent");
+        let parent = root.join("run");
+        assert!(!parent.exists(), "fixture must start with no parent");
+
+        write_atomic(parent.join(CONNECTION_FILE_NAME), &sample_info()).expect("publishes");
+
+        let mode = fs::metadata(&parent)
+            .expect("parent exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "an absent parent is created owner-only");
+
+        let _ = fs::remove_dir_all(root);
     }
 
     fn prod_connection_file(home: &Path) -> PathBuf {

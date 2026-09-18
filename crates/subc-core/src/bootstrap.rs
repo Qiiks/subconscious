@@ -748,6 +748,10 @@ fn is_absent_or_stale_connection_file(err: &ConnectionFileError) -> bool {
         | ConnectionFileError::InsecurePermissions { .. } => true,
         ConnectionFileError::MissingParent { .. }
         | ConnectionFileError::MissingFileName { .. }
+        // A writable ancestor is an operator misconfiguration, never evidence
+        // about whether a daemon is live. Reclaiming the file would republish key
+        // material into the same directory the refusal is about.
+        | ConnectionFileError::InsecureParentDirectory { .. }
         | ConnectionFileError::Io { .. }
         | ConnectionFileError::JsonWrite { .. }
         | ConnectionFileError::Random(_)
