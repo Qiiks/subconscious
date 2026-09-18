@@ -26,6 +26,7 @@ use cortexkit_log::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse};
 use subc_core::{fleet_lint, read_frame, write_frame, Frame, DEFAULT_DRAIN_TIMEOUT};
 use subc_protocol::{BindIdentity, Flags, FrameType, Priority, RouteTarget};
@@ -359,7 +360,7 @@ const ROUTES_HELP: &str = "ck routes — inspect live route consumers\n\nusage: 
 
 const PROVENANCE_HELP: &str = "ck provenance — inspect source-tagged module provenance\n\nusage: ck [--json] [--verbose] provenance <module-id>\n\n  ck provenance <id>  daemon-attested process facts beside module declarations";
 
-const QUOTA_HELP: &str = "ck quota - AI-provider quota and usage windows\n\nusage: ck [--json] quota [--verbose] [<provider-id>]\n\n  ck quota              connected providers and their usage windows\n  ck quota --verbose    all tracked providers, including unavailable ones\n  ck quota claude       one provider's windows and status in detail";
+const QUOTA_HELP: &str = "ck quota - AI-provider quota and usage windows\n\nusage: ck [--json] quota [--verbose] [--redact] [<provider-id>]\n\n  ck quota              connected providers and their usage windows\n  ck quota --verbose    all tracked providers, including unavailable ones\n  ck quota claude       one provider's windows and status in detail\n  ck quota --redact     hide emails and org names, for sharing a screenshot";
 
 const HEALTH_HELP: &str = "ck health — module health\n\nusage: ck [--json] [--verbose] health [<module-id>]\n\n  ck health            one-line health for every supervised module (cached)\n  ck health <id>       fresh health.check probe with headline metrics\n  ck health <id> --verbose  fresh probe with the complete metrics tree";
 
@@ -530,12 +531,14 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
         Command::Quota {
             provider_id,
             verbose,
+            redact,
         } => {
             quota(
                 &mut client,
                 provider_id.as_deref(),
                 args.json,
                 verbose,
+                redact,
                 args.subc.as_deref(),
             )
             .await
@@ -1014,6 +1017,7 @@ enum Command {
     Quota {
         provider_id: Option<String>,
         verbose: bool,
+        redact: bool,
     },
     FleetLint {
         config: Option<PathBuf>,
@@ -3714,6 +3718,7 @@ async fn quota(
     provider_filter: Option<&str>,
     json_output: bool,
     verbose: bool,
+    redact: bool,
     subc: Option<&Path>,
 ) -> Result<(), CkError> {
     ensure_quota_module_registered(client).await?;
@@ -3753,7 +3758,7 @@ async fn quota(
     if json_output {
         print_json(&body)?;
     } else {
-        print_quota_table(&providers, provider_filter, verbose, subc);
+        print_quota_table(&providers, provider_filter, verbose, redact, subc);
     }
     Ok(())
 }
@@ -3796,6 +3801,44 @@ fn provider_ids_sorted(providers: &[Value]) -> Vec<String> {
 }
 
 const QUOTA_PROGRESS_BAR_WIDTH: usize = 16;
+
+/// Stable four-hex pseudonym standing in for an account's human identity under
+/// `--redact`.
+///
+/// A BLANK WOULD BE WRONG, not merely less pretty. Three providers on a typical
+/// host serve several accounts each, so removing the email makes those rows
+/// visually identical and a reader can no longer tell which 5h window belongs
+/// with which weekly, or that four distinct accounts exist at all -- losing
+/// exactly the dimension that makes a multi-account screenshot worth taking.
+///
+/// DERIVED RATHER THAN POSITIONAL ("account 1 of 4") because the number moves
+/// when ordering changes, so two screenshots taken a minute apart disagree and
+/// the pair becomes unreadable. A hash of the account id renders the same in
+/// both, which is the property that matters when someone posts a before and an
+/// after.
+///
+/// Derived from the vault account id, falling back to the email only when no id
+/// is carried -- the id is the more stable of the two and is what a reader is
+/// matching across images.
+fn account_pseudonym(entry: &Value) -> String {
+    let seed = entry
+        .get("account")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            entry
+                .get("accountInfo")
+                .and_then(|i| i.get("email"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or("");
+    if seed.is_empty() {
+        return "account".to_string();
+    }
+    let digest = Sha256::digest(seed.as_bytes());
+    format!("account {:02x}{:02x}", digest[0], digest[1])
+}
 
 fn account_label(entry: &Value) -> String {
     entry
@@ -3958,10 +4001,19 @@ fn quota_entry_not_running_locally(entry: &Value) -> bool {
             })
 }
 
+/// `redact` reaches the RENDER PATH ONLY and cannot reach `--json`: the JSON
+/// branch in `quota` prints the wire body verbatim and returns before this is
+/// called. That separation is deliberate -- a display flag that also filtered
+/// the payload would eventually be used as a privacy mechanism for a machine
+/// consumer, and a missing `account` field reads to a consumer as "this
+/// provider resolves no identity", which silently changes account-set
+/// reconciliation. A display flag must not be able to produce a payload that
+/// lies.
 fn print_quota_table(
     providers: &[Value],
     filter: Option<&str>,
     verbose: bool,
+    redact: bool,
     subc: Option<&Path>,
 ) {
     let color_enabled = ansi_color_enabled();
@@ -4052,7 +4104,14 @@ fn print_quota_table(
             .unwrap_or(0);
 
         for entry in group {
-            print_quota_account(entry, &templates, label_width, color_enabled, verbose);
+            print_quota_account(
+                entry,
+                &templates,
+                label_width,
+                color_enabled,
+                verbose,
+                redact,
+            );
         }
 
         if connected.len() > 1 {
@@ -4149,17 +4208,26 @@ fn print_quota_account(
     label_width: usize,
     color_enabled: bool,
     verbose: bool,
+    redact: bool,
 ) {
     // The email is the human identity when the wire carries it; the vault
     // account id (shortened) is the fallback, and the credential source is
     // the last resort so a row is never label-less.
-    let mut label = entry
-        .get("accountInfo")
-        .and_then(|i| i.get("email"))
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| table_account_label(entry));
+    //
+    // Under --redact all three are replaced by a derived pseudonym, including
+    // the account id: a UUID identifies no person but is a stable
+    // cross-session identifier and reads as a secret in a screenshot.
+    let mut label = if redact {
+        account_pseudonym(entry)
+    } else {
+        entry
+            .get("accountInfo")
+            .and_then(|i| i.get("email"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| table_account_label(entry))
+    };
     if label.is_empty() {
         label = entry
             .get("source")
@@ -4201,7 +4269,7 @@ fn print_quota_account(
         None => dim_text("●", color_enabled),
     };
     let mut header = format!("  {dot} {}", bold_text(&label, color_enabled));
-    for extra in quota_account_header_extras(entry) {
+    for extra in quota_account_header_extras(entry, redact) {
         header.push_str(&dim_text(&format!(" · {extra}"), color_enabled));
     }
     println!("{header}");
@@ -4403,15 +4471,22 @@ fn format_duration_two_units(secs: u64) -> String {
 /// Optional account metadata after the label: org, plan, saved resets, and
 /// staleness. Every field is additive on the wire (QTA ships them
 /// incrementally), so absence simply omits the segment.
-fn quota_account_header_extras(entry: &Value) -> Vec<String> {
+fn quota_account_header_extras(entry: &Value, redact: bool) -> Vec<String> {
     let mut extras = Vec::new();
     let info = entry.get("accountInfo");
     // The email is consumed as the primary label upstream; extras start at
     // the org.
+    //
+    // THE ORG NAME IS THE ONE A NAIVE REDACTION MISSES. A personal Anthropic
+    // org is named after its owner ("Ufuk's Organization"), so blanking the
+    // email and leaving this renders the name in plain sight one column over.
+    // Measured by QTA on a live payload: 4 distinct emails and 4 distinct org
+    // names across the same accounts.
     if let Some(org) = info
         .and_then(|i| i.get("orgName"))
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
+        .filter(|_| !redact)
     {
         extras.push(org.to_string());
     }
@@ -6613,10 +6688,13 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
         "quota" => {
             let mut provider_id = None;
             let mut verbose = false;
+            let mut redact = false;
             for argument in tail {
                 let argument = argument.to_string_lossy();
                 if argument == "--verbose" {
                     verbose = true;
+                } else if argument == "--redact" {
+                    redact = true;
                 } else if provider_id.is_none() {
                     provider_id = Some(argument.into_owned());
                 }
@@ -6626,6 +6704,7 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
                 _ => Ok(Command::Quota {
                     provider_id,
                     verbose,
+                    redact,
                 }),
             }
         }
@@ -7285,7 +7364,7 @@ mod tests {
     fn account_header_extras_are_additive_and_absent_safe() {
         // Bare current-wire entry: no extras at all.
         let bare = serde_json::json!({ "provider": "codex", "account": "291f5165" });
-        assert!(quota_account_header_extras(&bare).is_empty());
+        assert!(quota_account_header_extras(&bare, false).is_empty());
 
         // Enriched entry per QTA's committed additive contract.
         let enriched = serde_json::json!({
@@ -7294,7 +7373,7 @@ mod tests {
             "accountInfo": { "email": "operator@example.com", "planType": "pro" },
             "savedResets": { "availableCount": 4 }
         });
-        let extras = quota_account_header_extras(&enriched);
+        let extras = quota_account_header_extras(&enriched, false);
         // email is the primary label upstream, never repeated in extras.
         assert_eq!(extras.len(), 2, "extras: {extras:?}");
         assert_eq!(extras[0], "plan: pro");
@@ -7844,9 +7923,85 @@ mod tests {
             Command::Quota {
                 provider_id: Some(provider_id),
                 verbose: true,
+                redact: false,
             } if provider_id == "anthropic"
         ));
         assert!(QUOTA_HELP.contains("--verbose"));
+    }
+
+    /// `--redact` replaces every identifying field with one derived pseudonym,
+    /// and the pseudonym must be STABLE -- two screenshots of the same account
+    /// taken minutes apart have to render identically or the pair is unreadable.
+    ///
+    /// The org-name arm is the one a naive redaction misses: a personal org is
+    /// named after its owner, so blanking the email and leaving the org renders
+    /// the name in plain sight one column over.
+    #[test]
+    fn redact_replaces_email_and_org_with_a_stable_derived_pseudonym() {
+        let entry = json!({
+            "account": "11111111-2222-3333-4444-555555555555",
+            "accountInfo": {
+                "email": "ufuk@example.com",
+                "orgName": "Ufuk's Organization",
+                "planType": "max",
+            },
+        });
+
+        let plain = account_pseudonym(&entry);
+        assert_eq!(
+            plain,
+            account_pseudonym(&entry),
+            "the pseudonym must be derived, not positional: an unstable label makes a \
+             before/after screenshot pair unmatchable"
+        );
+        assert!(
+            plain.starts_with("account ") && plain.len() == "account ".len() + 4,
+            "expected `account <4 hex>`, got {plain}"
+        );
+        assert!(
+            !plain.contains("ufuk") && !plain.contains("Organization"),
+            "the pseudonym must reveal nothing: {plain}"
+        );
+
+        // A DIFFERENT account must render differently, or the whole point --
+        // telling multiple accounts apart in one screenshot -- is lost.
+        let other = json!({ "account": "99999999-8888-7777-6666-555555555555" });
+        assert_ne!(plain, account_pseudonym(&other));
+
+        // The org name is dropped under redaction and kept without it; the plan
+        // type survives both, because it identifies nobody and is the point of
+        // the screenshot.
+        let redacted = quota_account_header_extras(&entry, true);
+        assert!(
+            !redacted.iter().any(|e| e.contains("Organization")),
+            "org name survived redaction: {redacted:?}"
+        );
+        assert!(redacted.iter().any(|e| e == "plan: max"));
+
+        let visible = quota_account_header_extras(&entry, false);
+        assert!(visible.iter().any(|e| e == "Ufuk's Organization"));
+    }
+
+    /// The flag is a RENDER flag and structurally cannot reach `--json`: the
+    /// JSON branch prints the wire body verbatim and returns before any
+    /// redaction runs. Pinned as a parse-level fact so nobody wires `redact`
+    /// into the payload path later and calls it a privacy feature.
+    #[test]
+    fn redact_is_parsed_as_a_render_flag_and_is_documented() {
+        let command = parse_command(
+            "quota",
+            &[OsString::from("--redact"), OsString::from("claude")],
+        )
+        .unwrap();
+        assert!(matches!(
+            command,
+            Command::Quota {
+                provider_id: Some(provider_id),
+                verbose: false,
+                redact: true,
+            } if provider_id == "claude"
+        ));
+        assert!(QUOTA_HELP.contains("--redact"));
     }
 
     #[test]
