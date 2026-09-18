@@ -30,7 +30,7 @@ set -euo pipefail
 
 STAGING="${CK_STAGING:-$HOME/.local/share/cortexkit/staging}"
 BIN_DIR="${CK_BIN_DIR:-$HOME/.local/share/cortexkit/bin}"
-MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; GONE=""; RESTART=1; PLACE=0
+MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; GONE=""; RESTART=1; PLACE=0; OLDER=0
 
 while (($# > 0)); do
   case "$1" in
@@ -42,6 +42,7 @@ while (($# > 0)); do
     --control) CONTROL="$2"; shift 2 ;;
     --gone) GONE="$2"; shift 2 ;;
     --place) PLACE=1; shift ;;
+    --older) OLDER=1; shift ;;
     --check-only) shift ;;  # now the default; accepted so older call sites keep working
     --no-restart) RESTART=0; shift ;;
     *) echo "refusal: unknown argument '$1'" >&2; exit 2 ;;
@@ -69,6 +70,50 @@ done
 [ -n "$sidecar" ] || refuse "no sidecar beside the staged artifact (bare-binary staging directories are refused)"
 (cd "$staged_dir" && shasum -c "$sidecar" >/dev/null 2>&1) || refuse "staged sidecar does not verify its own artifact: $sidecar"
 say "staged sidecar $sidecar: OK"
+
+# ---- STALENESS: is this artifact the NEWEST staged one for this module? ----
+#
+# Measured 2026-09-18: the staging directory held 84 binaries across all
+# modules, 30 for broca alone, EVERY ONE with a verifying sidecar -- which is
+# this gate's entire placeability test. So thirty artifacts looked exactly as
+# placeable as the live card, and the only thing standing between a wrong
+# placement and a right one was the operator typing a path from the right
+# message. That is a convention, not a mechanism.
+#
+# The failure it prevents is real and nearly happened: a broca card was
+# superseded upstream hours after it was staged and gated, and I learned it
+# from its owner rather than from anything here.
+#
+# NOT A REFUSAL OF THE ROLLBACK CASE, because placing an older artifact
+# deliberately must stay a one-liner: it asks for --older rather than blocking.
+#
+# THIS IS A SPEED BUMP, NOT THE FIX, and the honest limit is that
+# NEWEST-BY-MTIME IS A PROXY FOR CURRENT AND A POOR ONE. Proven while testing
+# it: the arm correctly refused a stale broca artifact and named a "newer" one
+# that is ALSO stale, because the live card had been superseded and renamed out
+# of range. So it reliably catches "you grabbed something old" and cannot tell
+# you what to grab instead. The real fix is the owner naming the current
+# artifact -- a fact the gate can check rather than an ordering it infers.
+newest=$(ls -t "$staged_dir" 2>/dev/null \
+  | grep -E "^(SIGNED\.)?ck-$MODULE\.[0-9a-f]+$" \
+  | head -1)
+staged_base=$(basename "$STAGED")
+if [ -n "$newest" ] && [ "$newest" != "$staged_base" ]; then
+  if [ "$OLDER" -eq 1 ]; then
+    say "staleness: placing $staged_base although $newest is newer (--older given)"
+  else
+    echo "REFUSED: $staged_base is not the newest staged artifact for $MODULE" >&2
+    echo "         newer: $newest" >&2
+    echo "         If this is deliberate (a rollback, or the newer file is not a" >&2
+    echo "         release), pass --older. Otherwise re-read the card." >&2
+    echo "         NOTE: newest-by-mtime is not the same as CURRENT. This directory" >&2
+    echo "         accumulates leftovers, so the newer file named above may be stale" >&2
+    echo "         too -- it is stated as a fact, not a recommendation." >&2
+    exit 2
+  fi
+else
+  say "staleness: $staged_base is the newest staged artifact for $MODULE"
+fi
 
 # Signing posture must match the running image: an ad-hoc re-sign of a Developer ID
 # binary silently revokes its macOS TCC grants, and the reverse is a surprise too.
