@@ -1,4 +1,20 @@
 #!/usr/bin/env bash
+#
+# EVERY REFUSAL PRINTS THE SAME PREFIX: "REFUSED: ". There were two vocabularies
+# until 2026-09-18 -- lowercase "refusal:" from argument validation, uppercase
+# "REFUSED:" from the gate arms -- and a caller filtering output with
+# `grep -E "...|REFUS"` saw NOTHING when a path was wrong, because the arg-
+# validation path used the other spelling. An empty filter result reads as
+# quiet success, so a real refusal became invisible at the exact moment the
+# operator most needed it.
+#
+# THE RULE THIS ENCODES: the party that knows the outcome must NAME it, because
+# every downstream filter is guessing at a vocabulary. A caller's grep is an
+# allow-list over outcomes and inherits the allow-list defect -- the outcome
+# nobody anticipated is the one that goes silent. Corollary for readers: prefer
+# a position-based view (`tail`) over a pattern-based one for verdicts, since a
+# verdict you failed to predict still occupies the last line.
+
 # Place a staged module binary with every gate arm that has caught a real defect.
 #
 # Each arm exists because it failed once, and each failure was a TRUE statement about
@@ -45,16 +61,16 @@ while (($# > 0)); do
     --older) OLDER=1; shift ;;
     --check-only) shift ;;  # now the default; accepted so older call sites keep working
     --no-restart) RESTART=0; shift ;;
-    *) echo "refusal: unknown argument '$1'" >&2; exit 2 ;;
+    *) echo "REFUSED: unknown argument '$1'" >&2; exit 2 ;;
   esac
 done
 
-[ -n "$MODULE" ] || { echo "refusal: --module is required" >&2; exit 2; }
-[ -n "$STAGED" ] || { echo "refusal: --staged is required" >&2; exit 2; }
-[ -n "$MARKER" ] || { echo "refusal: --marker is required (a discriminator that separates this build from the running one)" >&2; exit 2; }
+[ -n "$MODULE" ] || { echo "REFUSED: --module is required" >&2; exit 2; }
+[ -n "$STAGED" ] || { echo "REFUSED: --staged is required" >&2; exit 2; }
+[ -n "$MARKER" ] || { echo "REFUSED: --marker is required (a discriminator that separates this build from the running one)" >&2; exit 2; }
 DEST="${DEST:-$BIN_DIR/ck-$MODULE}"
-[ -f "$STAGED" ] || { echo "refusal: staged artifact not found: $STAGED" >&2; exit 2; }
-[ -f "$DEST" ] || { echo "refusal: destination does not exist, so this is an install rather than a placement: $DEST" >&2; exit 2; }
+[ -f "$STAGED" ] || { echo "REFUSED: staged artifact not found: $STAGED" >&2; exit 2; }
+[ -f "$DEST" ] || { echo "REFUSED: destination does not exist, so this is an install rather than a placement: $DEST" >&2; exit 2; }
 
 say() { printf '%s\n' "$*"; }
 refuse() { printf 'REFUSED: %s\n' "$*" >&2; exit 2; }
