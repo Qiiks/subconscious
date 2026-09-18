@@ -241,6 +241,27 @@ fn is_valid_method_family(value: &str) -> bool {
     })
 }
 
+/// Reverse-request handlers live in a process-global map keyed by an id the
+/// `RouteHandle` carries, rather than inside the handle itself.
+///
+/// WHY, so nobody "simplifies" this into the handle later: `RouteHandle` is
+/// `Copy`, deliberately and publicly. Every route-scoped call in this SDK takes
+/// it by value, and the fleet's Rust consumers pass it around freely on that
+/// assumption. An `Arc<ReverseRequestRegistry>` field would make it non-`Copy`
+/// and break every one of those call sites across twelve repositories, for a
+/// lane most of them do not use.
+///
+/// The cost is real and bounded: entries are removed on every teardown path
+/// (`remove_route`, `remove_route_by_handle`, `drain_routes`,
+/// `uninstall_route_handle`, `install_ingress_handle`), so a consumer that opens
+/// and closes routes for its lifetime does not grow. A consumer DROPPED without
+/// closing leaks its remaining entries until process exit, which is the one gap
+/// and is acceptable because nothing else about a dropped consumer is reclaimed
+/// either.
+///
+/// If `RouteHandle` ever stops being `Copy` for another reason, move this into
+/// the handle and delete the map — the indirection exists only to preserve that
+/// property.
 static NEXT_REVERSE_REQUEST_REGISTRY_ID: AtomicU64 = AtomicU64::new(1);
 static REVERSE_REQUEST_REGISTRIES: OnceLock<Mutex<HashMap<u64, ReverseRequestRegistry>>> =
     OnceLock::new();
