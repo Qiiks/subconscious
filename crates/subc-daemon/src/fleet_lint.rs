@@ -510,7 +510,7 @@ mod tests {
     use serde_json::{json, Map, Value};
     use subc_protocol::PROTOCOL_VERSION;
 
-    use super::{lint_with_timeout, LintOutcome, OperationalClass, MANIFEST_TIMEOUT};
+    use super::{lint_with_timeout, LintOutcome, LintReport, OperationalClass, MANIFEST_TIMEOUT};
     use crate::test_support::TestTempDir as TempDir;
 
     #[derive(serde::Serialize)]
@@ -537,6 +537,37 @@ mod tests {
     /// `CARGO_BIN_EXE_*`, so the stub is the sibling two directories above the
     /// test executable. Keep the existence panic and its remedy: `--lib` does
     /// not build this binary, while `cargo test -p subc-core` does.
+    /// Assert one operational class for one module, NAMING WHAT WAS ACTUALLY
+    /// FOUND when it does not match.
+    ///
+    /// These were bare `assert!(report.has_failure(...))`. On 2026-09-19 the
+    /// ubuntu leg failed one of them on a SCRIPT-ONLY commit, and the whole
+    /// report was the word `false`: every sibling fixture test passed in the
+    /// same run, the preceding `outcome == OperationalFailure` assertion passed,
+    /// so the lint HAD failed operationally and classified it as something else
+    /// -- and the test could not say which. It reproduces nowhere here (4/4
+    /// alone, whole-lib green), so the next occurrence is the only evidence
+    /// available and it must carry the actual class.
+    ///
+    /// A BARE BOOLEAN ASSERTION DISCARDS THE ONE FACT THAT DISTINGUISHES A REAL
+    /// REGRESSION FROM AN ENVIRONMENTAL ONE. ManifestUnparsable or
+    /// ProgramNotExecutable here would point at the fixture copy (the stub is
+    /// copied out of a target dir a concurrent build may be rewriting);
+    /// ManifestInvalid missing with some OTHER module named would point at the
+    /// grammar validator. Same `false` for both today.
+    #[track_caller]
+    fn assert_failure(report: &LintReport, class: OperationalClass, module: &str) {
+        assert!(
+            report.has_failure(class, module),
+            "expected {class:?} for module '{module}', but the report carries {:?} \
+             (outcome {:?}, examined {} of {})",
+            report.failures,
+            report.outcome,
+            report.examined,
+            report.configured,
+        );
+    }
+
     fn fake_aft_stub_path() -> PathBuf {
         let mut path = std::env::current_exe().expect("current_exe available in tests");
         path.pop(); // .../deps/
@@ -674,7 +705,7 @@ mod tests {
 
         let report = lint_config(&config, false).await;
         assert_eq!(report.outcome, LintOutcome::OperationalFailure);
-        assert!(report.has_failure(OperationalClass::ProgramMissing, "missing"));
+        assert_failure(&report, OperationalClass::ProgramMissing, "missing");
     }
 
     #[tokio::test]
@@ -693,12 +724,20 @@ mod tests {
         let report = lint_config(&config, false).await;
         assert_eq!(report.outcome, LintOutcome::OperationalFailure);
         #[cfg(unix)]
-        assert!(report.has_failure(OperationalClass::ProgramNotExecutable, "not-executable"));
+        assert_failure(
+            &report,
+            OperationalClass::ProgramNotExecutable,
+            "not-executable",
+        );
         #[cfg(not(unix))]
         {
             // Windows has no executable permission bit, so the copied `.exe`
             // spawns successfully and its empty stdout is classified instead.
-            assert!(report.has_failure(OperationalClass::ManifestUnparsable, "not-executable"));
+            assert_failure(
+                &report,
+                OperationalClass::ManifestUnparsable,
+                "not-executable",
+            );
         }
     }
 
@@ -720,7 +759,7 @@ mod tests {
             .unwrap();
         assert_eq!(MANIFEST_TIMEOUT, Duration::from_secs(10));
         assert_eq!(report.outcome, LintOutcome::OperationalFailure);
-        assert!(report.has_failure(OperationalClass::ManifestTimeout, "timeout"));
+        assert_failure(&report, OperationalClass::ManifestTimeout, "timeout");
     }
 
     #[tokio::test]
@@ -738,7 +777,7 @@ mod tests {
 
         let report = lint_config(&config, false).await;
         assert_eq!(report.outcome, LintOutcome::OperationalFailure);
-        assert!(report.has_failure(OperationalClass::ManifestExitNonzero, "nonzero"));
+        assert_failure(&report, OperationalClass::ManifestExitNonzero, "nonzero");
     }
 
     #[tokio::test]
@@ -811,7 +850,7 @@ mod tests {
 
         let report = lint_config(&config, false).await;
         assert_eq!(report.outcome, LintOutcome::OperationalFailure);
-        assert!(report.has_failure(OperationalClass::DuplicateModuleId, "duplicate"));
+        assert_failure(&report, OperationalClass::DuplicateModuleId, "duplicate");
     }
 
     #[tokio::test]
@@ -826,7 +865,7 @@ mod tests {
 
         let report = lint_config(&config, false).await;
         assert_eq!(report.outcome, LintOutcome::OperationalFailure);
-        assert!(report.has_failure(OperationalClass::ManifestInvalid, "invalid"));
+        assert_failure(&report, OperationalClass::ManifestInvalid, "invalid");
     }
 
     #[tokio::test]
@@ -841,7 +880,11 @@ mod tests {
 
         let report = lint_config(&config, false).await;
         assert_eq!(report.outcome, LintOutcome::OperationalFailure);
-        assert!(report.has_failure(OperationalClass::ManifestInvalid, "disabled-invalid"));
+        assert_failure(
+            &report,
+            OperationalClass::ManifestInvalid,
+            "disabled-invalid",
+        );
     }
 
     #[tokio::test]
