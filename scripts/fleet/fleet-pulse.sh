@@ -491,6 +491,24 @@ else
       printf '%s\n' "$dl_skips" | sed 's/^/    /'
     else
       printf '  MCP provider skips: none in last 20k lines (control: %s lines exist)\n' "$dl_total"
+      # The same witness one level down, and a quieter failure: the gateway skips
+      # an INDIVIDUAL tool whose manifest name is not MCP-safe (subc-mcp
+      # main.rs:2385 -- ASCII alphanumeric, '_' and '-' only) and composes the
+      # provider anyway. So a module can advertise a full tool surface, serve it
+      # correctly on its route, pass its own tests, and reach NO head at all.
+      # Measured 2026-09-19: fusiform 7 of 7 tool names dotted (zero reach), and
+      # cerebellum sat in that state from 14 August until a flat facade landed --
+      # neither owner could see it, because the skip is a line in the GATEWAY's
+      # stderr and their tools genuinely are dispatchable on the route. Grouped
+      # by module so "all of them" is distinguishable from "one typo".
+      dl_tool_skips=$(printf '%s\n' "$dl_win" | grep 'skipping tool' \
+        | sed "s/.*skipping tool '\([^.']*\)\..*/\1/" | sort | uniq -c | sort -rn)
+      if [ -n "$dl_tool_skips" ]; then
+        echo "  MCP tools skipped for unsafe names (module: count, advertised but unreachable):"
+        printf '%s\n' "$dl_tool_skips" | sed 's/^/    /'
+      else
+        printf '  MCP tool-name skips: none in last 20k lines (control: %s lines exist)\n' "$dl_total"
+      fi
     fi
   fi
 fi
