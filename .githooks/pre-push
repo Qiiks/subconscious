@@ -162,6 +162,47 @@ if command -v gh >/dev/null 2>&1; then
       --json status,headSha,workflowName \
       --jq '.[] | select(.status=="in_progress" or .status=="queued") | "\(.headSha[0:8]) \(.workflowName)"' \
       2>/dev/null | head -3)
+  # A SCHEDULED RED REPORTS TO NOBODY, so carry it on the next push.
+  #
+  # A push gate answers "is this change good" and you read it BECAUSE you just
+  # pushed. A scheduled run answers "is what already landed still good against
+  # the world as it is now" -- and its whole value is firing when you are not
+  # looking, which is exactly why its RESULT arrives when you are not looking.
+  #
+  # Measured here 2026-09-19 after FUSI found the same hole: SIX consecutive
+  # scheduled reds, 2026-09-07 to 2026-09-12, none of which I ever saw. They were
+  # the Windows breakage I was separately chasing on pushes, and they went green
+  # when I fixed it -- the signal worked perfectly and told nobody.
+  #
+  # A NOTICE, NOT A REFUSAL: a scheduled red is about what already landed, the
+  # push in front of you may well be its fix, and blocking unrelated work on it
+  # would be wrong. It reappears on EVERY push until the schedule goes green, so
+  # unlike a one-shot notification it cannot be missed by being away.
+  #
+  # ALSO REPORTS "no scheduled runs at all", because a cron that never fires
+  # produces exactly the same silence as one that passes.
+  sched=$(gh run list --event schedule --limit 1 \
+      --json conclusion,createdAt,headSha \
+      --jq '.[] | "\(.conclusion) \(.createdAt[0:16]) \(.headSha[0:8])"' 2>/dev/null || true)
+  if [ -z "$sched" ]; then
+    if grep -q "schedule:" "$(git rev-parse --show-toplevel)/.github/workflows/"*.yml 2>/dev/null; then
+      echo "" >&2
+      echo "pre-push NOTICE: a cron is declared but NO scheduled run exists." >&2
+      echo "  A schedule that never fires looks exactly like one that passes." >&2
+    fi
+  else
+    case "$sched" in
+      success*) : ;;
+      *)
+        echo "" >&2
+        echo "pre-push NOTICE: the last SCHEDULED run was not green:" >&2
+        echo "  $sched" >&2
+        echo "  It answers 'is what already landed still good', and it reports to nobody." >&2
+        echo "  gh run list --event schedule --limit 10" >&2
+        ;;
+    esac
+  fi
+
   if [ -n "$inflight" ]; then
     echo "" >&2
     echo "pre-push NOTICE: a CI run is IN FLIGHT on $branch and this push will cancel it:" >&2
