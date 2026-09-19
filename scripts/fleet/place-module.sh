@@ -176,17 +176,41 @@ count_in() {  # count_in <table> <file> <needle>
     *)  strings "$2" | grep -cF "$3" || true ;;
   esac
 }
-marker_table=""
+# A MARKER CAN DISCRIMINATE IN BOTH TABLES, AND THEN THE CONTROL PICKS WHICH ONE.
+#
+# This loop used to assign on every discriminating table, so the LAST one won --
+# `nm` -- arbitrarily. A Rust string literal that is also a symbol name (a
+# migration's table name, say) reads in both; the control is usually a plain
+# message literal that CANNOT appear in `nm`. So the gate chose nm and then
+# refused its own valid card for a control that was never possible there.
+#
+# The principle: the control's job is to prove the INSTRUMENT works on the table
+# the marker was counted in, so the table must be one where a control can exist.
+# Collect every discriminating table, then prefer one whose control reads on both
+# images. Refusing only when NO such table exists keeps the arm as strict as it
+# was without failing valid cards (PLEX, 190406a, first card to hit it).
+marker_tables=""
 for t in strings nm; do
   ms=$(count_in "$t" "$STAGED" "$MARKER")
   ml=$(count_in "$t" "$DEST" "$MARKER")
   say "marker $t:\"$MARKER\" staged $ms / live $ml"
-  if [ "$ms" -gt 0 ] && [ "$ml" -eq 0 ]; then marker_table="$t"; fi
+  if [ "$ms" -gt 0 ] && [ "$ml" -eq 0 ]; then marker_tables="$marker_tables $t"; fi
   if [ "$ms" -gt 0 ] && [ "$ml" -gt 0 ]; then
     refuse "marker reads on BOTH images in the $t table: it does not separate the two builds"
   fi
 done
-[ -n "$marker_table" ] || refuse "marker discriminates in NEITHER table: absent from the staged artifact (dead-code-eliminated, or a phrase from a comment, or a string belonging to a different binary)"
+[ -n "$marker_tables" ] || refuse "marker discriminates in NEITHER table: absent from the staged artifact (dead-code-eliminated, or a phrase from a comment, or a string belonging to a different binary)"
+marker_table=""
+if [ -n "$CONTROL" ]; then
+  for t in $marker_tables; do
+    cs=$(count_in "$t" "$STAGED" "$CONTROL")
+    cl=$(count_in "$t" "$DEST" "$CONTROL")
+    if [ "$cs" -gt 0 ] && [ "$cl" -gt 0 ]; then marker_table="$t"; break; fi
+  done
+  [ -n "$marker_table" ] || refuse "the control reads on both images in NONE of the tables where the marker discriminates ($marker_tables): the marker's count is uninformative, because nothing proves the instrument can see that table at all"
+else
+  marker_table="${marker_tables## }"; marker_table="${marker_table%% *}"
+fi
 say "marker discriminates in the $marker_table table"
 if [ -n "$CONTROL" ]; then
   c_staged=$(count_in "$marker_table" "$STAGED" "$CONTROL")
