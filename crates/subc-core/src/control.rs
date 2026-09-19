@@ -2798,8 +2798,41 @@ impl ControlHandler {
             module.retire().await.map_err(|err| {
                 format!("failed to retire module_id '{module_id}' during rescan: {err}")
             })?;
-            self.supervisor.retire(module_id);
+            // TOMBSTONE BEFORE RETIRE, and the order is the whole fix.
+            //
+            // `handle_route_open` resolves an absent module in three steps:
+            // registry, then supervisor status, then tombstone. Retiring first
+            // opens a window where ALL THREE ARE ABSENT -- the registry entry
+            // went with the teardown above, the supervisor entry went with
+            // `retire`, and the tombstone does not exist yet -- so a route.open
+            // landing in it gets `unknown_module` (RETRYABLE, "never heard of
+            // it") for a module that was deliberately removed and whose caller
+            // should get `module_removed` (TERMINAL, carrying a removal age).
+            //
+            // Writing the tombstone first closes it: during the window the
+            // supervisor entry still answers, so the caller gets
+            // `target_unavailable` -- retryable, and TRUE, because the module
+            // is mid-teardown. After both statements it is `module_removed`.
+            // No instant remains where a removed module reads as one that
+            // never existed.
+            //
+            // NOT DETERMINISTICALLY TESTABLE FROM HERE, said plainly because
+            // the absence of a test beside a fix invites deletion: these are
+            // two sync statements with no await between them, so reaching the
+            // window needs a second worker thread to land exactly between them
+            // and there is no hook to force it. MEASURED: the 25 daemon_config
+            // tests pass identically with the old order and the new one, so
+            // the existing suite cannot see this and a green run is not
+            // evidence either way. What the suite does hold is the
+            // post-condition -- a removed module answers `module_removed` --
+            // which this preserves.
+            //
+            // Found by an Athena panel reading the shipped tree against a
+            // design note (2026-09-19), as the one concrete instance of that
+            // note's class that survived contact with source. Direction is
+            // benign: retryable where terminal was intended, never the reverse.
             self.supervisor.record_rescan_removal(module_id);
+            self.supervisor.retire(module_id);
         }
 
         for module_id in configured.keys() {
