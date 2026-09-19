@@ -77,11 +77,14 @@ budget becomes folklore.
     on SIGTERM:
       1. stamp the terminal journal with a daemon-shutdown marker
       2. broadcast route.closing on channel 0 to every connection with routes
-      3. flush the child capture sinks
-      4. wait for quiescence up to a SHORT bounded budget
-      5. exit, whether or not step 4 completed
+      3. wait for quiescence up to a SHORT bounded budget
+      4. exit, whether or not step 3 completed
 
-Step 5 is the design. The handler **must not** try to outlast launchd, because
+A third step, "flush the child capture sinks", stood here and is DELETED: there
+is no buffer to flush, so it would have recovered zero bytes while reading as
+though it addressed the third loss. See that item above.
+
+Step 4 is the design. The handler **must not** try to outlast launchd, because
 a handler that is killed mid-way is strictly worse than one that exited on
 time: it holds the process alive past the point where its work is being
 recorded, and produces a partial teardown nobody can distinguish from a
@@ -108,9 +111,9 @@ new watches immediately and finish the pass they are in, and whether that pass
 completes before launchd's ceiling is a question the notice does not need to
 answer.
 
-Flushing the capture sinks (step 3) belongs before the wait for the same reason:
-it is bounded, it is cheap, and it recovers the third loss on the list
-independently of whether the drain finishes.
+There is no capture-flush step to order, for the reason given above: nothing is
+held, so nothing can be flushed. The third loss is not addressed by this handler
+and the document no longer claims it is.
 
 ## Escalation
 
@@ -140,13 +143,33 @@ The arm that decides it:
 5. the daemon exits within the bounded budget even with a module that
    deliberately refuses to quiesce
 
-Step 3 is the one a weaker implementation passes vacuously: a handler that
-broadcasts *after* closing the listener delivers nothing, and every module still
-exits cleanly by EOF, so steps 1/2/4/5 all pass while the feature does nothing.
-The ordering must be asserted against a module's own observation, not against
-the daemon's intent.
+Step 3 is the one a weaker implementation passes vacuously: a handler that never
+delivers the notice still lets every module exit cleanly by EOF, so the other
+arms all pass while the feature does nothing. **The ordering must be asserted
+against a module's own observation, not against the daemon's intent** — and the
+module must observe the SEQUENCE, since "received both" proves nothing without
+which came first.
 
-Control: with the broadcast removed, step 3 fails by name.
+Controls, and both break the property as the module experiences it:
+
+- with the broadcast removed, step 3 fails by name
+- with established connections closed *before* the broadcast, EOF precedes the
+  notice and step 3 fails by name
+
+The second is the real failure mode rather than a synthetic one: a handler that
+exits or tears connections down without broadcasting is exactly what this
+feature exists to prevent, and it is reachable by ordinary mis-edit.
+
+**AN EARLIER REVISION NAMED THE WRONG MUTATION HERE**, and the error is the one
+this very paragraph warns against. It said "a handler that broadcasts after
+closing the listener delivers nothing". False: `handle_connection` is spawned
+detached (`server.rs:126` drops the JoinHandle) and `AbortTasksOnDrop` holds only
+the accept-loop tasks (`server.rs:149-154`), so closing the listener aborts
+accepts and leaves every established connection running. A test forced red by
+moving the listener close would have asserted a daemon-internal ordering with no
+consequence for any module — reasoning about the daemon's structure while the
+property is about the module's experience. Caught by the mason implementing this,
+reading source against the prose.
 
 ## Non-goals, stated so nobody reads this as more
 
