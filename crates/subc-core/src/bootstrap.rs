@@ -359,6 +359,29 @@ pub async fn run() -> Result<(), BootstrapError> {
     run_with_config(BootstrapConfig::from_env()?).await
 }
 
+/// Serve a daemon from an explicit config. This is the entry point the twelve
+/// sibling repos use to boot an in-process daemon in their integration tests.
+///
+/// # THIS INSTALLS NO TRACING SUBSCRIBER, SO THE DAEMON IS SILENT BY DEFAULT
+///
+/// The daemon's own diagnostics go through `tracing`, and `tracing` DISCARDS
+/// every event when no subscriber is installed. The shipped binary installs one
+/// in `main` (`init_tracing`); this function deliberately does not, because a
+/// library that installs a global subscriber fights with whatever the host
+/// process already set up.
+///
+/// The consequence for a test harness is not "less verbose": it is that the
+/// daemon has NOTHING TO SAY about any failure, and a missing instrument reads
+/// exactly like a clean one. PLEX found this on 2026-09-18 while trying to
+/// capture daemon logs beside an intermittent bind failure, and discovered the
+/// daemon had been silent in every conformance run that repo had ever done --
+/// so the one client-side error string was all the evidence that could exist,
+/// and they had spent a real investigation on a failure whose second source was
+/// never being recorded.
+///
+/// Install one in the harness before calling this, and assert it did something
+/// (they measured 236 daemon lines with the subscriber installed, 0 with the
+/// call commented out) -- otherwise the fix is itself unverified.
 pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapError> {
     let configured_modules = config.configured_modules.clone();
     let storage_config = config.storage_config.clone();
