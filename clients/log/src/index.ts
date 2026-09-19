@@ -12,75 +12,97 @@ export interface Session {
 
 export type FieldValue = string | number | boolean;
 
+/**
+ * Bound context in render order. The array form is canonical because the line
+ * format pins the order fields were bound in; a plain object is accepted at
+ * call sites and keeps its insertion order.
+ */
+export type BoundFields =
+  | ReadonlyArray<readonly [string, FieldValue]>
+  | Record<string, FieldValue>;
+
+/**
+ * One structured event. The field names are the ones the shared golden fixture
+ * (`crates/subc-core/tests/fixtures/log_format_golden.json`) uses, so a case
+ * from it can be rendered without any translation step.
+ */
 export interface LogEvent {
   at_ms: number;
   level: Level;
-  module: string;
-  session: Session | null;
-  tag: string | null;
+  /** Dotted logger name rooted at the module id: `engram`, `engram.gc.walk`. */
+  logger: string;
+  /** Context bound to a scope, rendered in a bracket before the message. */
+  bound?: ReadonlyArray<readonly [string, FieldValue]>;
   message: string;
-  fields: readonly (readonly [string, FieldValue])[];
+  fields: ReadonlyArray<readonly [string, FieldValue]>;
 }
 
 export interface ParsedLine {
   at_ms: number;
   timestamp: string;
   level: Level;
-  module: string;
+  /** The full dotted logger name. */
+  logger: string;
+  /** The logger's first segment, which is always the module id. */
+  moduleId: string;
+  /** Decoded bound fields in the order they were rendered. */
+  bound: Array<[string, string]>;
+  /** The `session=` bound value split at its issuer prefix, when present. */
   session: Session | null;
-  tag: string | null;
   message: string;
   fields: Array<[string, string]>;
 }
 
 export interface LogConfig {
+  /** Stable fleet module id: the root of every logger name and of every file name. */
   moduleId: string;
-  lane:
-    | { kind: "module" }
-    | { kind: "plugin"; harness: string }
-    | { kind: "custom"; path: string };
+  /**
+   * Where the day segments live. Callers normally omit this so the path comes
+   * from the same resolver every store uses; a log then cannot land beside the
+   * wrong module's data.
+   */
+  logsDir?: string;
+  /**
+   * Fields bound for the whole process, rendered first and in this order. A
+   * harness-hosted plugin binds `harness=<name>` here: every lane of a module
+   * shares one file, and this is what tells them apart.
+   */
+  bound?: BoundFields;
+  /** `CK_LOG` override; omitted reads the process environment. */
   spec?: string;
-  retention?: { maxFileMb: number; keep: number; maxAgeDays: number };
-  redactor?: (line: string) => string;
-  clock?: () => number;
-  tags: readonly string[];
+  /** Segments older than this many days are unlinked. Default 14. */
+  maxAgeDays?: number;
+  /** Size at which today's segment is reported as oversized. Default 256 MiB. */
+  alarmSegmentMb?: number;
+  /** Module redactor, applied after the fleet credential redactor. */
+  redact?: (line: string) => string;
+  /** Clock override, for deterministic callers and tests. */
+  clock?: () => Date;
 }
 
 export interface LoggerStats {
   swallowedWrites: number;
   fallbackActive: boolean;
+  /** Directory holding the day segments. */
+  logsDir: string;
+  /** The segment path for the current instant. */
   path: string;
   ansiStripped: number;
 }
 
 export interface Logger {
-  error(
-    message: string,
-    fields?: Record<string, FieldValue>,
-    opts?: { tag?: string; session?: Session },
-  ): void;
-  warn(
-    message: string,
-    fields?: Record<string, FieldValue>,
-    opts?: { tag?: string; session?: Session },
-  ): void;
-  info(
-    message: string,
-    fields?: Record<string, FieldValue>,
-    opts?: { tag?: string; session?: Session },
-  ): void;
-  debug(
-    message: string,
-    fields?: Record<string, FieldValue>,
-    opts?: { tag?: string; session?: Session },
-  ): void;
-  trace(
-    message: string,
-    fields?: Record<string, FieldValue>,
-    opts?: { tag?: string; session?: Session },
-  ): void;
+  error(message: string, fields?: Record<string, FieldValue>): void;
+  warn(message: string, fields?: Record<string, FieldValue>): void;
+  info(message: string, fields?: Record<string, FieldValue>): void;
+  debug(message: string, fields?: Record<string, FieldValue>): void;
+  trace(message: string, fields?: Record<string, FieldValue>): void;
+  /** A logger named `<current>.<component>`, sharing this logger's file. */
+  child(component: string): Logger;
+  /** A logger carrying extra bound fields for a scope of work. */
+  withBound(fields: BoundFields): Logger;
+  /** `withBound` for the canonical session field. Empty halves bind nothing. */
   withSession(issuer: string, id: string): Logger;
-  enabled(level: Level, tag?: string): boolean;
+  enabled(level: Level): boolean;
   stats(): LoggerStats;
   flush(): Promise<void>;
   close(): Promise<void>;
@@ -94,84 +116,146 @@ const LEVEL_RANK: Record<Level, number> = {
   debug: 3,
   trace: 4,
 };
+const SEGMENT_PATTERN = /^[a-z][a-z0-9-]*$/;
 const DAY_MS = 24 * 60 * 60 * 1_000;
+const MIB = 1024 * 1024;
+const DEFAULT_MAX_AGE_DAYS = 14;
+const DEFAULT_ALARM_SEGMENT_MB = 256;
 const REDACTED = "[REDACTED]";
 
 let malformedSpecReported = false;
 let writeFailureReported = false;
+
+/** A level threshold, where "off" emits nothing at all. */
+type Threshold = Level | "off";
+
+interface LevelFilter {
+  /** Applied when no directive matches the logger. */
+  root: Threshold;
+  /** `[dotted prefix, threshold]`, shallowest first so the last hit is the most specific. */
+  directives: Array<[string, Threshold]>;
+}
 
 interface FormatResult {
   line: string;
   ansiStripped: number;
 }
 
-interface ParsedFilter {
-  defaultLevel: Level | "off";
-  tags: Map<string, Level | "off">;
+function isSegment(value: string): boolean {
+  return SEGMENT_PATTERN.test(value);
 }
 
-interface RuntimeRetention {
-  maxFileBytes: number;
-  keep: number;
-  maxAgeDays: number;
-}
-
-function validateToken(label: string, value: string): void {
-  if (value.length === 0 || /\s/.test(value)) {
-    throw new Error(`${label} must be a non-empty token without whitespace`);
+function assertSegment(label: string, value: string): void {
+  if (!isSegment(value)) {
+    throw new Error(`${label} must match [a-z][a-z0-9-]*, got ${JSON.stringify(value)}`);
   }
 }
 
+function assertFieldKey(label: string, key: string): void {
+  if (key.length === 0 || /[\s="\]]/.test(key)) {
+    throw new Error(`${label} must be a non-empty token without whitespace, '=', '"' or ']'`);
+  }
+}
+
+// Backslash is escaped first so a literal `\n` in the text survives as `\\n`
+// and cannot be read back as a newline. Same order as the Rust twin.
 function escapeMessage(value: string): string {
   return value.replaceAll("\\", "\\\\").replaceAll("\r", "\\r").replaceAll("\n", "\\n");
 }
 
 function formatValue(value: FieldValue): string {
-  if (typeof value !== "string") return String(value);
-  if (value !== "" && !/[\s"]/.test(value)) return value;
-  return `"${value
+  const text = typeof value === "string" ? value : String(value);
+  // A `]` is quoted along with the whitespace and quote characters so a bound
+  // value can never be misread as the end of the bracket.
+  if (text !== "" && !/[ "\r\n\]]/.test(text)) {
+    // An unquoted value is verbatim, backslashes included: only the quoted
+    // form has an escape grammar, so only a quoted value is ever decoded.
+    return text;
+  }
+  const escaped = text
     .replaceAll("\\", "\\\\")
+    .replaceAll('"', '\\"')
     .replaceAll("\r", "\\r")
-    .replaceAll("\n", "\\n")
-    .replaceAll('"', '\\"')}"`;
+    .replaceAll("\n", "\\n");
+  return `"${escaped}"`;
 }
 
+/**
+ * Removes terminal escape sequences and counts how many it removed. Both the
+ * 7-bit `ESC` forms and the 8-bit C1 forms are handled, because a log file is
+ * read by `grep` and a dashboard, never by a terminal emulator.
+ */
 function stripAnsi(value: string): { value: string; count: number } {
+  if (!/[\u001b\u0080-\u009f]/.test(value)) return { value, count: 0 };
+
+  let output = "";
   let count = 0;
-  const stripped = value.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, () => {
+  let index = 0;
+  while (index < value.length) {
+    const char = value[index]!;
+    const isEscape = char === "\u001b";
+    const isControlSequence = isEscape ? value[index + 1] === "[" : char === "\u009b";
+    const isOperatingSystemCommand = isEscape ? value[index + 1] === "]" : char === "\u009d";
+
+    if (!isEscape && (char < "\u0080" || char > "\u009f")) {
+      output += char;
+      index += 1;
+      continue;
+    }
+
+    let cursor = index + (isEscape ? 2 : 1);
+    if (isEscape && value[index + 1] === undefined) cursor = index + 1;
+    if (isControlSequence) {
+      while (cursor < value.length) {
+        const code = value.charCodeAt(cursor);
+        cursor += 1;
+        if (code >= 0x40 && code <= 0x7e) break;
+      }
+    } else if (isOperatingSystemCommand) {
+      while (cursor < value.length) {
+        const code = value.charCodeAt(cursor);
+        if (code === 0x07 || code === 0x9c) {
+          cursor += 1;
+          break;
+        }
+        if (code === 0x1b && value[cursor + 1] === "\\") {
+          cursor += 2;
+          break;
+        }
+        cursor += 1;
+      }
+    }
     count += 1;
-    return "";
-  });
-  return { value: stripped, count };
+    index = cursor;
+  }
+  return { value: output, count };
 }
 
 function formatLineWithStats(event: LogEvent): FormatResult {
   if (!LEVELS.includes(event.level)) throw new Error(`unknown log level: ${String(event.level)}`);
-  validateToken("module", event.module);
-  if (event.session) {
-    validateToken("session issuer", event.session.issuer);
-    validateToken("session id", event.session.id);
+  for (const segment of event.logger.split(".")) assertSegment("logger segment", segment);
+
+  let line = `${new Date(event.at_ms).toISOString()} ${event.level
+    .toUpperCase()
+    .padEnd(5, " ")} ${event.logger}:`;
+
+  const bound = event.bound ?? [];
+  // Nothing bound renders no bracket at all: "nothing is bound" and "an empty
+  // context" are different facts, and only the first one is ever true.
+  if (bound.length > 0) {
+    const rendered = bound.map(([key, value]) => {
+      assertFieldKey("bound field key", key);
+      return `${key}=${formatValue(value)}`;
+    });
+    line += ` [${rendered.join(" ")}]`;
   }
-  if (event.tag !== null) validateToken("tag", event.tag);
-
-  const timestamp = new Date(event.at_ms).toISOString();
-  const columns = [
-    timestamp,
-    event.level.toUpperCase().padEnd(5, " "),
-    event.module,
-  ];
-  if (event.session) columns.push(`session=${event.session.issuer}:${event.session.id}`);
-  if (event.tag !== null) columns.push(`tag=${event.tag}`);
-  columns.push(escapeMessage(event.message));
-
+  if (event.message !== "") line += ` ${escapeMessage(event.message)}`;
   for (const [key, value] of event.fields) {
-    if (key.length === 0 || /[\s=]/.test(key)) {
-      throw new Error("log field keys must be non-empty tokens without whitespace or '='");
-    }
-    columns.push(`${key}=${formatValue(value)}`);
+    assertFieldKey("event field key", key);
+    line += ` ${key}=${formatValue(value)}`;
   }
 
-  const stripped = stripAnsi(columns.join(" "));
+  const stripped = stripAnsi(line);
   return { line: stripped.value, ansiStripped: stripped.count };
 }
 
@@ -180,40 +264,50 @@ export function formatLine(event: LogEvent): string {
   return formatLineWithStats(event).line;
 }
 
-function tokenizeColumns(input: string): string[] | null {
-  const tokens: string[] = [];
-  let token = "";
+interface Token {
+  text: string;
+  start: number;
+}
+
+/** Splits on unquoted spaces, keeping each token's offset and its quoting intact. */
+function tokenize(input: string): Token[] | null {
+  const tokens: Token[] = [];
+  let text = "";
+  let start = 0;
   let quoted = false;
   let escaped = false;
 
-  for (const char of input) {
+  for (let index = 0; index < input.length; index += 1) {
+    const char = input[index]!;
     if (escaped) {
-      token += char;
+      text += char;
       escaped = false;
       continue;
     }
     if (quoted && char === "\\") {
-      token += char;
+      text += char;
       escaped = true;
       continue;
     }
     if (char === '"') {
       quoted = !quoted;
-      token += char;
+      text += char;
       continue;
     }
     if (char === " " && !quoted) {
-      if (token.length > 0) {
-        tokens.push(token);
-        token = "";
+      if (text.length > 0) {
+        tokens.push({ text, start });
+        text = "";
       }
+      start = index + 1;
       continue;
     }
-    token += char;
+    if (text.length === 0) start = index;
+    text += char;
   }
 
   if (quoted || escaped) return null;
-  if (token.length > 0) tokens.push(token);
+  if (text.length > 0) tokens.push({ text, start });
   return tokens;
 }
 
@@ -230,7 +324,6 @@ function decodeEscapedText(value: string): string | null {
     const escaped = value[index];
     if (escaped === "n") decoded += "\n";
     else if (escaped === "r") decoded += "\r";
-    else if (escaped === '"' || escaped === "\\") decoded += escaped;
     else decoded += escaped;
   }
   return decoded;
@@ -249,15 +342,53 @@ function decodeFieldToken(token: string): [string, string] | null {
   return value === null ? null : [key, value];
 }
 
+// The bracket closes at the first `]` outside a quoted value. A bound value
+// containing `]` was quoted by the renderer for exactly this reason, so a
+// plain search for `]` would split a path like `[root="a]b"]` in the middle.
+function findBracketClose(input: string): number {
+  let quoted = false;
+  let escaped = false;
+  for (let index = 0; index < input.length; index += 1) {
+    const char = input[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (quoted && char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (char === '"') quoted = !quoted;
+    else if (char === "]" && !quoted) return index;
+  }
+  return -1;
+}
+
+function splitSession(value: string): Session | null {
+  const separator = value.lastIndexOf(":");
+  if (separator <= 0 || separator === value.length - 1) return null;
+  return { issuer: value.slice(0, separator), id: value.slice(separator + 1) };
+}
+
+const LEVEL_COLUMNS: ReadonlyArray<readonly [string, Level]> = [
+  ["TRACE ", "trace"],
+  ["DEBUG ", "debug"],
+  ["INFO  ", "info"],
+  ["WARN  ", "warn"],
+  ["ERROR ", "error"],
+];
+
 /** Parse a canonical fleet line, returning a stable reason for malformed input. */
 export function parseLine(line: string): ParsedLine | { reject: string } {
-  if (/\x1b\[/.test(line)) return { reject: "ansi_forbidden" };
+  if (/[\u001b\u009b]/.test(line)) return { reject: "ansi_forbidden" };
+  if (/[\r\n]/.test(line)) return { reject: "line_break" };
 
   const timestampEnd = line.indexOf(" ");
-  if (timestampEnd < 0) return { reject: "timestamp_not_utc_z" };
+  if (timestampEnd < 0) return { reject: "timestamp_missing" };
   const timestamp = line.slice(0, timestampEnd);
+  if (!timestamp.endsWith("Z")) return { reject: "timestamp_not_utc_z" };
   if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(timestamp)) {
-    return { reject: "timestamp_not_utc_z" };
+    return { reject: "timestamp_precision" };
   }
   const atMs = Date.parse(timestamp);
   if (!Number.isFinite(atMs) || new Date(atMs).toISOString() !== timestamp) {
@@ -265,68 +396,85 @@ export function parseLine(line: string): ParsedLine | { reject: string } {
   }
 
   const afterTimestamp = line.slice(timestampEnd + 1);
-  const levelColumn = afterTimestamp.slice(0, 5);
-  const levelText = levelColumn.trim().toLowerCase();
-  if (
-    afterTimestamp.length < 7 ||
-    afterTimestamp[5] !== " " ||
-    !LEVELS.includes(levelText as Level) ||
-    levelColumn !== levelText.toUpperCase().padEnd(5, " ")
-  ) {
-    return { reject: "level_column_width" };
+  const column = LEVEL_COLUMNS.find(([prefix]) => afterTimestamp.startsWith(prefix));
+  if (!column) {
+    const named = LEVELS.some((level) => afterTimestamp.startsWith(level.toUpperCase()));
+    return { reject: named ? "level_column_width" : "level_invalid" };
   }
+  const afterLevel = afterTimestamp.slice(column[0].length);
 
-  const afterLevel = afterTimestamp.slice(6);
-  const moduleEnd = afterLevel.indexOf(" ");
-  if (moduleEnd <= 0) return { reject: "module_missing" };
-  const module = afterLevel.slice(0, moduleEnd);
-  const tokens = tokenizeColumns(afterLevel.slice(moduleEnd + 1));
-  if (!tokens || tokens.length === 0) return { reject: "message_missing" };
+  // The logger runs to the first space and MUST end in a colon. A line in the
+  // older format (`fusiform poll changed`) has no colon and fails here by
+  // design: the colon is what separates the logger from a one-word message.
+  const loggerEnd = afterLevel.indexOf(" ");
+  const loggerToken = loggerEnd < 0 ? afterLevel : afterLevel.slice(0, loggerEnd);
+  let body = loggerEnd < 0 ? "" : afterLevel.slice(loggerEnd + 1);
+  if (!loggerToken.endsWith(":")) return { reject: "logger_not_terminated" };
+  const logger = loggerToken.slice(0, -1);
+  if (logger.length === 0) return { reject: "logger_missing" };
+  const segments = logger.split(".");
+  if (!segments.every(isSegment)) return { reject: "logger_segment_grammar" };
 
-  let cursor = 0;
-  let session: Session | null = null;
-  let tag: string | null = null;
-  const sessionToken = tokens[cursor];
-  if (sessionToken?.startsWith("session=")) {
-    const sessionValue = sessionToken.slice("session=".length);
-    const separator = sessionValue.lastIndexOf(":");
-    if (separator <= 0 || separator === sessionValue.length - 1) {
+  const bound: Array<[string, string]> = [];
+  let hadBracket = false;
+  if (body.startsWith("[")) {
+    const rest = body.slice(1);
+    const close = findBracketClose(rest);
+    if (close < 0) return { reject: "bound_unterminated" };
+    const inside = rest.slice(0, close);
+    if (inside.length === 0) return { reject: "empty_bound_bracket" };
+    const boundTokens = tokenize(inside);
+    if (!boundTokens) return { reject: "bound_field_grammar" };
+    for (const token of boundTokens) {
+      const pair = decodeFieldToken(token.text);
+      if (!pair) return { reject: "bound_field_grammar" };
+      bound.push(pair);
+    }
+    const sessionPair = bound.find(([key]) => key === "session");
+    // `session=global` and other issuer-less placeholders fail on their
+    // missing `issuer:` half, so no particular sentinel has to be known here.
+    if (sessionPair && !splitSession(sessionPair[1])) {
       return { reject: "session_missing_issuer" };
     }
-    session = {
-      issuer: sessionValue.slice(0, separator),
-      id: sessionValue.slice(separator + 1),
-    };
-    cursor += 1;
-  }
-  const tagToken = tokens[cursor];
-  if (tagToken?.startsWith("tag=")) {
-    tag = tagToken.slice("tag=".length);
-    if (tag.length === 0) return { reject: "tag_missing" };
-    cursor += 1;
+    hadBracket = true;
+    const afterBracket = rest.slice(close + 1);
+    body = afterBracket.startsWith(" ") ? afterBracket.slice(1) : afterBracket;
   }
 
-  const remaining = tokens.slice(cursor);
-  let fieldsStart = remaining.length;
-  for (let index = 0; index < remaining.length; index += 1) {
-    if (remaining.slice(index).every((token) => decodeFieldToken(token) !== null)) {
+  // A bracket AFTER the message is not context: context precedes the message so
+  // its column stays stable. Rejecting it keeps writers from putting it wherever
+  // and losing that property; a trailing bracket is an event field value.
+  if (!hadBracket && body.includes(" [") && body.endsWith("]")) {
+    return { reject: "bound_after_message" };
+  }
+
+  const tokens = tokenize(body);
+  if (!tokens) return { reject: "field_quoting_invalid" };
+
+  // Nothing marks where the message ends and the fields begin, so the split is
+  // the earliest point from which every remaining token parses as `key=value`.
+  let fieldsStart = tokens.length;
+  for (let index = 0; index < tokens.length; index += 1) {
+    if (tokens.slice(index).every((token) => decodeFieldToken(token.text) !== null)) {
       fieldsStart = index;
       break;
     }
   }
-  if (fieldsStart === 0) return { reject: "message_missing" };
 
-  const fields = remaining.slice(fieldsStart).map((token) => decodeFieldToken(token)!);
-  const message = decodeEscapedText(remaining.slice(0, fieldsStart).join(" "));
+  const session = bound.find(([key]) => key === "session");
+  const fields = tokens.slice(fieldsStart).map((token) => decodeFieldToken(token.text)!);
+  const messageEnd = fieldsStart < tokens.length ? tokens[fieldsStart]!.start : body.length;
+  const message = decodeEscapedText(body.slice(0, messageEnd).trimEnd());
   if (message === null) return { reject: "message_escape_invalid" };
 
   return {
     at_ms: atMs,
     timestamp,
-    level: levelText as Level,
-    module,
-    session,
-    tag,
+    level: column[1],
+    logger,
+    moduleId: segments[0]!,
+    bound,
+    session: session === undefined ? null : splitSession(session[1]),
     message,
     fields,
   };
@@ -340,54 +488,80 @@ function reportStderr(message: string): void {
   }
 }
 
-function parseFilter(spec: string, declaredTags: ReadonlySet<string>): ParsedFilter {
-  const fallback = (): ParsedFilter => ({ defaultLevel: "info", tags: new Map() });
-  if (spec.trim() === "") return fallback();
-
-  let defaultLevel: Level | "off" = "info";
-  const tags = new Map<string, Level | "off">();
-  let malformed = false;
-
-  for (const rawDirective of spec.split(",")) {
-    const directive = rawDirective.trim();
-    if (directive === "") {
-      malformed = true;
-      break;
-    }
-    const equals = directive.indexOf("=");
-    if (equals < 0) {
-      if (directive === "off" || LEVELS.includes(directive as Level)) {
-        defaultLevel = directive as Level | "off";
-      }
-      continue;
-    }
-    if (equals === 0 || equals !== directive.lastIndexOf("=") || equals === directive.length - 1) {
-      malformed = true;
-      break;
-    }
-
-    const tag = directive.slice(0, equals);
-    const level = directive.slice(equals + 1);
-    if (!declaredTags.has(tag)) continue;
-    if (level !== "off" && !LEVELS.includes(level as Level)) {
-      malformed = true;
-      break;
-    }
-    tags.set(tag, level as Level | "off");
-  }
-
-  if (malformed) {
-    if (!malformedSpecReported) {
-      malformedSpecReported = true;
-      reportStderr("@cortexkit/log: malformed CK_LOG; using info");
-    }
-    return fallback();
-  }
-  return { defaultLevel, tags };
+function parseThreshold(text: string): Threshold | null {
+  const lowered = text.toLowerCase();
+  if (lowered === "off") return "off";
+  return LEVELS.includes(lowered as Level) ? (lowered as Level) : null;
 }
 
-function permits(filterLevel: Level | "off", eventLevel: Level): boolean {
-  return filterLevel !== "off" && LEVEL_RANK[eventLevel] <= LEVEL_RANK[filterLevel];
+/**
+ * Parses `CK_LOG` in `RUST_LOG`'s grammar: comma-separated directives, each
+ * `<logger>=<level>` or a bare `<level>` that sets the root default.
+ */
+function parseSpec(spec: string): LevelFilter | { error: string } {
+  let root: Threshold = "info";
+  const directives: Array<[string, Threshold]> = [];
+
+  for (const raw of spec.split(",")) {
+    const directive = raw.trim();
+    if (directive === "") continue;
+    const equals = directive.indexOf("=");
+    if (equals < 0) {
+      const level = parseThreshold(directive);
+      if (level === null) return { error: `unknown level: ${JSON.stringify(directive)}` };
+      root = level;
+      continue;
+    }
+    const logger = directive.slice(0, equals).trim();
+    const levelText = directive.slice(equals + 1).trim();
+    if (logger === "" || !logger.split(".").every(isSegment)) {
+      return { error: `logger name is not <segment>(.<segment>)*: ${JSON.stringify(directive)}` };
+    }
+    if (levelText === "") {
+      return { error: `directive has no level after '=': ${JSON.stringify(directive)}` };
+    }
+    const level = parseThreshold(levelText);
+    if (level === null) return { error: `unknown level: ${JSON.stringify(directive)}` };
+    directives.push([logger, level]);
+  }
+
+  // Shallowest first, so a single scan that keeps the last hit is "most
+  // specific directive wins". Array sort is stable, so directives of equal
+  // depth keep the order they were written in.
+  directives.sort(([left], [right]) => left.split(".").length - right.split(".").length);
+  return { root, directives };
+}
+
+// A directive names a prefix on DOTTED SEGMENTS, not on characters: `aft`
+// covers `aft` and `aft.index`, and does not cover `aftershock`.
+function coversLogger(prefix: string, logger: string): boolean {
+  if (!logger.startsWith(prefix)) return false;
+  const rest = logger.slice(prefix.length);
+  return rest === "" || rest.startsWith(".");
+}
+
+function filterAllows(filter: LevelFilter, logger: string, level: Level): boolean {
+  let threshold = filter.root;
+  for (const [prefix, directive] of filter.directives) {
+    if (coversLogger(prefix, logger)) threshold = directive;
+  }
+  return threshold !== "off" && LEVEL_RANK[level] <= LEVEL_RANK[threshold];
+}
+
+function resolveFilter(specOverride: string | undefined): LevelFilter {
+  const raw = (specOverride ?? process.env.CK_LOG ?? "").trim();
+  if (raw === "") return { root: "info", directives: [] };
+  const parsed = parseSpec(raw);
+  if ("error" in parsed) {
+    if (!malformedSpecReported) {
+      malformedSpecReported = true;
+      reportStderr(
+        `@cortexkit/log: invalid CK_LOG value ${JSON.stringify(raw)}; using info: ${parsed.error}`,
+      );
+    }
+    return { root: "info", directives: [] };
+  }
+  return parsed;
 }
 
 /** Redact known credential shapes before optional caller redaction. */
@@ -404,96 +578,139 @@ function defaultRedactor(line: string): string {
     .replace(/\b(?:ghp|gho)_[A-Za-z0-9_-]+\b/g, REDACTED);
 }
 
-function resolveLogPath(config: LogConfig): string {
-  // A custom lane names its file outright; resolving the module data dir for
-  // it would let the store's module-id validation refuse a path the caller
-  // already chose.
-  if (config.lane.kind === "custom") return config.lane.path;
-  const dataDir = moduleDataDir(config.moduleId);
-  if (config.lane.kind === "module") {
-    return path.join(dataDir, "logs", `${config.moduleId}.log`);
-  }
-  validateToken("plugin harness", config.lane.harness);
-  if (config.lane.harness === "." || config.lane.harness === ".." || /[/\\]/.test(config.lane.harness)) {
-    throw new Error("plugin harness must not contain path separators");
-  }
-  return path.join(dataDir, "logs", `${config.moduleId}.${config.lane.harness}.log`);
+function utcDay(at: Date): string {
+  return at.toISOString().slice(0, 10);
 }
 
-function runtimeRetention(config: LogConfig): RuntimeRetention {
-  const configured = config.retention ?? { maxFileMb: 32, keep: 2, maxAgeDays: 14 };
-  const hiddenBytes = (configured as typeof configured & { maxFileBytes?: number }).maxFileBytes;
-  const maxFileBytes = hiddenBytes ?? configured.maxFileMb * 1024 * 1024;
-  if (!Number.isFinite(maxFileBytes) || maxFileBytes <= 0) {
-    throw new Error("retention max file size must be positive");
-  }
-  if (!Number.isInteger(configured.keep) || configured.keep < 0) {
-    throw new Error("retention keep must be a non-negative integer");
-  }
-  if (!Number.isFinite(configured.maxAgeDays) || configured.maxAgeDays < 0) {
-    throw new Error("retention maxAgeDays must be non-negative");
-  }
-  return { maxFileBytes, keep: configured.keep, maxAgeDays: configured.maxAgeDays };
+/** The file name for a module's segment on the UTC day containing `at`. */
+export function segmentName(moduleId: string, at: Date): string {
+  return `${moduleId}.${utcDay(at)}.log`;
 }
 
-class FileSink {
-  readonly path: string;
-  readonly retention: RuntimeRetention;
-  readonly clock: () => number;
-  readonly callerRedactor?: (line: string) => string;
+/**
+ * The UTC day in `<module_id>.<YYYY-MM-DD>.log`, or null for any name that is
+ * not exactly that shape — another module's segment, a stderr capture, a
+ * pid-suffixed file from the previous format, or a date that is not a real
+ * calendar day. Those are left alone rather than guessed at.
+ */
+export function segmentDay(moduleId: string, fileName: string): string | null {
+  const prefix = `${moduleId}.`;
+  const suffix = ".log";
+  if (!fileName.startsWith(prefix) || !fileName.endsWith(suffix)) return null;
+  const day = fileName.slice(prefix.length, fileName.length - suffix.length);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return null;
+  const parsed = Date.parse(`${day}T00:00:00.000Z`);
+  if (!Number.isFinite(parsed)) return null;
+  // Rejects a date that parses loosely but is not the day it spells, such as
+  // a month of 13 or a 30th of February.
+  return utcDay(new Date(parsed)) === day ? day : null;
+}
+
+function dayOffset(day: string, days: number): string {
+  return utcDay(new Date(Date.parse(`${day}T00:00:00.000Z`) - days * DAY_MS));
+}
+
+/**
+ * The segments to unlink, decided by the date in the file name alone: no stat,
+ * no mtime. The boundary day (`today - maxAgeDays`) is KEPT, so `maxAgeDays: 0`
+ * keeps today only and the active segment is never a candidate.
+ */
+export function pruneCandidates(
+  moduleId: string,
+  today: string,
+  maxAgeDays: number,
+  present: readonly string[],
+): string[] {
+  const boundary = dayOffset(today, maxAgeDays);
+  return present.filter((name) => {
+    const day = segmentDay(moduleId, name);
+    return day !== null && day < boundary;
+  });
+}
+
+interface SinkOptions {
+  moduleId: string;
+  logsDir: string;
+  maxAgeDays: number;
+  alarmBytes: number;
+  clock: () => Date;
+  redact?: (line: string) => string;
+}
+
+/**
+ * Appends to `<logsDir>/<moduleId>.<UTC day>.log`, reopening when the day
+ * rolls. The name is never renamed, which is what lets every process of a
+ * module — the module itself and each harness-hosted plugin — share one file:
+ * each writer derives the same name from the clock and opens it `O_APPEND`, so
+ * the kernel lands every line whole with no lock and no coordinator.
+ */
+class SegmentSink {
+  readonly moduleId: string;
+  readonly logsDir: string;
+  readonly maxAgeDays: number;
+  readonly alarmBytes: number;
+  readonly clock: () => Date;
+  readonly redact?: (line: string) => string;
   swallowedWrites = 0;
   fallbackActive = false;
   ansiStripped = 0;
   private fd: number | null = null;
-  private bytesWritten = 0;
+  private openDay: string | null = null;
+  private alarmed = false;
   private closed = false;
 
-  constructor(config: LogConfig) {
-    this.path = resolveLogPath(config);
-    this.retention = runtimeRetention(config);
-    this.clock = config.clock ?? Date.now;
-    this.callerRedactor = config.redactor;
+  constructor(options: SinkOptions) {
+    this.moduleId = options.moduleId;
+    this.logsDir = options.logsDir;
+    this.maxAgeDays = options.maxAgeDays;
+    this.alarmBytes = options.alarmBytes;
+    this.clock = options.clock;
+    this.redact = options.redact;
 
     try {
-      const directory = path.dirname(this.path);
-      fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-      if (process.platform !== "win32") fs.chmodSync(directory, 0o700);
-      this.pruneGenerations(this.clock());
-      this.openActive();
+      fs.mkdirSync(this.logsDir, { recursive: true, mode: 0o700 });
+      if (process.platform !== "win32") fs.chmodSync(this.logsDir, 0o700);
+      this.rollTo(utcDay(this.clock()));
     } catch (error) {
       this.fallbackActive = true;
       reportStderr(
-        `@cortexkit/log: cannot open ${this.path}; falling back to stderr: ${String(error)}`,
+        `@cortexkit/log: cannot open ${this.pathNow()}; falling back to stderr: ${String(error)}`,
       );
     }
   }
 
-  write(line: string, now: number, ansiCount: number): void {
+  pathNow(): string {
+    return path.join(this.logsDir, segmentName(this.moduleId, this.clock()));
+  }
+
+  write(line: string, at: Date, ansiCount: number): void {
     this.ansiStripped += ansiCount;
     try {
       let redacted = defaultRedactor(line);
-      if (this.callerRedactor) redacted = this.callerRedactor(redacted);
+      if (this.redact) redacted = this.redact(redacted);
       const clean = stripAnsi(redacted);
       this.ansiStripped += clean.count;
-      const output = `${clean.value}\n`;
+      // Redactors are extension points, so the last guard before the write
+      // keeps the one-line, no-ANSI contract even when one introduces a break.
+      const guarded = clean.value.replaceAll("\r", "\\r").replaceAll("\n", "\\n");
+      const output = `${guarded}\n`;
 
       if (this.fallbackActive) {
         process.stderr.write(output);
         return;
       }
-      if (this.closed || this.fd === null) throw new Error("log sink is closed");
+      if (this.closed) throw new Error("log sink is closed");
 
+      const today = utcDay(at);
+      if (this.openDay !== today) this.rollTo(today);
+      if (this.fd === null) throw new Error("log segment is not open");
+
+      // Harness-hosted plugins can exit without draining timers, so a complete
+      // line is assembled first and issued as one synchronous write.
       const byteLength = Buffer.byteLength(output);
-      if (this.bytesWritten > 0 && this.bytesWritten + byteLength > this.retention.maxFileBytes) {
-        this.rotate(now);
-      }
-      if (this.fd === null) throw new Error("log sink is unavailable after rotation");
-
-      // Harness-hosted plugins can exit without draining timers. A complete line is
-      // therefore assembled first and issued as one synchronous write, preserving the tail.
       const written = fs.writeSync(this.fd, output, null, "utf8");
       if (written !== byteLength) throw new Error(`short log write (${written}/${byteLength})`);
-      this.bytesWritten += written;
+      this.reportOversize();
     } catch (error) {
       this.swallowedWrites += 1;
       if (!writeFailureReported) {
@@ -507,125 +724,166 @@ class FileSink {
     return {
       swallowedWrites: this.swallowedWrites,
       fallbackActive: this.fallbackActive,
-      path: this.path,
+      logsDir: this.logsDir,
+      path: this.pathNow(),
       ansiStripped: this.ansiStripped,
     };
   }
 
   async flush(): Promise<void> {
-    // Synchronous writes leave no library-owned timer buffer for flush to drain.
+    // Synchronous writes leave no library-owned buffer for flush to drain.
   }
 
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
-    if (this.fd !== null) {
-      try {
-        fs.closeSync(this.fd);
-      } catch (error) {
-        this.swallowedWrites += 1;
-        if (!writeFailureReported) {
-          writeFailureReported = true;
-          reportStderr(`@cortexkit/log: log close failed: ${String(error)}`);
-        }
-      } finally {
-        this.fd = null;
+    if (this.fd === null) return;
+    try {
+      fs.closeSync(this.fd);
+    } catch (error) {
+      this.swallowedWrites += 1;
+      if (!writeFailureReported) {
+        writeFailureReported = true;
+        reportStderr(`@cortexkit/log: log close failed: ${String(error)}`);
       }
+    } finally {
+      this.fd = null;
     }
   }
 
-  private openActive(): void {
-    this.fd = fs.openSync(
-      this.path,
-      fs.constants.O_APPEND | fs.constants.O_CREAT | fs.constants.O_WRONLY,
-      0o600,
-    );
-    if (process.platform !== "win32") fs.chmodSync(this.path, 0o600);
-    this.bytesWritten = fs.fstatSync(this.fd).size;
-  }
-
-  private rotate(now: number): void {
+  // Opening a segment also prunes: the writer is the only party that runs
+  // whenever the module runs, so it is the only one that can bound the set
+  // without a daemon.
+  private rollTo(day: string): void {
     if (this.fd !== null) {
       fs.closeSync(this.fd);
       this.fd = null;
     }
-
-    if (this.retention.keep === 0) {
-      if (fs.existsSync(this.path)) fs.unlinkSync(this.path);
-    } else {
-      const oldest = `${this.path}.${this.retention.keep}`;
-      if (fs.existsSync(oldest)) fs.unlinkSync(oldest);
-      for (let generation = this.retention.keep - 1; generation >= 1; generation -= 1) {
-        const source = `${this.path}.${generation}`;
-        if (fs.existsSync(source)) fs.renameSync(source, `${this.path}.${generation + 1}`);
-      }
-      if (fs.existsSync(this.path)) fs.renameSync(this.path, `${this.path}.1`);
+    const pruned = this.prune(day);
+    const segmentPath = path.join(this.logsDir, `${this.moduleId}.${day}.log`);
+    this.fd = fs.openSync(segmentPath, "a", 0o600);
+    if (process.platform !== "win32") fs.chmodSync(segmentPath, 0o600);
+    this.openDay = day;
+    this.alarmed = false;
+    // A feature that fires later has to say that it fired: without this line,
+    // "retention never ran" and "ran and found nothing" look the same from
+    // outside the process.
+    if (pruned.removed > 0) {
+      reportStderr(
+        `@cortexkit/log: ${this.moduleId}.retention pruned=${pruned.removed} kept=${pruned.kept}`,
+      );
     }
-
-    this.openActive();
-    this.pruneGenerations(now);
   }
 
-  private pruneGenerations(now: number): void {
-    const cutoff = now - this.retention.maxAgeDays * DAY_MS;
-    for (let generation = 1; generation <= this.retention.keep; generation += 1) {
-      const generationPath = `${this.path}.${generation}`;
+  private prune(today: string): { removed: number; kept: number } {
+    const segments = fs
+      .readdirSync(this.logsDir)
+      .filter((name) => segmentDay(this.moduleId, name) !== null);
+    const doomed = pruneCandidates(this.moduleId, today, this.maxAgeDays, segments);
+    for (const name of doomed) {
       try {
-        if (fs.statSync(generationPath).mtimeMs < cutoff) fs.unlinkSync(generationPath);
+        fs.unlinkSync(path.join(this.logsDir, name));
       } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code;
-        if (code !== "ENOENT") throw error;
+        // Another writer for this module pruned it first. That is the design
+        // working, not a failure.
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       }
     }
+    return { removed: doomed.length, kept: segments.length - doomed.length };
   }
+
+  // Reported once per segment, because a module writing this much in a day has
+  // a defect worth surfacing and a runaway writer must not get a second flood
+  // from its own alarm. The segment is never truncated: that would hide it.
+  private reportOversize(): void {
+    if (this.alarmed || this.fd === null) return;
+    const size = fs.fstatSync(this.fd).size;
+    if (size <= this.alarmBytes) return;
+    this.alarmed = true;
+    reportStderr(
+      `@cortexkit/log: segment oversized, NOT truncated: path=${path.join(
+        this.logsDir,
+        `${this.moduleId}.${this.openDay}.log`,
+      )} bytes=${size}`,
+    );
+  }
+}
+
+function boundPairs(fields: BoundFields): ReadonlyArray<readonly [string, FieldValue]> {
+  return Array.isArray(fields)
+    ? (fields as ReadonlyArray<readonly [string, FieldValue]>)
+    : Object.entries(fields as Record<string, FieldValue>);
+}
+
+/**
+ * Merges bound fields left to right: an existing key is overwritten IN PLACE so
+ * an inner scope refines an outer one without moving the bracket's columns, and
+ * a new key is appended. An empty value binds nothing — a line carries no field
+ * rather than a `key=` with no value.
+ */
+function mergeBound(
+  base: ReadonlyArray<readonly [string, string]>,
+  additions: BoundFields,
+): Array<[string, string]> {
+  const merged: Array<[string, string]> = base.map(([key, value]) => [key, value]);
+  for (const [key, rawValue] of boundPairs(additions)) {
+    assertFieldKey("bound field key", key);
+    const value = typeof rawValue === "string" ? rawValue : String(rawValue);
+    if (value === "") continue;
+    const existing = merged.findIndex(([candidate]) => candidate === key);
+    if (existing >= 0) merged[existing] = [key, value];
+    else merged.push([key, value]);
+  }
+  return merged;
 }
 
 class LoggerImpl implements Logger {
   constructor(
-    private readonly moduleId: string,
-    private readonly declaredTags: ReadonlySet<string>,
-    private readonly filter: ParsedFilter,
-    private readonly sink: FileSink,
-    private readonly session: Session | null,
+    private readonly logger: string,
+    private readonly bound: ReadonlyArray<readonly [string, string]>,
+    private readonly filter: LevelFilter,
+    private readonly sink: SegmentSink,
   ) {}
 
-  error(message: string, fields?: Record<string, FieldValue>, opts?: { tag?: string; session?: Session }): void {
-    this.log("error", message, fields, opts);
+  error(message: string, fields?: Record<string, FieldValue>): void {
+    this.log("error", message, fields);
   }
 
-  warn(message: string, fields?: Record<string, FieldValue>, opts?: { tag?: string; session?: Session }): void {
-    this.log("warn", message, fields, opts);
+  warn(message: string, fields?: Record<string, FieldValue>): void {
+    this.log("warn", message, fields);
   }
 
-  info(message: string, fields?: Record<string, FieldValue>, opts?: { tag?: string; session?: Session }): void {
-    this.log("info", message, fields, opts);
+  info(message: string, fields?: Record<string, FieldValue>): void {
+    this.log("info", message, fields);
   }
 
-  debug(message: string, fields?: Record<string, FieldValue>, opts?: { tag?: string; session?: Session }): void {
-    this.log("debug", message, fields, opts);
+  debug(message: string, fields?: Record<string, FieldValue>): void {
+    this.log("debug", message, fields);
   }
 
-  trace(message: string, fields?: Record<string, FieldValue>, opts?: { tag?: string; session?: Session }): void {
-    this.log("trace", message, fields, opts);
+  trace(message: string, fields?: Record<string, FieldValue>): void {
+    this.log("trace", message, fields);
+  }
+
+  child(component: string): Logger {
+    assertSegment("logger component", component);
+    return new LoggerImpl(`${this.logger}.${component}`, this.bound, this.filter, this.sink);
+  }
+
+  withBound(fields: BoundFields): Logger {
+    return new LoggerImpl(this.logger, mergeBound(this.bound, fields), this.filter, this.sink);
   }
 
   withSession(issuer: string, id: string): Logger {
-    validateToken("session issuer", issuer);
-    validateToken("session id", id);
-    return new LoggerImpl(
-      this.moduleId,
-      this.declaredTags,
-      this.filter,
-      this.sink,
-      { issuer, id },
-    );
+    // An empty half means "no session": the line carries no field rather than
+    // a placeholder, because a placeholder is greppable against nothing.
+    if (issuer === "" || id === "") return this;
+    return this.withBound([["session", `${issuer}:${id}`]]);
   }
 
-  enabled(level: Level, tag?: string): boolean {
+  enabled(level: Level): boolean {
     if (!LEVELS.includes(level)) throw new Error(`unknown log level: ${String(level)}`);
-    this.assertDeclaredTag(tag);
-    const configured = tag ? (this.filter.tags.get(tag) ?? this.filter.defaultLevel) : this.filter.defaultLevel;
-    return permits(configured, level);
+    return filterAllows(this.filter, this.logger, level);
   }
 
   stats(): LoggerStats {
@@ -640,43 +898,79 @@ class LoggerImpl implements Logger {
     return this.sink.close();
   }
 
-  private log(
-    level: Level,
-    message: string,
-    fields?: Record<string, FieldValue>,
-    opts?: { tag?: string; session?: Session },
-  ): void {
-    this.assertDeclaredTag(opts?.tag);
-    if (!this.enabled(level, opts?.tag)) return;
-    const now = this.sink.clock();
+  private log(level: Level, message: string, fields?: Record<string, FieldValue>): void {
+    if (!this.enabled(level)) return;
+    const at = this.sink.clock();
     const formatted = formatLineWithStats({
-      at_ms: now,
+      at_ms: at.getTime(),
       level,
-      module: this.moduleId,
-      session: opts?.session ?? this.session,
-      tag: opts?.tag ?? null,
+      logger: this.logger,
+      bound: this.bound,
       message,
       fields: Object.entries(fields ?? {}),
     });
-    this.sink.write(formatted.line, now, formatted.ansiStripped);
-  }
-
-  private assertDeclaredTag(tag: string | undefined): void {
-    if (tag !== undefined && !this.declaredTags.has(tag)) {
-      throw new Error(`undeclared log tag: ${tag}`);
-    }
+    this.sink.write(formatted.line, at, formatted.ansiStripped);
   }
 }
 
-export function createLogger(config: LogConfig): Logger {
-  const declaredTags = new Set<string>();
-  for (const tag of config.tags) {
-    validateToken("declared tag", tag);
-    if (declaredTags.has(tag)) throw new Error(`duplicate declared log tag: ${tag}`);
-    declaredTags.add(tag);
+function positiveNumber(label: string, value: number): number {
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`${label} must be a positive number`);
   }
+  return value;
+}
 
-  const filter = parseFilter(config.spec ?? process.env.CK_LOG ?? "", declaredTags);
-  const sink = new FileSink(config);
-  return new LoggerImpl(config.moduleId, declaredTags, filter, sink, null);
+function wholeDays(label: string, value: number): number {
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`${label} must be a non-negative whole number of days`);
+  }
+  return value;
+}
+
+// An unparseable environment value is ignored rather than fatal: a logger that
+// refuses to start over a stray knob is worse than one on the defaults.
+function envNumber(name: string): number | undefined {
+  const raw = process.env[name]?.trim();
+  if (raw === undefined || raw === "") return undefined;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : undefined;
+}
+
+/**
+ * The config for a plugin running inside a harness process. `harness=` is
+ * bound on every line because all of a module's lanes share one file, and it
+ * is the only thing that separates them.
+ */
+export function forPlugin(moduleId: string, harness: string): LogConfig {
+  return { moduleId, bound: [["harness", harness]] };
+}
+
+export function createLogger(config: LogConfig): Logger {
+  // The module id is the root of the logger hierarchy that CK_LOG filters on,
+  // so it has to satisfy the same segment grammar as every component.
+  assertSegment("module id", config.moduleId);
+  const logsDir = config.logsDir ?? path.join(moduleDataDir(config.moduleId), "logs");
+  const maxAgeDays = wholeDays(
+    "maxAgeDays",
+    config.maxAgeDays ?? envNumber("CK_LOG_MAX_AGE_DAYS") ?? DEFAULT_MAX_AGE_DAYS,
+  );
+  const alarmSegmentMb = positiveNumber(
+    "alarmSegmentMb",
+    config.alarmSegmentMb ?? envNumber("CK_LOG_ALARM_SEGMENT_MB") ?? DEFAULT_ALARM_SEGMENT_MB,
+  );
+
+  const sink = new SegmentSink({
+    moduleId: config.moduleId,
+    logsDir,
+    maxAgeDays,
+    alarmBytes: Math.floor(alarmSegmentMb * MIB),
+    clock: config.clock ?? (() => new Date()),
+    redact: config.redact,
+  });
+  return new LoggerImpl(
+    config.moduleId,
+    mergeBound([], config.bound ?? []),
+    resolveFilter(config.spec),
+    sink,
+  );
 }
