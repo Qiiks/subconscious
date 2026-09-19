@@ -312,6 +312,23 @@ backstop, not the policy.
   start: `logger=<module> retention pruned=N kept=M window_days=14`), so
   "never ran" and "ran and found nothing" are distinguishable from outside.
 
+## Why one line per record is a hard requirement
+
+Attribution is satisfied per-record and the log is read per-line. Any format
+where those two can diverge — a continuation line carrying part of a record
+without its timestamp, level, or module — produces a census that is right about
+lines and wrong about producers. Measured on 2026-09-19: a `tail -1` sample of
+the shared stderr capture landed on a continuation line and recorded a module as
+emitting no identifier at all, when every one of its records carried one. Under
+r2 the logger writes module and component on each line by construction, so a
+record that wraps still carries them; the property is structural rather than
+maintained.
+
+The cheap test for any log format: ask what a continuation line carries, not
+what the record carries. A format where a record can span more than one line
+needs either a reader that reassembles or a writer that cannot wrap. Nobody
+builds the first, so the second is the only real option.
+
 ## Adoption
 
 ### Readers, not just producers
