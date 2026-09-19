@@ -60,8 +60,15 @@ violations=0
 # This check compares COMMITS ($BASE...HEAD). Uncommitted working-tree edits
 # are invisible to it, so "clean" here answers a narrower question than "is
 # the tree consistent". Say so instead of letting the narrow answer read as
-# the broad one (a wire-crate edit sitting unstaged would pass silently).
-if ! git diff --quiet -- crates/ 2>/dev/null; then
+# the broad one.
+#
+# `git diff HEAD`, not `git diff`: the bare form compares the working tree to
+# the INDEX, so a change that has been `git add`ed reads as clean -- which is
+# the natural state right before a commit, i.e. exactly when a human runs this
+# by hand. CI never sees it because CI checkouts are clean, which is how it
+# survived (FUSI found it in their copy, 2026-09-19; reproduced here on a
+# clean tree: staged plant -> bare form CLEAN, HEAD form DIRTY).
+if ! git diff --quiet HEAD -- crates/ 2>/dev/null; then
   echo "  note: uncommitted changes exist under crates/ -- this check reads" >&2
   echo "  committed history only ($BASE...HEAD) and does not see them." >&2
 fi
