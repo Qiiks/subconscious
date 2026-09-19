@@ -66,13 +66,20 @@ fi
 # The notice carries the pushed sha because consumers' first check is
 # "was the bump real and the tree clean" (FUSI's property) -- a sha they
 # can cite answers it without re-derivation.
-range_bumps=$(git diff "@{push}...HEAD" -- 'crates/*/Cargo.toml' 2>/dev/null \
-  | grep -E '^\+version = ' | wc -l | tr -d ' ')
+  # BLIND SPOT FOUND BY BROCA (2026-09-19): deriving targets from a
+  # `crates/<name>/` shape makes every version-carrying file OUTSIDE that
+  # prefix gate nothing when edited alone. Measured here: cortexkit-release is
+  # a workspace member at the repo root, and three npm packages under clients/
+  # carry versions consumers pin. A path-glob derivation is a CLAIM ABOUT
+  # LAYOUT, and the layout it describes is never the whole repo.
+  bump_globs='crates/*/Cargo.toml cortexkit-release/Cargo.toml clients/*/package.json'
+range_bumps=$(git diff "@{push}...HEAD" -- $bump_globs 2>/dev/null \
+  | grep -cE '^\+ *"?version"? *[=:]' | tr -d ' ')
 if [ "${range_bumps:-0}" -gt 0 ]; then
   echo "" >&2
   echo "pre-push NOTICE: pushing $(git rev-parse --short HEAD) with $range_bumps workspace crate version bump(s):" >&2
-  git diff "@{push}...HEAD" -- 'crates/*/Cargo.toml' 2>/dev/null \
-    | grep -E '^(diff --git|\+version = )' | sed 's|diff --git a/|  |;s| b/.*||' >&2
+  git diff "@{push}...HEAD" -- $bump_globs 2>/dev/null \
+    | grep -E '^(diff --git|\+ *"?version"? *[=:])' | sed 's|diff --git a/|  |;s| b/.*||' >&2
   echo "  EVERY path-dep sibling's committed lock is stale from this moment." >&2
   echo "  Fan out now: bash scripts/fleet/check-sibling-locks.sh for the list," >&2
   echo "  then peer-notify owners. Fix recipe to send: cargo update -w against" >&2
