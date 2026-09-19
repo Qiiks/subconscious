@@ -169,9 +169,49 @@ say "staged sidecar $sidecar: OK"
 # all modules, 26 for broca alone with verifying sidecars, every one passing this
 # gate's only placeability test. A broca card was superseded upstream hours after
 # it was staged and gated, and I learned it from its owner rather than from here.
+# TWO DECLARATION SHAPES, AND THE ROOT-LEVEL ONE IS STRICTLY STRONGER.
+#
+#   <stage>/ck-<module>.current   in-stage. "<sha256>  <file>  <stamp>".
+#   <staging root>/<module>.current   beside the stages, key=value, carrying
+#                                     stage= and revision=.
+#
+# An IN-STAGE manifest can only say "this stage is current", because to read it
+# I must already have chosen a directory -- so it is a SELF-ATTESTATION, and
+# every stage can carry one saying yes. It catches the case where I pass a stale
+# directory that has no manifest, and misses the case where the stale directory
+# has one. The ROOT-LEVEL form NAMES the current stage, which is the question the
+# mtime fallback was guessing at.
+#
+# FUSI built the root form (2026-09-19) after my gate printed "INFERRED from
+# mtime" on one of their cards; PLEX and three others already write the in-stage
+# form. Both are read, root first, because a seat that improved its declaration
+# must not be punished for it and a seat that has not must keep working.
+# Derived from the PARENT of the passed artifact's directory, never from
+# $STAGING: seats stage wherever they like (FUSI under ~/ck-stage, others under
+# the cortexkit staging root), and a hardcoded root would silently find no
+# declaration for every seat that chose a different one -- reporting "INFERRED
+# from mtime" while a perfectly good declaration sat one directory up.
+root_manifest="$(dirname "$staged_dir")/$MODULE.current"
 manifest="$staged_dir/ck-$MODULE.current"
 staged_base=$(basename "$STAGED")
-if [ -f "$manifest" ]; then
+if [ -f "$root_manifest" ]; then
+  want_stage=$(awk -F= '$1=="stage"{print $2}' "$root_manifest")
+  want_rev=$(awk -F= '$1=="revision"{print $2}' "$root_manifest")
+  # Compare the DIRECTORY, since the root form names a stage rather than a file.
+  if [ "$staged_dir" = "$want_stage" ]; then
+    say "currency: matches $MODULE.current (owner-declared stage), rev ${want_rev:0:12}"
+  elif [ "$OLDER" -eq 1 ]; then
+    say "currency: placing from $staged_dir although the owner declares $want_stage (--older given)"
+  else
+    echo "REFUSED: $staged_dir is not the stage $MODULE.current declares" >&2
+    echo "         owner declares: $want_stage" >&2
+    echo "         you passed:     $staged_dir" >&2
+    echo "         The root manifest is the owner's statement of WHICH STAGE is live," >&2
+    echo "         which an in-stage manifest cannot answer. If this is deliberate" >&2
+    echo "         (a rollback), pass --older." >&2
+    exit 2
+  fi
+elif [ -f "$manifest" ]; then
   want_sha=$(awk 'NR==1{print $1}' "$manifest")
   want_file=$(awk 'NR==1{print $2}' "$manifest")
   have_sha=$(shasum -a256 "$STAGED" | awk '{print $1}')
