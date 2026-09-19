@@ -38,7 +38,10 @@ pub use forwarding::{ForwardingError, ForwardingTable, ModuleEndpointId};
 // subc-protocol (pure, with the envelope it accompanies) and the async I/O loop
 // in subc-transport (with the authenticated stream). Re-exported here for
 // callers that use the daemon library to build and exchange frames.
-pub use control::DEFAULT_ROUTE_BIND_RELAY_TIMEOUT;
+pub use control::{
+    DEFAULT_ROUTE_BIND_BREAKER_COOLDOWN, DEFAULT_ROUTE_BIND_BREAKER_THRESHOLD,
+    DEFAULT_ROUTE_BIND_RELAY_TIMEOUT,
+};
 pub use identity::{IdentityError, ProjectRootId, RequestIdentity, SessionId};
 pub use observability::{ConnectedClients, DaemonCounters};
 pub use registry::{ChannelState, ConnectionId, ModuleRegistration, Registry, RegistryError};

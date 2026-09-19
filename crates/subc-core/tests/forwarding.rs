@@ -27,12 +27,13 @@ use subc_protocol::{
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
-    time::{sleep, timeout, Instant},
+    time::{sleep, sleep_until, timeout, Instant},
 };
 
 mod common;
 use common::{
     connect_authed_client, start_test_daemon_with_bind_timeout,
+    start_test_daemon_with_bind_timeout_and_breaker,
     start_test_daemon_with_process_liveness_and_supervisor,
     start_test_daemon_with_route_bind_relay_overrides, TestDaemon,
 };
@@ -61,6 +62,32 @@ impl TestServer {
     /// quickly instead of waiting on the production-safe default.
     async fn start_with_bind_timeout(bind_timeout: Duration) -> Self {
         Self::start_inner(Some(bind_timeout)).await
+    }
+
+    /// Start with a short relay timeout AND a test-sized bind-relay breaker
+    /// policy. The production breaker needs three full 12s budgets to open and
+    /// then holds for 20s; the constants carry the reasoning for those numbers
+    /// and these tests pin the mechanism.
+    async fn start_with_bind_timeout_and_breaker(
+        bind_timeout: Duration,
+        threshold: u32,
+        cooldown: Duration,
+    ) -> Self {
+        let process_liveness = Arc::new(SupervisorProcessLiveness::new());
+        let supervisor_handle = SupervisorHandle::new();
+        let daemon = start_test_daemon_with_bind_timeout_and_breaker(
+            "forwarding-server",
+            process_liveness.clone(),
+            supervisor_handle.clone(),
+            bind_timeout,
+            (threshold, cooldown),
+        )
+        .await;
+        Self {
+            daemon,
+            process_liveness,
+            supervisor_handle,
+        }
     }
 
     async fn start_inner(bind_timeout: Option<Duration>) -> Self {
@@ -4037,6 +4064,706 @@ async fn route_open_timeout_sends_module_goodbye_for_abandoned_bind() {
     timing_out.stop().await.unwrap();
 }
 
+/// Deadline for the two frames of the head-of-line arm below. A DEADLOCK
+/// DETECTOR, not a latency bound: it is a third of that test's bind budget and
+/// hundreds of times the loopback round trip it actually measures, so it fires
+/// only when a reader is being held across the bind budget.
+const HELD_READER_DEADLINE: Duration = Duration::from_secs(2);
+
+/// While a module's breaker is open, an open to it neither relays nor spends
+/// the bind budget, so the frames behind it on the same socket are served
+/// instead of waiting the budget out.
+///
+/// WHAT THIS DELIBERATELY DOES NOT ASSERT, and why: that the neighbour's
+/// response arrives BEFORE the wedged module's refusal. The connection reader
+/// is serial -- it awaits a frame's dispatch before reading the next -- and the
+/// breaker does not change that, so the neighbour's frame is not even read
+/// until the open ahead of it has settled. With the breaker closed, settling
+/// costs the full budget; with it open, the refusal is written first and the
+/// neighbour follows. Nothing short of answering the open asynchronously can
+/// put the neighbour first, and that is a separate change this one deliberately
+/// does not make (see `docs/designs/route-open-head-of-line.md`).
+///
+/// So the witnesses here are structural: no relay was sent (the stub's attach
+/// count is unchanged across the refusal), the refusal was counted under the
+/// breaker's own key, and both frames came back inside a deadline well under
+/// the bind budget -- which is what fails if the breaker check is deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_open_breaker_keeps_a_wedged_module_from_holding_later_frames_on_the_same_socket() {
+    // Budget 6s against a 2s read deadline. Deleting the breaker check makes
+    // the second open pay the budget and the neighbour's response miss the
+    // deadline by 4s; no ordinary slowness closes a gap that size. Threshold 1
+    // so the setup pays that budget once rather than three times.
+    let server = TestServer::start_with_bind_timeout_and_breaker(
+        Duration::from_secs(6),
+        1,
+        Duration::from_secs(30),
+    )
+    .await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let wedged_id = "fake-aft-breaker-wedged";
+    let neighbour_id = "fake-aft-breaker-neighbour";
+    let (wedged, wedged_events) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        wedged_id,
+        "breaker-head-of-line",
+        [("FAKE_AFT_BIND_NEVER_REPLY", "1")],
+    )
+    .await;
+    let neighbour = spawn_stub(&server, &supervisor, neighbour_id).await;
+
+    let project = TestProject::new();
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let neighbour_ack = attach_on_stream(
+        &mut client,
+        &project,
+        620,
+        "ses-breaker-neighbour",
+        neighbour_id,
+    )
+    .await;
+
+    // One full-budget timeout opens this daemon's breaker.
+    let opening = attach_error_on_stream_with_wait(
+        &mut client,
+        &project,
+        621,
+        "ses-breaker-open",
+        wedged_id,
+        SETUP_TIMEOUT,
+    )
+    .await;
+    assert_eq!(opening.code, "module_timeout");
+    wait_for_stub_event_count(&wedged_events, SETUP_TIMEOUT, is_attach_event, 1).await;
+    let relays_before = attach_event_count(&wedged_events);
+
+    let mut diagnostic = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let refusals_before = server_counter_key(
+        &mut diagnostic,
+        622,
+        "route_open_refused_by_code",
+        "module_timeout_breaker_open",
+    )
+    .await;
+
+    // Pipelined on ONE socket: the open to the wedged module, then a call to
+    // the already-bound neighbour.
+    let payload = br#"{"jsonrpc":"2.0","id":1,"method":"read"}"#;
+    write_frame(
+        &mut client,
+        &attach_frame(
+            623,
+            attach_request(&project, "ses-breaker-refused", wedged_id),
+        ),
+    )
+    .await
+    .unwrap();
+    write_frame(
+        &mut client,
+        &data_request(
+            neighbour_ack.route_channel,
+            neighbour_ack.route_epoch,
+            624,
+            payload,
+        ),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+
+    let refusal = read_frame_timeout_for(&mut client, HELD_READER_DEADLINE).await;
+    assert_eq!(refusal.header.ty, FrameType::Error);
+    assert_eq!(refusal.header.corr, 623);
+    assert_eq!(
+        serde_json::from_slice::<ErrorBody>(&refusal.body)
+            .unwrap()
+            .code,
+        "module_timeout"
+    );
+    let response = read_frame_timeout_for(&mut client, HELD_READER_DEADLINE).await;
+    assert_eq!(response.header.ty, FrameType::Response);
+    assert_eq!(response.header.channel, neighbour_ack.route_channel);
+    assert_eq!(response.header.corr, 624);
+    assert_eq!(response.body, payload);
+
+    assert_eq!(
+        attach_event_count(&wedged_events),
+        relays_before,
+        "a refusal from an open breaker must not relay route.bind to the wedged module"
+    );
+    let refusals_after = server_counter_key(
+        &mut diagnostic,
+        625,
+        "route_open_refused_by_code",
+        "module_timeout_breaker_open",
+    )
+    .await;
+    assert_eq!(
+        refusals_after,
+        refusals_before + 1,
+        "the fast refusal must be counted under the breaker's own key, or an operator \
+         cannot tell a module that is refusing instantly from one that is fine"
+    );
+
+    wedged.stop().await.unwrap();
+    neighbour.stop().await.unwrap();
+}
+
+/// A wedged module costs the WHOLE DAEMON at most one full-budget wait per
+/// cooldown, rather than one per route.open per connection. This is the
+/// fleet-level property: without it, every connection that calls a wedged
+/// module pays its own budget and holds its own later frames.
+///
+/// Four client connections, because the breaker is per target module and a
+/// two-connection test could pass against a per-connection one by accident.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wedged_module_costs_at_most_one_full_budget_wait_per_cooldown_across_connections() {
+    let bind_budget = Duration::from_millis(400);
+    let cooldown = Duration::from_secs(4);
+    let server = TestServer::start_with_bind_timeout_and_breaker(bind_budget, 3, cooldown).await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-breaker-fleet";
+    let (wedged, events_path) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_id,
+        "breaker-fleet",
+        [("FAKE_AFT_BIND_NEVER_REPLY", "1")],
+    )
+    .await;
+
+    let project = TestProject::new();
+    let mut opener = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    for corr in 630..633 {
+        let error = attach_error_on_stream_with_wait(
+            &mut opener,
+            &project,
+            corr,
+            "ses-breaker-fleet-open",
+            module_id,
+            SETUP_TIMEOUT,
+        )
+        .await;
+        assert_eq!(error.code, "module_timeout");
+    }
+    let opened_at = Instant::now();
+    wait_for_stub_event_count(&events_path, SETUP_TIMEOUT, is_attach_event, 3).await;
+    assert_eq!(attach_event_count(&events_path), 3);
+
+    let mut connections = Vec::new();
+    for _ in 0..4 {
+        connections.push(
+            connect_authed_client(&server.connection_file_path)
+                .await
+                .unwrap(),
+        );
+    }
+
+    // Twelve opens from four other connections while the breaker is open. Not
+    // one of them may reach the module.
+    let mut corr = 640;
+    for round in 0..3 {
+        for connection in &mut connections {
+            let error = attach_error_on_stream_with_wait(
+                connection,
+                &project,
+                corr,
+                &format!("ses-breaker-fleet-{round}"),
+                module_id,
+                SETUP_TIMEOUT,
+            )
+            .await;
+            assert_eq!(error.code, "module_timeout");
+            corr += 1;
+        }
+    }
+    assert_eq!(
+        attach_event_count(&events_path),
+        3,
+        "while the breaker is open a wedged module must receive no relay at all, \
+         from any connection"
+    );
+
+    // Past the cooldown, the four connections between them get exactly ONE
+    // probe -- not one each.
+    sleep_until(opened_at + cooldown + Duration::from_millis(200)).await;
+    for connection in &mut connections {
+        let error = attach_error_on_stream_with_wait(
+            connection,
+            &project,
+            corr,
+            "ses-breaker-fleet-probe",
+            module_id,
+            SETUP_TIMEOUT,
+        )
+        .await;
+        assert_eq!(error.code, "module_timeout");
+        corr += 1;
+    }
+    assert_eq!(
+        attach_event_count(&events_path),
+        4,
+        "one cooldown must buy the module exactly one more full-budget wait, \
+         across all connections"
+    );
+
+    wedged.stop().await.unwrap();
+}
+
+/// ARM 2: the breaker opens at the threshold and the next open is refused
+/// WITHOUT A RELAY BEING SENT. Uses the production threshold, so the constant
+/// itself is under test and not just the mechanism.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bind_relay_breaker_opens_at_the_threshold_and_refuses_before_relaying() {
+    let bind_budget = Duration::from_millis(300);
+    let server = TestServer::start_with_bind_timeout_and_breaker(
+        bind_budget,
+        3,
+        // Long enough that no probe can interfere with the assertions below.
+        Duration::from_secs(30),
+    )
+    .await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-breaker-threshold";
+    let (wedged, events_path) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_id,
+        "breaker-threshold",
+        [("FAKE_AFT_BIND_NEVER_REPLY", "1")],
+    )
+    .await;
+
+    let project = TestProject::new();
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let mut diagnostic = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+
+    for corr in 650..653 {
+        let error = attach_error_on_stream_with_wait(
+            &mut client,
+            &project,
+            corr,
+            "ses-breaker-threshold",
+            module_id,
+            SETUP_TIMEOUT,
+        )
+        .await;
+        assert_eq!(error.code, "module_timeout");
+    }
+    wait_for_stub_event_count(&events_path, SETUP_TIMEOUT, is_attach_event, 3).await;
+    assert_eq!(
+        attach_event_count(&events_path),
+        3,
+        "every open below the threshold must still be relayed"
+    );
+    let timeouts_at_threshold = server_counter_key(
+        &mut diagnostic,
+        653,
+        "route_open_refused_by_code",
+        "module_timeout",
+    )
+    .await;
+    assert_eq!(timeouts_at_threshold, 3);
+
+    let refused = attach_error_on_stream_with_wait(
+        &mut client,
+        &project,
+        654,
+        "ses-breaker-threshold-refused",
+        module_id,
+        SETUP_TIMEOUT,
+    )
+    .await;
+    assert_eq!(refused.code, "module_timeout");
+
+    // Wait out more than a whole budget: a relay, had one been sent, would
+    // have reached the stub and been recorded long before this returns.
+    sleep(bind_budget * 2).await;
+    assert_eq!(
+        attach_event_count(&events_path),
+        3,
+        "the refusal after the threshold must not have relayed route.bind at all"
+    );
+    assert_eq!(
+        server_counter_key(
+            &mut diagnostic,
+            655,
+            "route_open_refused_by_code",
+            "module_timeout"
+        )
+        .await,
+        timeouts_at_threshold,
+        "a fast refusal must not be counted as another budget burned"
+    );
+    assert_eq!(
+        server_counter_key(
+            &mut diagnostic,
+            656,
+            "route_open_refused_by_code",
+            "module_timeout_breaker_open"
+        )
+        .await,
+        1
+    );
+
+    // The operator surface: an open breaker is nameable from server.describe.
+    let open_breaker = server_counter_key_value(&mut diagnostic, 657, "route_bind_breakers_open")
+        .await
+        .unwrap_or_else(|| panic!("server.describe must name the open breaker"));
+    assert_eq!(open_breaker[module_id]["consecutive_timeouts"], 3);
+
+    wedged.stop().await.unwrap();
+}
+
+/// ARM 3: a module that says no quickly is healthy. Rejection is a different
+/// condition with its own refusal and must never trip the breaker, however
+/// often it happens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_module_that_rejects_binds_quickly_never_trips_the_breaker() {
+    let server = TestServer::start_with_bind_timeout_and_breaker(
+        Duration::from_millis(300),
+        3,
+        Duration::from_secs(30),
+    )
+    .await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-breaker-rejects";
+    let (rejecting, events_path) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_id,
+        "breaker-rejects",
+        [("FAKE_AFT_REJECT_ATTACH", "1")],
+    )
+    .await;
+
+    let project = TestProject::new();
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let rejections = 6;
+    for corr in 660..(660 + rejections) {
+        let error = attach_error_on_stream_with_wait(
+            &mut client,
+            &project,
+            corr,
+            "ses-breaker-rejects",
+            module_id,
+            SETUP_TIMEOUT,
+        )
+        .await;
+        assert_eq!(error.code, "config_divergence");
+    }
+
+    assert_eq!(
+        attach_event_count(&events_path),
+        rejections as usize,
+        "every rejected open must still have been relayed: twice the threshold of \
+         rejections must leave the breaker closed"
+    );
+    let mut diagnostic = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    assert_eq!(
+        server_counter_key(
+            &mut diagnostic,
+            670,
+            "route_open_refused_by_code",
+            "module_timeout_breaker_open"
+        )
+        .await,
+        0
+    );
+    assert!(
+        server_counter_key_value(&mut diagnostic, 671, "route_bind_breakers_open")
+            .await
+            .is_none(),
+        "no breaker may be open for a module that answers every bind"
+    );
+
+    rejecting.stop().await.unwrap();
+}
+
+/// ARM 4: at the cooldown boundary the breaker admits EXACTLY ONE probe, not
+/// every arrival that happens to find the cooldown expired.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn half_open_admits_exactly_one_probe_under_concurrent_arrivals() {
+    let bind_budget = Duration::from_millis(300);
+    let cooldown = Duration::from_millis(1500);
+    let server = TestServer::start_with_bind_timeout_and_breaker(bind_budget, 3, cooldown).await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-breaker-probe";
+    let (wedged, events_path) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_id,
+        "breaker-probe",
+        [("FAKE_AFT_BIND_NEVER_REPLY", "1")],
+    )
+    .await;
+
+    let project = TestProject::new();
+    let mut opener = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    for corr in 680..683 {
+        let error = attach_error_on_stream_with_wait(
+            &mut opener,
+            &project,
+            corr,
+            "ses-breaker-probe-open",
+            module_id,
+            SETUP_TIMEOUT,
+        )
+        .await;
+        assert_eq!(error.code, "module_timeout");
+    }
+    let opened_at = Instant::now();
+    wait_for_stub_event_count(&events_path, SETUP_TIMEOUT, is_attach_event, 3).await;
+
+    // Connect and build every frame BEFORE the cooldown expires, so the four
+    // arrivals really do race the boundary instead of trickling in behind each
+    // other's setup cost.
+    let mut racers = Vec::new();
+    for (index, corr) in (690..694).enumerate() {
+        let connection = connect_authed_client(&server.connection_file_path)
+            .await
+            .unwrap();
+        let frame = attach_frame(
+            corr,
+            attach_request(&project, &format!("ses-breaker-race-{index}"), module_id),
+        );
+        racers.push((connection, frame));
+    }
+
+    sleep_until(opened_at + cooldown + Duration::from_millis(100)).await;
+    let mut inflight = Vec::new();
+    for (mut connection, frame) in racers {
+        inflight.push(tokio::spawn(async move {
+            write_frame(&mut connection, &frame).await.unwrap();
+            connection.flush().await.unwrap();
+            read_frame_timeout_for(&mut connection, SETUP_TIMEOUT).await
+        }));
+    }
+    for task in inflight {
+        let frame = task.await.unwrap();
+        assert_eq!(frame.header.ty, FrameType::Error);
+        assert_eq!(
+            serde_json::from_slice::<ErrorBody>(&frame.body)
+                .unwrap()
+                .code,
+            "module_timeout"
+        );
+    }
+
+    assert_eq!(
+        attach_event_count(&events_path),
+        4,
+        "four opens racing the cooldown boundary must yield exactly one probe"
+    );
+
+    wedged.stop().await.unwrap();
+}
+
+/// ARM 5: an accepted probe closes the breaker and binds flow normally again.
+///
+/// The module recovers INSIDE ONE PROCESS (`FAKE_AFT_BIND_NEVER_REPLY_FIRST`)
+/// rather than by being restarted. A restart would also replace the module
+/// connection, which is independently a reason the daemon discards what it
+/// learned, so a restart cannot tell recovery from amnesia.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_accepted_probe_closes_the_breaker_and_binds_flow_again() {
+    let bind_budget = Duration::from_millis(300);
+    let cooldown = Duration::from_millis(800);
+    let server = TestServer::start_with_bind_timeout_and_breaker(bind_budget, 3, cooldown).await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-breaker-recovers";
+    let (recovering, events_path) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_id,
+        "breaker-recovers",
+        [("FAKE_AFT_BIND_NEVER_REPLY_FIRST", "3")],
+    )
+    .await;
+
+    let project = TestProject::new();
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    for corr in 700..703 {
+        let error = attach_error_on_stream_with_wait(
+            &mut client,
+            &project,
+            corr,
+            "ses-breaker-recover-open",
+            module_id,
+            SETUP_TIMEOUT,
+        )
+        .await;
+        assert_eq!(error.code, "module_timeout");
+    }
+    let opened_at = Instant::now();
+    wait_for_stub_event_count(&events_path, SETUP_TIMEOUT, is_attach_event, 3).await;
+
+    let mut diagnostic = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let refusals_before = server_counter_key(
+        &mut diagnostic,
+        703,
+        "route_open_refused_by_code",
+        "module_timeout_breaker_open",
+    )
+    .await;
+    assert!(
+        server_counter_key_value(&mut diagnostic, 704, "route_bind_breakers_open")
+            .await
+            .is_some(),
+        "the breaker must be open before recovery is claimed"
+    );
+
+    sleep_until(opened_at + cooldown + Duration::from_millis(100)).await;
+    let probe = attach_on_stream(
+        &mut client,
+        &project,
+        705,
+        "ses-breaker-probe-ok",
+        module_id,
+    )
+    .await;
+    assert!(probe.route_channel > 0);
+
+    let after = attach_on_stream(&mut client, &project, 706, "ses-breaker-closed", module_id).await;
+    assert!(after.route_channel > 0);
+
+    assert_eq!(
+        attach_event_count(&events_path),
+        5,
+        "once the probe is accepted the breaker must be closed, so the next open \
+         relays normally instead of being refused"
+    );
+    assert_eq!(
+        server_counter_key(
+            &mut diagnostic,
+            707,
+            "route_open_refused_by_code",
+            "module_timeout_breaker_open"
+        )
+        .await,
+        refusals_before,
+        "no open after the accepted probe may be fast-refused"
+    );
+    assert!(
+        server_counter_key_value(&mut diagnostic, 708, "route_bind_breakers_open")
+            .await
+            .is_none(),
+        "a closed breaker must disappear from the operator surface"
+    );
+
+    recovering.stop().await.unwrap();
+}
+
+/// A BREAKER IS A CACHED VERDICT ABOUT A PROCESS, NOT ABOUT A NAME. When a new
+/// module connection registers under the id, the process the verdict describes
+/// is gone, so the verdict goes with it: the replacement is not made to serve
+/// its predecessor's cooldown.
+///
+/// The cooldown here is 30s against a test that finishes in seconds, so the
+/// open after the respawn can only be relayed if the registration discarded the
+/// state -- waiting it out is not available to this test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_module_connection_discards_the_breaker_state_of_the_process_it_replaced() {
+    let server = TestServer::start_with_bind_timeout_and_breaker(
+        Duration::from_millis(300),
+        3,
+        Duration::from_secs(30),
+    )
+    .await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-breaker-respawn";
+    let (wedged, _wedged_events) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_id,
+        "breaker-respawn-wedged",
+        [("FAKE_AFT_BIND_NEVER_REPLY", "1")],
+    )
+    .await;
+
+    let project = TestProject::new();
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    for corr in 720..723 {
+        let error = attach_error_on_stream_with_wait(
+            &mut client,
+            &project,
+            corr,
+            "ses-breaker-respawn-open",
+            module_id,
+            SETUP_TIMEOUT,
+        )
+        .await;
+        assert_eq!(error.code, "module_timeout");
+    }
+    let mut diagnostic = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    assert!(
+        server_counter_key_value(&mut diagnostic, 723, "route_bind_breakers_open")
+            .await
+            .is_some(),
+        "the breaker must be open before the respawn, or this proves nothing"
+    );
+
+    wedged.stop().await.unwrap();
+    wait_for_registration_absent(&server.registry, module_id, SETUP_TIMEOUT).await;
+    let healthy = spawn_stub(&server, &supervisor, module_id).await;
+
+    let ack = attach_on_stream(
+        &mut client,
+        &project,
+        724,
+        "ses-breaker-respawn-healthy",
+        module_id,
+    )
+    .await;
+    assert!(ack.route_channel > 0);
+    assert!(
+        server_counter_key_value(&mut diagnostic, 725, "route_bind_breakers_open")
+            .await
+            .is_none(),
+        "a respawned module must not inherit the open breaker of the process it replaced"
+    );
+
+    healthy.stop().await.unwrap();
+}
+
+fn is_attach_event(event: &Value) -> bool {
+    event["kind"] == "attach"
+}
+
+/// How many route.bind relays the stub has actually received. The structural
+/// witness for "no relay was sent", which a latency bound cannot give.
+fn attach_event_count(path: &Path) -> usize {
+    stub_events(path)
+        .iter()
+        .filter(|event| is_attach_event(event))
+        .count()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn malformed_route_bind_reply_settles_and_later_open_succeeds() {
     let server = TestServer::start().await;
@@ -6737,6 +7464,26 @@ async fn server_counter_key(stream: &mut TcpStream, corr: u64, map: &str, key: &
             .and_then(|value| value.get(key).cloned())
             .and_then(|value| value.as_u64())
             .unwrap_or(0),
+        other => panic!("unexpected server.describe response: {other:?}"),
+    }
+}
+
+/// Read a whole counters entry, for the ones that are objects rather than
+/// totals. `None` when the key is absent, which for the breaker surface is
+/// itself the assertion that nothing is open.
+async fn server_counter_key_value(stream: &mut TcpStream, corr: u64, key: &str) -> Option<Value> {
+    write_frame(
+        stream,
+        &control_request_frame(corr, ClientControlRequest::ServerDescribe {}),
+    )
+    .await
+    .unwrap();
+    stream.flush().await.unwrap();
+    let frame = read_frame_timeout(stream).await;
+    match serde_json::from_slice::<ClientControlResponse>(&frame.body).unwrap() {
+        ClientControlResponse::ServerDescribe { counters, .. } => {
+            counters.and_then(|value| value.get(key).cloned())
+        }
         other => panic!("unexpected server.describe response: {other:?}"),
     }
 }

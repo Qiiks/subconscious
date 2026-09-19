@@ -1,8 +1,8 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant as StdInstant},
 };
 
@@ -99,6 +99,42 @@ const MODULE_BASELINE_CONTROL_OPS: &[&str] = &["route.bind", "route.status"];
 /// bind is far worse than waiting on a slow one; a consumer that wants a tighter
 /// bound retries the bind itself (the sanctioned warm-bind-retry pattern).
 pub const DEFAULT_ROUTE_BIND_RELAY_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// How many CONSECUTIVE full-budget relay timeouts against one target module
+/// open that module's bind-relay breaker.
+///
+/// Three, so that the breaker is NOT REACHABLE INSIDE ONE CLIENT CALL. Both
+/// SDKs default to a 30s request deadline and the relay budget defaults to 12s,
+/// so three consecutive full-budget timeouts take ~36s to observe: every client
+/// whose open contributed to opening the breaker had already given up on its
+/// own. That is what makes opening the breaker unable to turn a call that would
+/// have succeeded into a refusal — it can only make an already-failing module
+/// fail faster.
+///
+/// Two would be reachable inside one default deadline. One would convict a
+/// module on a single cold-cache bind, which is exactly the valid-but-slow case
+/// `DEFAULT_ROUTE_BIND_RELAY_TIMEOUT`'s own doc comment exists to protect.
+pub const DEFAULT_ROUTE_BIND_BREAKER_THRESHOLD: u32 = 3;
+
+/// How long a module's bind-relay breaker stays open before exactly one
+/// `route.open` is let through as a probe.
+///
+/// Bounded BELOW by the relay budget: a cooldown at or under the 12s budget
+/// re-pays a full-budget stall almost continuously, and the breaker stops being
+/// a saving worth its own state. Bounded ABOVE by the SDKs' 30s default request
+/// deadline: a client that starts retrying after the module recovers has to get
+/// a probe opportunity inside its own deadline, or the breaker converts a
+/// recovered module into a failed call — the failure it exists to prevent,
+/// pointed the other way.
+///
+/// 20s sits between those with room on both sides, and it caps what a wedged
+/// module can cost at one full-budget wait per 20s ACROSS THE WHOLE DAEMON
+/// rather than one per `route.open` per connection. The stall that motivated
+/// this, with its measurements, is written up in
+/// `docs/designs/route-open-head-of-line.md`: 268 opens against one module each
+/// waited the whole budget out.
+pub const DEFAULT_ROUTE_BIND_BREAKER_COOLDOWN: Duration = Duration::from_secs(20);
+
 const DEFAULT_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const SLOW_CONTROL_DISPATCH_THRESHOLD: Duration = Duration::from_secs(1);
 
@@ -156,6 +192,13 @@ pub struct ControlHandler {
     /// `handle_route_open` resolves the deadline for a target module, a
     /// per-module entry wins over the daemon-wide value above.
     route_bind_relay_timeouts: BTreeMap<String, Duration>,
+    /// Per-target-module bind-relay breaker state. Shared with the forwarding
+    /// table, which is where a new module connection resets it.
+    route_bind_breakers: RouteBindBreakers,
+    /// Consecutive relay timeouts that open a module's breaker.
+    route_bind_breaker_threshold: u32,
+    /// How long a breaker stays open before one probe is admitted.
+    route_bind_breaker_cooldown: Duration,
     health_probe_timeout: Duration,
     /// Central storage policy. When set, each registering module receives its
     /// resolved storage descriptor in HELLO_ACK; `None` leaves the field absent.
@@ -267,6 +310,261 @@ impl Drop for RouteBindReservationGuard {
     }
 }
 
+/// Per-target-module circuit breaker around the `route.bind` relay.
+///
+/// The connection reader is serial per connection, so a module whose `on_bind`
+/// sits on the ack blocks every LATER frame on the connections that call it,
+/// including calls to unrelated modules. This does not make any module's bind
+/// fast; it stops the daemon paying the full budget again and again for a
+/// condition it has already observed.
+///
+/// State is keyed by TARGET MODULE and shared by every connection: a wedged
+/// module wedges everyone, so what one connection learned should protect the
+/// rest.
+///
+/// THE MAP IS EMPTY WHILE THE FLEET IS HEALTHY. An entry appears only when a
+/// relay to that module has actually timed out, and is removed again when a
+/// relay is accepted or the module reconnects, so it cannot grow with traffic
+/// or with modules that behave.
+///
+/// # Why a `std` mutex here is not the head-of-line defect again
+///
+/// Acquisition never awaits. The critical section is a hash lookup plus a few
+/// integer updates, with no I/O and no `.await` inside it, so a reader task
+/// cannot be descheduled behind it the way it can behind
+/// `tokio::sync::Mutex::lock().await` or a semaphore permit. It is the same
+/// primitive, held for the same kind of work, as the refusal counter this very
+/// path already increments.
+///
+/// It is also NOT on the data-plane splice path: only `route.open` and module
+/// registration touch it, so bound-route frames gain no state check and no
+/// contention.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RouteBindBreakers {
+    modules: Arc<Mutex<HashMap<String, ModuleBreakerState>>>,
+}
+
+#[derive(Debug, Default)]
+struct ModuleBreakerState {
+    /// Relay timeouts observed with no accepted relay in between.
+    consecutive_timeouts: u32,
+    /// `Some` while the breaker is open: the instant the cooldown expires and
+    /// the next arrival may probe. `None` means closed.
+    cooldown_until: Option<Instant>,
+    /// A half-open probe has been admitted and has not settled yet. This is
+    /// what makes the probe EXACTLY ONE: the flag is set under the same lock
+    /// that read the cooldown, so concurrent opens arriving at the moment the
+    /// cooldown expires cannot all decide that they are the probe.
+    probe_in_flight: bool,
+}
+
+/// What the breaker decided for one `route.open`, before any relay work.
+enum RouteBindAdmission<'a> {
+    Admitted {
+        guard: RouteBindBreakerGuard<'a>,
+        /// This open is the single half-open probe, so the transition is worth
+        /// one log line.
+        probe: bool,
+    },
+    Refused {
+        consecutive_timeouts: u32,
+        /// What is left of the cooldown. Zero when the refusal is because the
+        /// one probe is already in flight rather than because the cooldown has
+        /// not elapsed.
+        retry_in: Duration,
+        probe_in_flight: bool,
+    },
+}
+
+/// An outstanding admission, which must be told how its relay settled.
+///
+/// `Drop` settles it as inconclusive, so an early return between admission and
+/// the relay -- or the whole handler being cancelled when the client
+/// disconnects -- releases a half-open probe slot instead of leaving the
+/// breaker wedged half-open with no further probes.
+struct RouteBindBreakerGuard<'a> {
+    breakers: RouteBindBreakers,
+    module_id: &'a str,
+    settled: bool,
+}
+
+impl RouteBindBreakerGuard<'_> {
+    /// The module answered within the budget and took the bind. THE ONLY
+    /// OUTCOME THAT CLEARS THE COUNT. Returns true when this closed an open
+    /// breaker, which is a transition worth logging.
+    fn record_accepted(&mut self) -> bool {
+        self.settled = true;
+        self.breakers.record_accepted(self.module_id)
+    }
+
+    /// The relay burned the whole budget with no answer. THE ONLY ARM THAT
+    /// COUNTS TOWARD OPENING.
+    fn record_timeout(&mut self, threshold: u32, cooldown: Duration) -> Option<BreakerOpened> {
+        self.settled = true;
+        self.breakers
+            .record_timeout(self.module_id, threshold, cooldown)
+    }
+
+    /// Everything else: the module REJECTED the bind, its connection went away
+    /// mid-relay, or the waiter was cancelled.
+    ///
+    /// None of these is evidence that a module is slow, and each already has
+    /// its own refusal with its own code. A module that rejects a bind in
+    /// microseconds is healthy and must never be convicted for it; a module
+    /// that died has said nothing about the module that replaces it. So these
+    /// neither increment nor reset the count -- they only release a probe slot.
+    fn record_inconclusive(&mut self) {
+        self.settled = true;
+        self.breakers.record_inconclusive(self.module_id);
+    }
+}
+
+impl Drop for RouteBindBreakerGuard<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.breakers.record_inconclusive(self.module_id);
+        }
+    }
+}
+
+/// The breaker moved to open, reported so the caller can log it outside the
+/// lock. Opening is rare and load-bearing; the refusals that follow are
+/// frequent and are counted rather than logged.
+struct BreakerOpened {
+    consecutive_timeouts: u32,
+    /// True when a failed probe re-opened an already-open breaker, which reads
+    /// very differently in a log from a first opening.
+    reopened_after_probe: bool,
+}
+
+impl RouteBindBreakers {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, ModuleBreakerState>> {
+        self.modules
+            .lock()
+            .expect("route.bind breaker mutex poisoned")
+    }
+
+    /// Decide whether this `route.open` may attempt its relay. Takes the map
+    /// lock and nothing else, and never awaits.
+    fn admit<'a>(&self, module_id: &'a str) -> RouteBindAdmission<'a> {
+        let admitted = |probe| RouteBindAdmission::Admitted {
+            guard: RouteBindBreakerGuard {
+                breakers: self.clone(),
+                module_id,
+                settled: false,
+            },
+            probe,
+        };
+
+        let mut modules = self.lock();
+        let Some(state) = modules.get_mut(module_id) else {
+            return admitted(false);
+        };
+        let Some(cooldown_until) = state.cooldown_until else {
+            return admitted(false);
+        };
+        if state.probe_in_flight {
+            return RouteBindAdmission::Refused {
+                consecutive_timeouts: state.consecutive_timeouts,
+                retry_in: Duration::ZERO,
+                probe_in_flight: true,
+            };
+        }
+        let now = Instant::now();
+        if now < cooldown_until {
+            return RouteBindAdmission::Refused {
+                consecutive_timeouts: state.consecutive_timeouts,
+                retry_in: cooldown_until - now,
+                probe_in_flight: false,
+            };
+        }
+        state.probe_in_flight = true;
+        admitted(true)
+    }
+
+    fn record_accepted(&self, module_id: &str) -> bool {
+        self.lock()
+            .remove(module_id)
+            .is_some_and(|state| state.cooldown_until.is_some())
+    }
+
+    fn record_timeout(
+        &self,
+        module_id: &str,
+        threshold: u32,
+        cooldown: Duration,
+    ) -> Option<BreakerOpened> {
+        let mut modules = self.lock();
+        let state = modules.entry(module_id.to_string()).or_default();
+        let was_open = state.cooldown_until.is_some();
+        let was_probe = state.probe_in_flight;
+        state.probe_in_flight = false;
+        state.consecutive_timeouts = state.consecutive_timeouts.saturating_add(1);
+        if state.consecutive_timeouts < threshold {
+            return None;
+        }
+        state.cooldown_until = Some(Instant::now() + cooldown);
+        Some(BreakerOpened {
+            consecutive_timeouts: state.consecutive_timeouts,
+            reopened_after_probe: was_open && was_probe,
+        })
+    }
+
+    fn record_inconclusive(&self, module_id: &str) {
+        if let Some(state) = self.lock().get_mut(module_id) {
+            state.probe_in_flight = false;
+        }
+    }
+
+    /// Discard what was learned about a module, because the process it was
+    /// learned about is gone. Returns the discarded count when it was non-zero.
+    ///
+    /// A BREAKER IS A CACHED VERDICT ABOUT A PROCESS, NOT ABOUT A NAME. A
+    /// `module_id` is a configuration identity that outlives any particular
+    /// child; what the breaker observed was the process behind the module
+    /// connection of the moment. When a new connection registers under that id
+    /// the verdict's subject no longer exists, so the verdict is stale by
+    /// construction rather than merely likely to be wrong. Keeping it would
+    /// apply a dead process's record to a live one, which is the same defect
+    /// class this breaker exists to stop the daemon committing.
+    ///
+    /// A half-open probe in flight is discarded with the rest: it was a
+    /// question about the old process.
+    pub(crate) fn reset_for_new_module_connection(&self, module_id: &str) -> Option<u32> {
+        self.lock()
+            .remove(module_id)
+            .map(|state| state.consecutive_timeouts)
+            .filter(|discarded| *discarded > 0)
+    }
+
+    /// Open breakers, for the `server.describe` counters object. `None` when
+    /// none is open, so the key stays absent rather than present-and-empty.
+    ///
+    /// This is the operator's answer to "is this module refusing instantly or
+    /// is it fine?", which look identical from a client that retries and then
+    /// succeeds.
+    fn open_snapshot(&self) -> Option<serde_json::Value> {
+        let now = Instant::now();
+        let modules = self.lock();
+        let open = modules
+            .iter()
+            .filter_map(|(module_id, state)| {
+                let cooldown_until = state.cooldown_until?;
+                Some((
+                    module_id.clone(),
+                    serde_json::json!({
+                        "consecutive_timeouts": state.consecutive_timeouts,
+                        "cooldown_remaining_ms":
+                            cooldown_until.saturating_duration_since(now).as_millis() as u64,
+                        "probe_in_flight": state.probe_in_flight,
+                    }),
+                ))
+            })
+            .collect::<serde_json::Map<String, serde_json::Value>>();
+        (!open.is_empty()).then(|| serde_json::Value::Object(open))
+    }
+}
+
 impl ControlHandler {
     pub fn new(registry: Arc<Registry>) -> Self {
         Self::with_forwarding(registry, Arc::new(ForwardingTable::default()))
@@ -274,6 +572,10 @@ impl ControlHandler {
 
     pub fn with_forwarding(registry: Arc<Registry>, forwarding: Arc<ForwardingTable>) -> Self {
         let counters = forwarding.counters();
+        // Taken from the forwarding table rather than created here, so that the
+        // breaker a `route.open` consults is the same one a module's
+        // registration resets, however many handlers are built over one table.
+        let route_bind_breakers = forwarding.route_bind_breakers();
         Self {
             registry,
             forwarding,
@@ -288,6 +590,9 @@ impl ControlHandler {
             ]),
             route_bind_relay_timeout: DEFAULT_ROUTE_BIND_RELAY_TIMEOUT,
             route_bind_relay_timeouts: BTreeMap::new(),
+            route_bind_breakers,
+            route_bind_breaker_threshold: DEFAULT_ROUTE_BIND_BREAKER_THRESHOLD,
+            route_bind_breaker_cooldown: DEFAULT_ROUTE_BIND_BREAKER_COOLDOWN,
             health_probe_timeout: DEFAULT_HEALTH_PROBE_TIMEOUT,
             storage_config: None,
             admission_facts_carrier_module_id: None,
@@ -357,6 +662,19 @@ impl ControlHandler {
             .get(module_id)
             .copied()
             .unwrap_or(self.route_bind_relay_timeout)
+    }
+
+    /// Override the per-module bind-relay breaker policy.
+    ///
+    /// Used by tests, which cannot spend three production budgets opening a
+    /// breaker or twenty seconds waiting for its cooldown. The production
+    /// values are `DEFAULT_ROUTE_BIND_BREAKER_THRESHOLD` and
+    /// `DEFAULT_ROUTE_BIND_BREAKER_COOLDOWN`, whose doc comments carry the
+    /// reasoning for the numbers.
+    pub fn with_route_bind_breaker(mut self, threshold: u32, cooldown: Duration) -> Self {
+        self.route_bind_breaker_threshold = threshold.max(1);
+        self.route_bind_breaker_cooldown = cooldown;
+        self
     }
 
     #[cfg(test)]
@@ -1443,6 +1761,17 @@ impl ControlHandler {
             );
             obj.insert("max_routes_on_one_connection".into(), max.into());
         }
+        // A module that is being fast-refused and a module that is fine look
+        // identical from a client that retries and succeeds, so name the open
+        // breakers here. This rides the existing free-form counters object
+        // rather than a new wire field, so no sibling that deserializes
+        // `ServerDescribe` has to be rebuilt to keep reading it.
+        if let (Some(open_breakers), Some(obj)) = (
+            self.route_bind_breakers.open_snapshot(),
+            counters.as_object_mut(),
+        ) {
+            obj.insert("route_bind_breakers_open".into(), open_breakers);
+        }
         let response = ClientControlResponse::ServerDescribe {
             protocol_ver: PROTOCOL_VERSION,
             subc_ops: subc_ops(),
@@ -1543,6 +1872,59 @@ impl ControlHandler {
     ) -> Result<Frame, RouterError> {
         self.observe_route_open_refusal(ctx, module_id, code);
         control_error_frame(frame, code, message.into())
+    }
+
+    /// Refuse a `route.open` because the target module's bind-relay breaker is
+    /// open, without attempting the relay.
+    ///
+    /// The wire code is `module_timeout`, which is the truth (the module has
+    /// not been answering binds) and which both SDKs already classify as
+    /// retryable with capped backoff. Reusing it is what keeps this change out
+    /// of both SDKs; the daemon-side distinction lives in the counter key
+    /// instead.
+    ///
+    /// DELIBERATELY NOT LOGGED PER OCCURRENCE, unlike every other refusal.
+    /// While a breaker is open this fires on every open to that module, and the
+    /// stall written up in `docs/designs/route-open-head-of-line.md` already
+    /// produced 261 lines about a single module inside 3000 lines of daemon
+    /// log. The rare transitions are logged at warn/info instead and the volume
+    /// is carried by the counter, so the evidence survives without the flood.
+    /// The debug line keeps a per-refusal record reachable for whoever turns
+    /// the level up.
+    fn route_open_breaker_refusal_frame(
+        &self,
+        ctx: &RouteCtx,
+        frame: &Frame,
+        module_id: &str,
+        consecutive_timeouts: u32,
+        retry_in: Duration,
+        probe_in_flight: bool,
+    ) -> Result<Frame, RouterError> {
+        self.counters
+            .increment_route_open_refused(crate::observability::ROUTE_OPEN_REFUSED_BREAKER_OPEN);
+        debug!(
+            target: "control",
+            code = "module_timeout",
+            module_id = ?module_id,
+            connection_id = ctx.connection_id.get(),
+            consecutive_timeouts,
+            retry_in_ms = retry_in.as_millis() as u64,
+            probe_in_flight,
+            "route.open refused by open bind-relay breaker"
+        );
+        let detail = if probe_in_flight {
+            "one probe bind is already in flight; retry once it settles".to_string()
+        } else {
+            format!("not relaying for another {retry_in:?}")
+        };
+        control_error_frame(
+            frame,
+            "module_timeout",
+            format!(
+                "module_id '{module_id}' failed {consecutive_timeouts} consecutive route.bind \
+                 relays; {detail}"
+            ),
+        )
     }
 
     /// `code` is daemon vocabulary and prints plainly; `module_id` is the
@@ -1924,6 +2306,43 @@ impl ControlHandler {
         };
         identity.project_root = project_root.as_path().to_path_buf();
 
+        // Last gate before any relay work, and deliberately after the cheap
+        // registry and availability checks above: those name a more precise
+        // condition (unknown, removed, reloading) and a caller is better served
+        // by the precise code than by this one.
+        //
+        // Everything below this point costs an egress permit, a reserved handle
+        // pair and, if the module does not answer, the whole relay budget with
+        // the connection's reader held for it. A module that has already burned
+        // that budget `threshold` times in a row does not get to charge it
+        // again until a probe says it recovered.
+        let mut breaker = match self.route_bind_breakers.admit(&target_module_id) {
+            RouteBindAdmission::Admitted { guard, probe } => {
+                if probe {
+                    info!(
+                        module_id = %target_module_id,
+                        connection_id = ctx.connection_id.get(),
+                        "route.bind breaker half-open: admitting one probe"
+                    );
+                }
+                guard
+            }
+            RouteBindAdmission::Refused {
+                consecutive_timeouts,
+                retry_in,
+                probe_in_flight,
+            } => {
+                return Ok(vec![self.route_open_breaker_refusal_frame(
+                    ctx,
+                    &frame,
+                    &target_module_id,
+                    consecutive_timeouts,
+                    retry_in,
+                    probe_in_flight,
+                )?]);
+            }
+        };
+
         // Resolve the per-module budget here so the wait matches the operator's
         // intent for this specific target. A per-module override in
         // `subc.jsonc` (or `with_route_bind_relay_timeouts` for embedded
@@ -2037,11 +2456,21 @@ impl ControlHandler {
         match timeout_at(relay_deadline, receiver).await {
             Ok(Ok(RouteBindRelayOutcome::Accepted)) => {
                 reservation.disarm();
+                if breaker.record_accepted() {
+                    info!(
+                        module_id = %target_module_id,
+                        "route.bind breaker closed: the probe was accepted"
+                    );
+                }
                 self.observe_route_open_accept(ctx, &target_module_id, &principal_label);
                 Ok(Vec::new())
             }
             Ok(Ok(RouteBindRelayOutcome::Rejected(body))) => {
                 reservation.release_and_disarm();
+                // A module that says no in microseconds is healthy. Rejection
+                // is a different condition with its own refusal and must not
+                // move the breaker.
+                breaker.record_inconclusive();
                 self.counters
                     .increment_route_open_refused("module_rejected");
                 info!(
@@ -2056,6 +2485,7 @@ impl ControlHandler {
             }
             Ok(Ok(RouteBindRelayOutcome::ModuleGone(message))) => {
                 reservation.release_and_disarm();
+                breaker.record_inconclusive();
                 // Fires when the module's connection closes while a relayed
                 // bind is pending -- typically a caller racing a module restart
                 // whose bind was relayed BEFORE the drain mark went up. Logged
@@ -2076,6 +2506,7 @@ impl ControlHandler {
             }
             Ok(Err(_)) => {
                 reservation.release_and_disarm();
+                breaker.record_inconclusive();
                 Ok(vec![self.route_open_refusal_frame(
                     ctx,
                     &frame,
@@ -2086,6 +2517,21 @@ impl ControlHandler {
             }
             Err(_) => {
                 reservation.release_and_disarm();
+                // THE ONLY ARM THAT MOVES THE BREAKER. Budget exhausted with no
+                // answer at all is the one condition a fast refusal can
+                // usefully stand in for; every other arm already answered.
+                if let Some(opened) = breaker.record_timeout(
+                    self.route_bind_breaker_threshold,
+                    self.route_bind_breaker_cooldown,
+                ) {
+                    warn!(
+                        module_id = %target_module_id,
+                        consecutive_timeouts = opened.consecutive_timeouts,
+                        cooldown_ms = self.route_bind_breaker_cooldown.as_millis() as u64,
+                        reopened_after_probe = opened.reopened_after_probe,
+                        "route.bind breaker open: refusing route.open for this module without relaying until one probe says it recovered"
+                    );
+                }
                 // The generous budget just burned to no answer: the module is
                 // registered and its connection is up, but its bind handler sat
                 // on the ack for the full budget (warm-on-bind, cold configure,

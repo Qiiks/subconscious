@@ -78,15 +78,19 @@ impl Drop for TestDaemon {
     }
 }
 
+/// Bind-relay breaker policy for a test daemon: consecutive relay timeouts that
+/// open a module's breaker, and how long it stays open before one probe.
+pub type BreakerPolicy = (u32, Duration);
+
 pub async fn start_test_daemon(name: &str) -> TestDaemon {
-    start_test_daemon_inner(name, None, None, None, Vec::new()).await
+    start_test_daemon_inner(name, None, None, None, Vec::new(), None).await
 }
 
 pub async fn start_test_daemon_with_process_liveness(
     name: &str,
     process_liveness: Arc<dyn ModuleProcessLiveness>,
 ) -> TestDaemon {
-    start_test_daemon_inner(name, Some(process_liveness), None, None, Vec::new()).await
+    start_test_daemon_inner(name, Some(process_liveness), None, None, Vec::new(), None).await
 }
 
 pub async fn start_test_daemon_with_process_liveness_and_supervisor(
@@ -100,6 +104,7 @@ pub async fn start_test_daemon_with_process_liveness_and_supervisor(
         Some(supervisor_handle),
         None,
         Vec::new(),
+        None,
     )
     .await
 }
@@ -118,6 +123,31 @@ pub async fn start_test_daemon_with_bind_timeout(
         Some(supervisor_handle),
         Some(bind_timeout),
         Vec::new(),
+        None,
+    )
+    .await
+}
+
+/// Start a test daemon with an explicit route.bind relay timeout AND an
+/// explicit bind-relay breaker policy.
+///
+/// The production breaker needs three full 12s budgets to open and stays open
+/// for 20s, which no test can afford to wait out; the constants carry the
+/// reasoning for those numbers and the tests pin the mechanism.
+pub async fn start_test_daemon_with_bind_timeout_and_breaker(
+    name: &str,
+    process_liveness: Arc<dyn ModuleProcessLiveness>,
+    supervisor_handle: SupervisorHandle,
+    bind_timeout: Duration,
+    breaker: BreakerPolicy,
+) -> TestDaemon {
+    start_test_daemon_inner(
+        name,
+        Some(process_liveness),
+        Some(supervisor_handle),
+        Some(bind_timeout),
+        Vec::new(),
+        Some(breaker),
     )
     .await
 }
@@ -139,6 +169,7 @@ pub async fn start_test_daemon_with_route_bind_relay_overrides(
         Some(supervisor_handle),
         Some(daemon_wide),
         per_module,
+        None,
     )
     .await
 }
@@ -149,6 +180,7 @@ async fn start_test_daemon_inner(
     supervisor_handle: Option<SupervisorHandle>,
     bind_timeout: Option<Duration>,
     per_module_bind_timeouts: Vec<(String, Duration)>,
+    breaker: Option<BreakerPolicy>,
 ) -> TestDaemon {
     let temp_dir = unique_temp_dir(name);
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -193,6 +225,9 @@ async fn start_test_daemon_inner(
     }
     if let Some(bind_timeout) = bind_timeout {
         handler = handler.with_route_bind_relay_timeout(bind_timeout);
+    }
+    if let Some((threshold, cooldown)) = breaker {
+        handler = handler.with_route_bind_breaker(threshold, cooldown);
     }
     let control = Arc::new(handler);
     let forwarding = control.forwarding();

@@ -13,9 +13,12 @@ use subc_protocol::{
 };
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::time::Instant;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
-use crate::{observability::DaemonCounters, registry::ConnectionId, router::FrameSink, Frame};
+use crate::{
+    control::RouteBindBreakers, observability::DaemonCounters, registry::ConnectionId,
+    router::FrameSink, Frame,
+};
 
 /// Default per-channel request-credit window for modules that schedule internally.
 const DEFAULT_MODULE_MANAGED_WINDOW: usize = 32;
@@ -336,11 +339,20 @@ pub struct ForwardingTable {
     inner: Arc<RwLock<ForwardingInner>>,
     close_registry: Mutex<HashMap<ConnectionId, oneshot::Sender<CloseReason>>>,
     counters: DaemonCounters,
+    /// Per-target-module bind-relay breaker state. It lives here, beside the
+    /// module connections it describes, because this is where a module
+    /// connection's identity is established and therefore where a stale
+    /// verdict has to be discarded.
+    route_bind_breakers: RouteBindBreakers,
 }
 
 impl ForwardingTable {
     pub(crate) fn counters(&self) -> DaemonCounters {
         self.counters.clone()
+    }
+
+    pub(crate) fn route_bind_breakers(&self) -> RouteBindBreakers {
+        self.route_bind_breakers.clone()
     }
 
     pub(crate) fn register_connection_close(
@@ -423,6 +435,30 @@ impl ForwardingTable {
                 concurrency,
             },
         );
+        drop(inner);
+
+        // A new module connection has arrived under this id, so anything the
+        // bind-relay breaker learned was learned about a process that is no
+        // longer the one behind this name. See
+        // `RouteBindBreakers::reset_for_new_module_connection`.
+        //
+        // Keyed on ARRIVAL rather than on teardown deliberately: a connection
+        // going away is not evidence about anything, and a module whose
+        // connection drops without coming back should keep its verdict until
+        // something actually registers in its place. This also covers the
+        // unclean replacements -- a module killed mid-bind, or one whose
+        // connection was closing -- because registration is the single path by
+        // which any module connection becomes usable.
+        if let Some(discarded) = self
+            .route_bind_breakers
+            .reset_for_new_module_connection(&module_id)
+        {
+            info!(
+                module_id = %module_id,
+                discarded_consecutive_timeouts = discarded,
+                "route.bind breaker state discarded: a new module connection replaced the process it described"
+            );
+        }
         Ok(endpoint)
     }
 

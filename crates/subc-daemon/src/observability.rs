@@ -34,8 +34,22 @@ const ROUTE_OPEN_REFUSAL_COUNTER_CODES: &[&str] = &[
     "route_limit",
     "forwarding_error",
     "module_timeout",
+    ROUTE_OPEN_REFUSED_BREAKER_OPEN,
     "module_rejected",
 ];
+
+/// Counter key for a `route.open` refused by the per-module bind-relay breaker
+/// before any relay was attempted.
+///
+/// The frame the caller receives carries `module_timeout`, because both SDKs
+/// already classify that as retryable with capped backoff and inventing a new
+/// wire code would need a change in each of them. The COUNTER is deliberately a
+/// different key: "this module burned the full bind budget" and "this module is
+/// being refused in microseconds because it already did that repeatedly" are
+/// the two states an operator most needs to tell apart, and they are
+/// indistinguishable from the client side, where both look like one retryable
+/// error that the next attempt may well satisfy.
+pub(crate) const ROUTE_OPEN_REFUSED_BREAKER_OPEN: &str = "module_timeout_breaker_open";
 
 /// Shared count of authenticated socket connections accepted by the daemon.
 #[derive(Debug, Clone, Default)]

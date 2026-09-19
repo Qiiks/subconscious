@@ -47,6 +47,14 @@ const FAKE_AFT_CLEAN_EXIT_AFTER_MS_ENV: &str = "FAKE_AFT_CLEAN_EXIT_AFTER_MS";
 const FAKE_AFT_REJECT_ATTACH_ENV: &str = "FAKE_AFT_REJECT_ATTACH";
 const FAKE_AFT_BIND_NEVER_REPLY_ENV: &str = "FAKE_AFT_BIND_NEVER_REPLY";
 const FAKE_AFT_BIND_NEVER_REPLY_AFTER_ENV: &str = "FAKE_AFT_BIND_NEVER_REPLY_AFTER";
+/// Leave the FIRST N route.bind relays unanswered, then behave normally.
+///
+/// The mirror image of `FAKE_AFT_BIND_NEVER_REPLY_AFTER`, and the shape a test
+/// needs to watch a module RECOVER inside one process: restarting the stub
+/// without the wedging variable would also replace the module connection, which
+/// is itself a reason the daemon forgets what it observed, so a restart cannot
+/// distinguish recovery from amnesia.
+const FAKE_AFT_BIND_NEVER_REPLY_FIRST_ENV: &str = "FAKE_AFT_BIND_NEVER_REPLY_FIRST";
 const FAKE_AFT_MALFORMED_BIND_REPLY_ENV: &str = "FAKE_AFT_MALFORMED_BIND_REPLY";
 const FAKE_AFT_FAIL_REGISTRATION_ENV: &str = "FAKE_AFT_FAIL_REGISTRATION";
 const FAKE_AFT_FAIL_REGISTRATION_AFTER_FIRST_PATH_ENV: &str =
@@ -1032,10 +1040,16 @@ async fn handle_control_request(
                 }),
             )?;
             state.route_bind_count += 1;
+            // `route_bind_count` was just incremented, so it is this bind's
+            // 1-based ordinal: `_FIRST` wedges ordinals 1..=n and `_AFTER`
+            // wedges everything past n.
             let bind_never_reply = config.bind_never_reply
                 || config
                     .bind_never_reply_after
-                    .is_some_and(|after| state.route_bind_count > after);
+                    .is_some_and(|after| state.route_bind_count > after)
+                || config
+                    .bind_never_reply_first
+                    .is_some_and(|first| state.route_bind_count <= first);
             if bind_never_reply {
                 record_event(
                     config,
@@ -1614,6 +1628,7 @@ struct StubConfig {
     reject_attach: bool,
     bind_never_reply: bool,
     bind_never_reply_after: Option<usize>,
+    bind_never_reply_first: Option<usize>,
     malformed_bind_reply: Option<MalformedBindReply>,
     fail_registration: bool,
     events_path: Option<PathBuf>,
@@ -1693,6 +1708,13 @@ impl StubConfig {
                     .map_err(|source| StubError::InvalidBindNeverReplyAfter { raw, source })
             })
             .transpose()?;
+        let bind_never_reply_first = env::var(FAKE_AFT_BIND_NEVER_REPLY_FIRST_ENV)
+            .ok()
+            .map(|raw| {
+                raw.parse::<usize>()
+                    .map_err(|source| StubError::InvalidBindNeverReplyFirst { raw, source })
+            })
+            .transpose()?;
         let concurrency = concurrency_from_env()?;
         let role = role_from_env()?;
         let status = env::var(FAKE_AFT_STATUS_ENV).ok().map(|raw| {
@@ -1733,6 +1755,7 @@ impl StubConfig {
             reject_attach: env_flag(FAKE_AFT_REJECT_ATTACH_ENV),
             bind_never_reply: env_flag(FAKE_AFT_BIND_NEVER_REPLY_ENV),
             bind_never_reply_after,
+            bind_never_reply_first,
             malformed_bind_reply: malformed_bind_reply_from_env()?,
             fail_registration,
             events_path,
@@ -1937,6 +1960,10 @@ enum StubError {
         raw: String,
         source: std::num::ParseIntError,
     },
+    InvalidBindNeverReplyFirst {
+        raw: String,
+        source: std::num::ParseIntError,
+    },
     InvalidToolcallDelay {
         raw: String,
         source: std::num::ParseIntError,
@@ -2009,6 +2036,10 @@ impl fmt::Display for StubError {
             Self::InvalidBindNeverReplyAfter { raw, source } => write!(
                 f,
                 "invalid {FAKE_AFT_BIND_NEVER_REPLY_AFTER_ENV} value '{raw}': {source}"
+            ),
+            Self::InvalidBindNeverReplyFirst { raw, source } => write!(
+                f,
+                "invalid {FAKE_AFT_BIND_NEVER_REPLY_FIRST_ENV} value '{raw}': {source}"
             ),
             Self::InvalidToolcallDelay { raw, source } => write!(
                 f,
@@ -2088,6 +2119,7 @@ impl Error for StubError {
         match self {
             Self::InvalidCrashAfter { source, .. } => Some(source),
             Self::InvalidBindNeverReplyAfter { source, .. } => Some(source),
+            Self::InvalidBindNeverReplyFirst { source, .. } => Some(source),
             Self::InvalidToolcallDelay { source, .. } => Some(source),
             Self::InvalidExitCode { source, .. } => Some(source),
             Self::InvalidOrphanWriterDelay { source, .. } => Some(source),
