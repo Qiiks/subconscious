@@ -348,11 +348,18 @@ for t in strings nm; do
   ml=$(count_in "$t" "$DEST" "$MARKER")
   say "marker $t:\"$MARKER\" staged $ms / live $ml"
   if [ "$ms" -gt 0 ] && [ "$ml" -eq 0 ]; then marker_tables="$marker_tables $t"; fi
+  # N/N in ONE table is not a refusal on its own: a JSON key that is new as a
+  # string literal can share its spelling with a symbol both builds already
+  # carry (PLEX, 01c23c5: `annotations` strings 1/0, nm 3/3). The literal
+  # discriminates; the symbol is a different fact about a different table. What
+  # keeps this honest is the control read in the SAME table the marker
+  # discriminated in (below). Refusal is reserved for a marker that separates
+  # the builds in NO table, which the check after this loop enforces.
   if [ "$ms" -gt 0 ] && [ "$ml" -gt 0 ]; then
-    refuse "marker reads on BOTH images in the $t table: it does not separate the two builds"
+    say "  note: marker also reads on both images in the $t table; that table is not evidence either way"
   fi
 done
-[ -n "$marker_tables" ] || refuse "marker discriminates in NEITHER table: absent from the staged artifact (dead-code-eliminated, or a phrase from a comment, or a string belonging to a different binary)"
+[ -n "$marker_tables" ] || refuse "marker discriminates in NEITHER table: either absent from the staged artifact (dead-code-eliminated, a phrase from a comment, a string from a different binary) or present on BOTH images everywhere (a control, not a marker)"
 marker_table=""
 if [ -n "$CONTROL" ]; then
   for t in $marker_tables; do
