@@ -184,6 +184,27 @@ if command -v gh >/dev/null 2>&1; then
   sched=$(gh run list --event schedule --limit 1 \
       --json conclusion,createdAt,headSha \
       --jq '.[] | "\(.conclusion) \(.createdAt[0:16]) \(.headSha[0:8])"' 2>/dev/null || true)
+  # A CRON THAT STOPPED FIRING LEAVES A GREEN LAST RUN, so conclusion alone is
+  # not enough: a schedule that ran for months, went green, and then stopped
+  # (workflow renamed, default branch moved, repo activity-disabled after 60
+  # days) reports exactly what a healthy one reports. Age is the discriminator.
+  #
+  # 48h rather than 24h because GitHub's scheduler is LATE AND VARIABLE: CEREB
+  # measured a `17 4 * * *` cron landing at ~09:00Z, five hours behind, on all
+  # twelve of their runs. A 24h bound would fire on a healthy queue delay, and
+  # an alarm that fires on healthy work gets muted.
+  sched_age_h=$(gh run list --event schedule --limit 1 --json createdAt \
+      --jq '.[0].createdAt' 2>/dev/null \
+    | { read -r ts; [ -n "$ts" ] && python3 -c "
+import sys,datetime
+t=datetime.datetime.fromisoformat('$ts'.replace('Z','+00:00'))
+print(int((datetime.datetime.now(datetime.timezone.utc)-t).total_seconds()//3600))
+" 2>/dev/null || true; })
+  if [ -n "${sched_age_h:-}" ] && [ "$sched_age_h" -gt 48 ] 2>/dev/null; then
+    echo "" >&2
+    echo "pre-push NOTICE: the last SCHEDULED run is ${sched_age_h}h old." >&2
+    echo "  A cron that stopped firing leaves a green last run and looks healthy." >&2
+  fi
   if [ -z "$sched" ]; then
     if grep -q "schedule:" "$(git rev-parse --show-toplevel)/.github/workflows/"*.yml 2>/dev/null; then
       echo "" >&2
