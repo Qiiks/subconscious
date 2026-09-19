@@ -179,5 +179,29 @@ mod tests {
             .unwrap();
         assert_eq!(line, format!("{expected}\n"));
         assert!(!line.contains('\u{1b}'));
+
+        // THE DAEMON'S OWN LOGGER NAMES, READ BACK FROM THE FILE. A `target:`
+        // string is opaque to the compiler and checked by nothing until an
+        // operator filters on it, and by then the symptom is silence: under
+        // r2 a `::` path target maps to the BARE module id, so the four
+        // `target: "subc_daemon::control"` sites in control.rs rendered as
+        // root `subc:` for a week while looking like they named a component.
+        // The subscriber is process-global, which is why this lives in the
+        // same test as the install above rather than beside it.
+        tracing::info!(target: "control", "component line");
+        tracing::info!(target: "subc_daemon::control", "path-shaped target");
+        let lines = fs::read_to_string(logs_dir.join("fusiform.2026-09-05.log")).unwrap();
+        let rendered: Vec<&str> = lines.lines().collect();
+        assert_eq!(rendered.len(), 3, "{lines}");
+        assert!(
+            rendered[1].contains(" fusiform.control: component line"),
+            "a segment-grammar target must render as <module>.<component>: {}",
+            rendered[1]
+        );
+        assert!(
+            rendered[2].contains(" fusiform: path-shaped target"),
+            "a `::` target must map to the bare module id, never a component: {}",
+            rendered[2]
+        );
     }
 }

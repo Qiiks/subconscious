@@ -1,6 +1,6 @@
 [package]
 name = "subc-core"
-version = "0.18.19"
+version = "0.18.20"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -43,7 +43,7 @@ harness = false
 required-features = ["bench-harness"]
 
 [dependencies]
-subc-daemon = { path = "../subc-daemon", version = "0.18.17" }
+subc-daemon = { path = "../subc-daemon", version = "0.18.18" }
 cortexkit-log = { version = "0.3.0", git = "https://github.com/cortexkit/commons.git", rev = "50a70f2dbb1e44efa8346271e17c9aa8cd6115c8" }
 cortexkit-paths = "0.1.1"
 base64 = "0.22"
