@@ -212,14 +212,34 @@ print(int((datetime.datetime.now(datetime.timezone.utc)-t).total_seconds()//3600
       echo "  A schedule that never fires looks exactly like one that passes." >&2
     fi
   else
+    # CANCELLED IS NOT RED -- it is a SAMPLE NEVER TAKEN, and conflating them
+    # inflates the count and points at the wrong cause. The concurrency group is
+    # `ci-${{ github.ref }}`, so a push to master and the morning cron SHARE it
+    # and the push cancels the cron. Measured 2026-09-19: of six non-success
+    # scheduled runs here, FOUR were cancelled by my own pushes and only two were
+    # genuine failures. I published "six reds" to the fleet twice before reading
+    # one of the logs.
+    #
+    # The cancelled case is not a defect to fix: the push run that cancelled it
+    # tests a newer tip against the same siblings, so it answers the same
+    # question. It is a MISSING SAMPLE, not a missed failure, and the operator
+    # needs those worded differently.
     case "$sched" in
       success*) : ;;
+      cancelled*)
+        echo "" >&2
+        echo "pre-push NOTICE: the last SCHEDULED run was CANCELLED, not failed:" >&2
+        echo "  $sched" >&2
+        echo "  A push shares the concurrency group with the cron, so the sample" >&2
+        echo "  was never taken. Not a red. The push run that cancelled it covers" >&2
+        echo "  the same question against a newer tip." >&2
+        ;;
       *)
         echo "" >&2
-        echo "pre-push NOTICE: the last SCHEDULED run was not green:" >&2
+        echo "pre-push NOTICE: the last SCHEDULED run FAILED:" >&2
         echo "  $sched" >&2
         echo "  It answers 'is what already landed still good', and it reports to nobody." >&2
-        echo "  gh run list --event schedule --limit 10" >&2
+        echo "  gh run list --event schedule --limit 10 --json conclusion,createdAt,headSha" >&2
         ;;
     esac
   fi
