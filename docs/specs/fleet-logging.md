@@ -1,9 +1,22 @@
 # Fleet logging — one crate, one format, module-owned files
 
-Status: normative. Approved by the operator 2026-09-05 after a fourteen-module
-census (thirteen answered; ENGRAM and WERNI fold in when they land). Supersedes
-the "Daemon slice" of `ck-module-logs.md` (daemon-owned per-module files); the
-verb section of that document is re-based here.
+Status: normative, **r2**. Approved by the operator 2026-09-19 after the fleet
+log census (`docs/audits/fleet-log-census-2026-09-19.md`) found two of nineteen
+producers on the r1 format two weeks after r1 was approved. r2 supersedes r1 on
+the line format, the file layout, rotation, and the tag mechanism; it keeps
+r1's crate architecture, levels, `CK_LOG` knob, redaction, session semantics,
+and adoption rules for the two live-user modules.
+
+What changed and why, in one paragraph: r1 had a `tag=` field orthogonal to
+level, a positional module id, per-harness files for plugins, and rename-based
+rotation. The census showed a fleet with six line formats, and the design
+conversation that followed found that every mainstream logging framework
+solves "errors only, but also perf metrics" the same way — a **hierarchical
+logger name with per-logger levels**, never a separate tag dimension. r2 adopts
+that, which also settles where the module id lives (it is the root of the
+logger name), and moves rotation from rename to **date-stamped segments**,
+which removes the multi-writer race that per-harness files existed to avoid,
+so plugins and the module can share one file.
 
 ## Why one crate
 
@@ -15,9 +28,17 @@ by Rust crate path, and the exact tags collided with the same string used as a
 repository path by other modules. Twelve of fourteen have no level control.
 Two plugin lanes log to `$TMPDIR`, one of them uncapped. Consistency across
 fourteen implementations does not happen by asking; it happens when the file,
-format, rotation, retention, levels, tags, session field and redaction all come
-from one place a module initialises with its module id and nothing else — the
-same lesson the data-path resolver taught.
+format, rotation, retention, levels, logger names, session field and redaction
+all come from one place a module initialises with its module id and nothing
+else — the same lesson the data-path resolver taught.
+
+The 2026-09-19 census measured the cost of the gap directly: eleven seats
+**linked** the crate and one **routed** through it. Linking is a Cargo edit;
+routing is the per-seat change nobody is blocked on, and the daemon's stderr
+capture (a well-behaved fallback with rotation and a renderer) removed the
+visible cost of not doing it. Adoption is therefore **mandatory** under r2, and
+the capture lane's non-emptiness becomes a reported finding rather than a
+sentence in a spec.
 
 - Rust: `cortexkit-log` in `commons/crates/cortexkit-log` (landed at commons
   `01da197`; publish to crates.io follows the first fleet adopter; path-dep
@@ -27,112 +48,197 @@ same lesson the data-path resolver taught.
 - Both are conformance-tested against one golden fixture set that lives in
   `subconscious/crates/subc-core/tests/fixtures/log_format_golden.json` and is
   vendored into commons (authority side owns the fixture; same rule as the
-  store-path golden).
+  store-path golden). **The r2 fixture is a breaking rewrite of the r1 one**;
+  both twins re-pin in the same change.
+
+## Line format
+
+```
+<timestamp> <LEVEL> <logger>: [<bound fields>] <message> <event fields>
+```
+
+```
+2026-09-19T04:46:29.432Z INFO  magic-context.historian: [harness=pi session=01a0b7fc-bba1-7f60-aa2b-27c2df4481ab] trigger fired reason=force_band usage=93.9%
+2026-09-19T04:46:29.449Z INFO  magic-context.transform: [harness=opencode session=ses_0758f6ce7ffeJ0A9sV8Qvema7d] transform completed ms=24.3 messages=25 targets=23
+2026-09-19T04:46:29.209Z DEBUG magic-context.perf: [harness=pi session=01a0b7fc-bba1-7f60-aa2b-27c2df4481ab] transform stage stage=stickyReplayDecisions ms=0.0
+2026-09-19T07:59:01.882Z ERROR engram.scheduler: capture halted after 3 consecutive failures gen=192 class=dedup_map_unreadable
+2026-09-19T07:59:03.501Z DEBUG synapse.perf: job done model=qwen3-0.6b lane=decode tokens=12 ms=118
+2026-09-19T07:58:59.004Z WARN  aft.index: [root=/Work/CortexKit/prefrontal] build fell back to full projection reason=journal_gap ms=4288
+2026-09-19T07:59:02.113Z INFO  prefrontal-core.wake: [agent=agent_ab64ea0873bbee0c session=opencode:ses_0758f6ce7ffeJ0A9sV8Qvema7d] delivered lane=notice ms=22
+2026-09-19T07:58:58.970Z INFO  subc.supervise: module reported non-ok health module_id=engram status=Degraded
+```
+
+Field by field, each with the reason it is where it is:
+
+- **`<timestamp>`** — RFC3339, UTC, millisecond precision, `Z` suffix. Fixed
+  width, lexically monotonic (MC's dashboard sorts on it). Never local time.
+- **`<LEVEL>`** — one of `TRACE DEBUG INFO WARN ERROR`, padded to five. Fixed
+  column so the eye can run down it.
+- **`<logger>:`** — the **hierarchical logger name**, dotted, rooted at the
+  module id: `engram`, `engram.scheduler`, `magic-context.perf`. This is
+  Logback's `%logger`, Python's `getLogger(__name__)`, tracing's target. The
+  trailing colon is the separator every framework uses; without it the name
+  reads as the first word of the message. The module id is here **because it
+  is the root of the hierarchy that `CK_LOG` filters on**, not as decoration —
+  which is why it survived the argument that the file path already names it.
+- **`[<bound fields>]`** — context bound to a scope rather than to an event:
+  process-level (`harness=pi`) or scoped (`session=…`, `agent=…`, `root=…`).
+  Bracketed because bound fields are **constant across a run of lines**, so the
+  bracket has a stable width within any one scope and the message column stays
+  aligned in the file you are reading. `]` is the unambiguous end of context; a
+  parser lifts these without guessing. **Absent entirely when nothing is
+  bound** — never `[]`.
+- **`<message>`** — free text, positional. Positional over `msg="…"` because
+  every line in this fleet is read by a human before it is read by a parser,
+  and the machine consumers we have (two doctors, `ck logs`) key on the fixed
+  columns and on message words, never on extracting the message as a field.
+  The event is structured underneath (`tracing` / the TS twin's record), so a
+  JSON renderer is a formatter swap if one is ever needed, not a call-site
+  change.
+- **`<event fields>`** — `key=value`, after the message, values with spaces or
+  `"` double-quoted with `\"` escaping, newlines escaped as `\n`. Last because
+  they vary from zero to eighty characters per line and a terminal wrap should
+  cut them, not the message.
+
+Nothing marks where the message ends and event fields begin. A message that
+contains a literal `key=value` is ambiguous to a field parser. This is the same
+trade `tracing`'s fmt layer and zerolog's console writer make, and it is
+accepted for the reason above: the text line is the human lane.
+
+### Bound fields
+
+Two scopes, both required by the operator's ask (session ids for AFT and MC,
+agent ids for prefrontal):
+
+- **Process-level** — bound once at `init` and present on every line the
+  process writes. For a plugin, `harness=<pi|opencode|omp|claude-code|…>` is
+  mandatory: after r2 all of a module's lanes share one file, so the harness
+  field is the only thing that separates them.
+- **Scoped** — bound for a span of work and present on every line inside it:
+  `session=<issuer>:<id>`, `agent=<agent_id>`, `root=<path>`. Rust: a
+  `tracing::Span` with the fields as span fields (`session_span` already does
+  this for session). TS: a child logger carrying the bindings.
+
+**`session=` carries the whole id, always.** It is a match key against a
+session store, not a display string, and its shape differs by issuer
+(`01a0b7fc-bba1-7f60-aa2b-27c2df4481ab` for pi, `ses_0758f6ce7ffeJ0A9sV8Qvema7d`
+for opencode). A truncated id is greppable against nothing. Issuer prefix as in
+r1: `session=<issuer>:<id>`, absent when there is none, never a placeholder.
+
+### Logger names replace tags
+
+r1 declared a `tag=` vocabulary per module, orthogonal to level, so an operator
+could raise `perf` without raising everything. r2 gets the same capability from
+the logger hierarchy, which is how every framework does it:
+
+```
+CK_LOG=error                                errors only, fleet-wide
+CK_LOG=error,magic-context.perf=info        errors, plus MC's perf lines
+CK_LOG=warn,aft=debug                       everything aft, warnings elsewhere
+CK_LOG=info,engram.gc=trace                 one component at trace
+```
+
+RUST_LOG grammar, unchanged; the TS twin implements the same grammar. A logger
+name is `<module_id>` optionally followed by `.<component>` segments matching
+`[a-z][a-z0-9-]*`. A level set on a name applies to it and every name beneath
+it; the most specific match wins. **The bare module id is a valid logger** — a
+module that names no components still gets `engram:` on every line and working
+level control; it forgoes only sub-component granularity.
+
+A module declares its logger names in its manifest, as r1 declared tags, so
+`ck logs <id> --loggers` can list what exists. The crate does not refuse an
+undeclared name at runtime (a refusal in a logging call is a worse failure than
+an undeclared name); the manifest declaration is for discoverability and for
+`ck daemon lint`.
 
 ## Files
 
-```text
-<module data dir>/logs/<module_id>.log                 the supervised process
-<module data dir>/logs/<module_id>.<harness>.log       one per harness-hosted plugin process
-<module data dir>/logs/<name>.log.1 … .log.<keep>      rotated generations
-~/.local/share/cortexkit/run/logs/subc.log             the daemon's own log (subconscious only)
-~/.local/share/cortexkit/run/logs/<module_id>.stderr.log   daemon capture of a module's stray stderr/stdout
+```
+<module data dir>/logs/<module_id>.<YYYY-MM-DD>.log     one segment per UTC day, all lanes
+~/.local/share/cortexkit/run/logs/subc.<YYYY-MM-DD>.log  the daemon's own log (subconscious only)
+~/.local/share/cortexkit/run/logs/<module_id>.stderr.log daemon capture of stray stderr/stdout
 ```
 
-- **One file per process.** A plugin runs inside the harness process and cannot
-  share the module's handle; `<module>.<harness>.log` is the natural unit
-  (`magic-context.opencode.log`, `magic-context.pi.log`, `magic-context.omp.log`,
-  `aft.opencode.log`, `prefrontal.opencode.log`). A module never needs lane
-  files for its own threads — that is what `session=` and `tag=` are for.
+- **One file per module per day.** r1 split plugin lanes into
+  `<module>.<harness>.log` because a plugin runs inside the harness process and
+  cannot share a file handle across a rename-based rotation. r2 has no rename
+  (below), so the plugins and the module all append to today's segment and
+  `harness=` on every plugin line is what tells them apart. A user debugging MC
+  reads **one timeline**, not four files to reconstruct one.
+- **Date-stamped, never renamed.** Every writer computes today's segment name
+  from the UTC clock and opens it `O_APPEND | O_CREAT`, one `write(2)` per
+  framed line (the crate already does this; the comment at the site says why).
+  Concurrent appends from any number of processes land at line boundaries. A
+  writer re-derives the name on every write and reopens when the day rolls;
+  the clock is the only coordinator and it needs none. Yesterday's segment
+  becomes immutable at midnight by construction.
+- **No size cap within a day.** This is the cost of never renaming and it is
+  accepted: a segment that grows past a threshold (default 256 MiB) is an
+  **alarm** — the crate reports it once through the same first-failure-to-
+  stderr channel it uses for swallowed writes, and `fleet-pulse` reads
+  oversized segments as a finding — because a module writing that much in a
+  day has a defect worth surfacing, and truncating it would hide the defect.
 - The data dir is `module_data_dir(module_id)` from `cortexkit-store-types` /
   `@cortexkit/store` — the crate takes the module id and resolves the path;
   callers never assemble it (the doubled-path incident).
 - Files `0600`, directory `0700` on Unix; per-user ACL inherited on Windows.
-- **Nothing a module writes lands in `subc.log` anymore.** The daemon's log
-  carries supervisor events, health transitions, route drops — all already
-  stamped `module_id=<id>`. Two daemon-side residues stay on purpose: the
+- **Nothing a module writes lands in `subc.*.log`.** The daemon's log carries
+  supervisor events, health transitions, route drops — all stamped
+  `module_id=<id>` as an *event field*, because there the module is the subject
+  of the line, not its emitter. Two daemon-side residues stay on purpose: the
   stderr crash ring (`supervisor.stderr_tail`; a panicking module cannot write
   its own log, and the backtrace is the line worth having) and
-  `run/logs/<id>.stderr.log`, a daemon-owned capture of anything a module still
-  emits on stderr/stdout. A module that logs through the crate writes nothing
-  there, so that file being non-empty is itself a finding.
-
-## Line format
-
-One line per event, UTC with millisecond precision, level padded to five,
-module id, then optional fields, then the message, then `key=value` fields.
-No ANSI in files, ever (the daemon's file layer sets `with_ansi(false)`).
-
-```
-2026-09-05T10:41:03.123Z INFO  broca session=broca:8f3a1c02 run=r_12 dispatch admitted model=anthropic/claude-sonnet-4-5
-2026-09-05T10:41:03.130Z WARN  magic-context session=opencode:ses_00fc88222ffe tag=perf transform stage folded ms=412 retry=2
-2026-09-05T10:41:04.002Z ERROR insula provider=codex account=ufuk3 refresh failed class=auth_invalid
-2026-09-05T10:41:05.500Z INFO  fusiform poll changed version=1788526509641 eras=22 facts_changed=0 arrived=2
-```
-
-- `session=<issuer>:<id>` — issuer is the namespace that minted the id
-  (`opencode`, `pi`, `omp`, `claude-code`, `broca`, `wernicke:<platform>`…). A
-  line may carry more than one session-shaped field when two lineages meet
-  (`session=opencode:… broca_session=…`). **Absent when there is none; never a
-  placeholder.** MC's synthetic `"global"` ids become absence.
-- `tag=<t>` — the module's own tag vocabulary (`perf`, `wire`, `trace`,
-  `hist`, `store`…), declared in the module manifest (`self_signals`-style: a
-  list with a one-line description each) so `ck module logs <id> --tags` can
-  list what exists. Tags are tracing targets on Rust; the TS twin mirrors them.
-- Message text is free; fields after it are `key=value`, values with spaces
-  double-quoted. The crate escapes newlines inside values so one event is
-  always one line.
-- Multi-line payloads (backtraces) are emitted as one line per source line,
-  each carrying the same timestamp and `tag=panic`; the crate installs a panic
-  hook that does this so a module's last words go into its own file, not only
-  the daemon's ring.
-
-## Levels and tags: one knob
-
-`CK_LOG=<spec>` in the process environment, `RUST_LOG` grammar:
-`info`, `info,perf=debug`, `warn,wire=trace,mc-store=debug`. Both crates read
-it; nothing else configures verbosity.
-
-- The daemon injects it at spawn from `subc.jsonc`:
-  ```jsonc
-  "modules": { "broca": { "program": "…", "log": { "level": "info", "tags": { "perf": "debug" },
-                                                    "max_file_mb": 32, "keep": 2, "max_age_days": 14 } } }
-  ```
-  Defaults when the key is absent: `info`, no tag overrides, 32 / 2 / 14.
-  `ck module restart <id>` applies a change; a live-reload op is a later
-  addition and not part of this contract.
-- Plugins read the same env from the harness process. Harnesses that give a
-  plugin no environment path get the defaults; a plugin may also read
-  `.cortexkit/<module>.jsonc log.*` for the same keys and must document which
-  wins (env wins, as it does for every other knob).
-- **No fleet tag vocabulary.** A module declares its tags; the crate refuses
-  an undeclared tag at compile time on Rust (a `const` list) and at init on TS.
+  `run/logs/<id>.stderr.log`, the daemon-owned capture of anything a module
+  still emits on stderr/stdout. **A module on the crate writes nothing there,
+  so that file being non-empty for an adopted module is a defect, and
+  `fleet-pulse` reports it.** The capture keeps its r1 rename-based rotation
+  because it has exactly one writer.
 
 ## Retention
 
-Defaults are sized against the noisiest module, not the median (ENGRAM's
-rule from the GC-grace incident): a module at `progress` verbosity writes
-~50 MB/day, so `32 MiB × keep 2` bounds the active set and `max_age_days`
-bounds the rotated set independently of rate. Rate-driven tags (upload
-progress, walk slices) are declared tags that ship OFF by default in the
-module's own `CK_LOG` baseline; a module must not put a per-object line
-behind `info`.
+Per-module policy, writer-executed, no central authority — with the reasons.
 
-Size cap per file (`max_file_mb`, checked on every write), `keep` rotated
-generations, and `max_age_days` applied to rotated generations at every
-rotation and at init. Rotation renames `.log → .log.1 → … → .log.<keep>` and
-reopens; a follower detects the inode change. No time-based rotation of the
-active file: a quiet module's single line must not roll on a clock.
+- **Policy is per-module** because volumes differ by orders of magnitude
+  (engram's GC walk at `progress` verbosity versus claustrum's audit-adjacent
+  events versus synapse perf). It lives in the one place the daemon already
+  reads at spawn:
+  ```jsonc
+  "modules": { "broca": { "program": "…", "log": { "level": "info",
+                                                    "loggers": { "broca.perf": "debug" },
+                                                    "max_age_days": 14,
+                                                    "alarm_segment_mb": 256 } } }
+  ```
+  Defaults when the key is absent: `info`, no per-logger overrides, 14 days,
+  256 MiB. Standalone MC/AFT read the same keys from
+  `.cortexkit/<module>.jsonc log.*`; env wins, as for every other knob.
+- **Execution is by the writer, at process start and at each day roll.** With
+  date-stamped names, pruning is a **string comparison on the filename** — no
+  `stat`, no mtime, no generation renaming: `magic-context.2026-08-20.log` is
+  older than the window, unlink it. A lost unlink race returns `ENOENT`, which
+  is the correct outcome. It is cheap enough to run unconditionally and it is
+  the only shape that works when the daemon is down or absent.
+- **No daemon sweeper.** Module data dirs are module-owned; the daemon writes
+  only under `run/`. That boundary is what keeps a daemon defect from deleting
+  a module's data, and a background task unlinking inside `engram/logs/` would
+  cross it for a job the writer does correctly. The one case the writer cannot
+  cover — a retired module that never starts again — is an **operator verb**
+  (`ck logs prune`, later), where the operator owns everything and no boundary
+  is crossed. Measured 2026-09-19, orphaned log directories on this host are
+  negligible.
+- `max_age_days` bounds the set independently of rate; the segment alarm
+  bounds the rate's visibility. Rate-driven loggers (upload progress, walk
+  slices) ship at `debug` or below in the module's own baseline; a module must
+  not put a per-object line at `info`.
 
 ## Redaction
 
-The sink takes a `Redactor` (a `fn(&str) -> Cow<str>` on Rust, a
-`(line: string) => string` on TS) applied to every complete line before the
-write. Fleet default redacts credential shapes (bearer/JWT-looking tokens, `ckh_`
-handles, `sk-`/`ghp_`-style keys, `Authorization:` values); a module composes
-its own on top (MC's sanitizer; claustrum's hand-written redacting `Debug`
-impls remain the first line of defence). A module MUST NOT log prompt text,
-message bodies, or credential payloads at any level; the redactor is the
+Unchanged from r1. The sink takes a `Redactor` (a `fn(&str) -> Cow<str>` on
+Rust, a `(line: string) => string` on TS) applied to every complete line before
+the write. Fleet default redacts credential shapes (bearer/JWT-looking tokens,
+`ckh_` handles, `sk-`/`ghp_`-style keys, `Authorization:` values); a module
+composes its own on top (MC's sanitizer; claustrum's hand-written redacting
+`Debug` impls remain the first line of defence). A module MUST NOT log prompt
+text, message bodies, or credential payloads at any level; the redactor is the
 backstop, not the policy.
 
 ## Observability of the logger itself
@@ -140,38 +246,52 @@ backstop, not the policy.
 - `swallowed_writes` counter (write failed, line dropped) readable by the module
   for its health report; the crate reports the first failure per process to
   stderr once, never per line (a full disk must not generate a second flood).
+- `oversized_segment` reported the same way, once, when today's segment crosses
+  `alarm_segment_mb`.
 - Rust: when the file sink cannot be opened, the crate falls back to stderr so
   the daemon's capture still exists; the fallback is announced in the first
   line.
+- **A feature that fires later must log that it armed** (retention prune at
+  start: `logger=<module> retention pruned=N kept=M window_days=14`), so
+  "never ran" and "ran and found nothing" are distinguishable from outside.
 
 ## Adoption
 
-- **Live-user modules (aft, magic-context) move only with their doctors.**
-  Both have CLI doctors that parse today's paths and formats to extract
-  errors into GitHub issues. For them: the doctor learns the new path and
-  format first and reads BOTH for at least one release; adoption ships in the
-  same release as the doctor; the old `$TMPDIR` plugin log and pid-suffixed
-  file are read-only compatibility inputs, never written again after the cut.
-  Nothing else in the fleet waits on them.
+**Mandatory, fleet-wide.** Every module and every plugin lane, as each seat has
+time; a seat that cannot adopt names the blocker on the record. The census
+question posted 2026-09-19 ([#512] in `#fleet-notices`) collects each seat's
+reason before the wave, so a crate gap is fixed in commons rather than
+discovered ten times.
 
-  Measured doctor contracts (2026-09-05), which the format satisfies without
+- **Live-user modules (aft, magic-context) move only with their doctors.**
+  Both have CLI doctors that parse today's paths and formats to extract errors
+  into GitHub issues. For them: the doctor learns the new path and format
+  first and reads BOTH for at least one release; adoption ships in the same
+  release as the doctor; the old `$TMPDIR` plugin log and pid-suffixed file are
+  read-only compatibility inputs, never written again after the cut. Nothing
+  else in the fleet waits on them.
+
+  Measured doctor contracts (2026-09-05), which the r2 format satisfies without
   special cases: both doctors are line-regex over free text, keyed on message
   words (`failed:`, `Error:`, `EMERGENCY`, `exception`, `crashed:`,
   `panicked at`, `timed out after <n>ms`) that the module's message text keeps;
   neither parses timestamp, level, or fields. Session filters widen to accept
-  `session=<issuer>:<id>` beside the bracketed form for one release, with the
-  raw `ses_…` / uuid preserved as the id. AFT's telemetry parsers anchor on
-  the message (`index_event kind=… root=…`, `perf tick:`, `slow tool_call …`)
-  and require the `key=value` tail unquoted — satisfied because AFT sanitises
-  those values (no spaces, no `=`) and the format quotes only values that
-  contain a space, `"` or newline. MC's dashboard sorts lexically on the
-  timestamp capture; RFC3339 with `Z` and fixed millisecond width is
-  lexically monotonic. Owners re-key error extraction on `<LEVEL>` once
-  levels exist (their migration, not a format requirement).
+  `session=<issuer>:<id>` inside the bracket beside the bracketed form for one
+  release, with the raw `ses_…` / uuid preserved as the id. AFT's telemetry
+  parsers anchor on the message (`index_event kind=… root=…`, `perf tick:`,
+  `slow tool_call …`) and require the `key=value` tail unquoted — satisfied
+  because AFT sanitises those values (no spaces, no `=`) and the format quotes
+  only values that contain a space, `"` or newline. MC's dashboard sorts
+  lexically on the timestamp capture; RFC3339 with `Z` and fixed millisecond
+  width is lexically monotonic. Owners re-key error extraction on `<LEVEL>`
+  once levels exist (their migration, not a format requirement).
 
-  Consumers pin their parsers against
-  `crates/subc-core/tests/fixtures/log_format_golden.json` (the authority
-  fixture) rather than against sample lines.
+  Consumers pin their parsers against the authority fixture rather than
+  against sample lines.
+- **A module whose diagnostics are not on stderr** (thalamus: durable
+  failure-state JSON plus a per-turn decision log keyed by `exchange_id`) still
+  adopts for the lines it does emit, and says so in its census row. The crate
+  does not replace a structured instrument; it replaces `eprintln!`.
 - `logs/` under a module data dir is never captured by engram, as an
   engram-wide rule independent of descriptors (rotation churn would otherwise
   be a fresh upload every capture); the status surface says it was excluded.
@@ -180,32 +300,41 @@ backstop, not the policy.
   change, thalamus/astrocyte/synapse prefixes, synapse worker rings forwarded,
   callosum crate-path targets, prefrontal's uncapped plugin log) are done in
   that same change because the crate makes them the default shape.
-- The daemon: `subc.log` moves to `run/logs/subc.log` through the same crate
-  (no ANSI, rotation); stdout of children becomes a pipe alongside stderr into
-  `run/logs/<id>.stderr.log`; `CK_LOG` and the retention knobs injected at
-  spawn from `subc.jsonc`.
+- The daemon: `subc.log` becomes `subc.<date>.log` through the same crate;
+  `CK_LOG`, `loggers`, `max_age_days` and `alarm_segment_mb` injected at spawn
+  from `subc.jsonc`; the `module_id` prefix leaves the daemon's own lines and
+  becomes the logger root `subc.<component>`.
 
-## `ck module logs`
+### Ergonomics, because they decide adoption
+
+Today `eprintln!` needs nothing and the crate needs a `Config`, an `init`, and a
+kept `Handle`. That gradient is backwards and it is most of why ten seats linked
+without routing. r2 requires the crate to offer a **zero-argument path** for a
+supervised module: the daemon already injects `CK_LOG` at spawn and already
+injects `SUBC_MODULE_ID` (`supervise.rs:3936`, for launch attestation), so
+`cortexkit_log::init_from_env()` resolves module id, data dir, level and
+retention with no arguments. Nothing new is injected for this; the crate reads
+what is already there. The retention and per-logger keys ride in `CK_LOG`'s
+siblings (`CK_LOG_MAX_AGE_DAYS`, `CK_LOG_ALARM_SEGMENT_MB`), which the daemon
+derives from the `log` block — r1 named the `Retention` struct but no env
+contract, which is what stopped the daemon injecting it. A plugin, which has no daemon, passes its module
+id and harness and nothing else.
+
+## `ck logs` — deferred
+
+Built once the fleet is on one format, not before; a renderer over six formats
+is a renderer with six special cases. Shape when it comes:
 
 ```text
-ck module logs [<id>] [-n <lines>] [-f] [--since <dur>] [--tag <t>] [--level <l>] [--lane <harness>|module|stderr|daemon] [--json]
+ck logs [<id>] [-n <lines>] [-f] [--since <dur>] [--logger <name>] [--level <l>] [--lane module|<harness>|stderr|daemon] [--json]
 ```
 
-- No id: a table of every module's log files (path, size, last line's
-  timestamp) — the census as a verb.
-- Default: last 200 lines of the merged view for `<id>` — the module's file,
-  its plugin lane files, `run/logs/<id>.stderr.log`, and `run/logs/subc.log`
-  lines with `module_id=<id>` — merged by timestamp, newest last, each source
-  marked in a fixed column (`mod`, `opencode`, `pi`, `stderr`, `daemon`).
-- `-f` follows all sources across rotation. `--since` bounds by the line's own
-  timestamp (all sources share the format). `--tag`/`--level` filter on the
-  fields the format guarantees. `--lane` selects one source.
-- Every filtered view ends with one stderr line stating what it removed
-  (`showing 200 of 3,412 lines (2,900 below INFO, 312 daemon lines hidden)`).
-- Plain text on stdout, one line per line; colour only on a tty.
-- Empty states: `no log yet for <id>`; `no module named '<id>'. Run ck module list.`
+Globs `<module>.*.log` and merges by timestamp; `-f` notices a new segment at
+midnight; `--lane` filters on `harness=` rather than on file. The r1 `ck module
+logs` verb keeps working over the capture and daemon files until then.
 
 ## Out of scope
 
 Per-request joins across a module's data sinks (thalamus `exchange_id`);
-shipping logs anywhere; live level reload.
+shipping logs anywhere; live level reload; a JSON render lane (a formatter swap
+if ever needed, not a format change).
