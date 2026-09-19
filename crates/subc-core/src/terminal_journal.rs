@@ -21,6 +21,15 @@ const RETENTION: cortexkit_log::Retention = cortexkit_log::Retention {
 };
 
 #[derive(Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+enum DaemonMarker {
+    DaemonShutdown {
+        daemon_incarnation: String,
+        at_ms: u64,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
 struct JournalEntry {
     module_id: String,
     daemon_incarnation: String,
@@ -85,22 +94,35 @@ impl TerminalJournal {
         }
     }
 
+    #[cfg(unix)]
+    pub(crate) fn stamp_shutdown(&self) {
+        self.append_serialized(serde_json::to_vec(&DaemonMarker::DaemonShutdown {
+            daemon_incarnation: self.incarnation.clone(),
+            at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        }));
+    }
+
     pub(crate) fn append(&self, module_id: &str, record: &TerminalRecord) {
         let entry = JournalEntry {
             module_id: module_id.to_owned(),
             daemon_incarnation: self.incarnation.clone(),
             record: record.clone(),
         };
+        self.append_serialized(serde_json::to_vec(&entry));
+    }
+
+    fn append_serialized(&self, line: Result<Vec<u8>, serde_json::Error>) {
         let mut writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
-        let result = serde_json::to_vec(&entry)
-            .map_err(io::Error::other)
-            .and_then(|line| {
-                writer
-                    .sink
-                    .as_mut()
-                    .ok_or_else(|| io::Error::other("terminal journal was not opened"))?
-                    .write_line(&line)
-            });
+        let result = line.map_err(io::Error::other).and_then(|line| {
+            writer
+                .sink
+                .as_mut()
+                .ok_or_else(|| io::Error::other("terminal journal was not opened"))?
+                .write_line(&line)
+        });
         if let Err(error) = result {
             writer.failures = writer.failures.saturating_add(1);
             tracing::warn!(path = %self.path.display(), %error, "terminal journal append failed");
@@ -152,6 +174,8 @@ impl TerminalJournal {
                                 ));
                             }
                         }
+                        _ if line.ends_with(b"\n")
+                            && serde_json::from_slice::<DaemonMarker>(&line).is_ok() => {}
                         _ => history.journal_skipped_lines += 1,
                     },
                     Err(error) => {
@@ -243,6 +267,25 @@ mod tests {
                 "crash budget exhausted: max_restarts=3 within window_secs=600".into(),
             ),
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn shutdown_marker_survives_reopen_without_becoming_corruption_or_an_exit() {
+        let dir = TestTempDir::new("terminal-journal-shutdown");
+        let path = dir.join("terminals.jsonl");
+        let journal = TerminalJournal::open(path.clone(), "cut-daemon".into());
+        journal.append("module", &record(8));
+        journal.stamp_shutdown();
+        drop(journal);
+        let journal = TerminalJournal::open(path, "next-daemon".into());
+        let history = journal.merge(
+            "module",
+            TerminalRing::new(TerminalRingConfig::default(), 10).snapshot(),
+        );
+        assert_eq!(history.journal_skipped_lines, 0);
+        assert_eq!(history.entries.len(), 1);
+        assert_eq!(history.entries[0].at_ms, 8);
     }
 
     #[test]

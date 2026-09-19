@@ -35,6 +35,7 @@ use crate::{
 pub struct OutboundFrame {
     pub frame: Frame,
     pub enqueued_at: std::time::Instant,
+    pub(crate) flushed: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl OutboundFrame {
@@ -42,6 +43,7 @@ impl OutboundFrame {
         Self {
             frame,
             enqueued_at: std::time::Instant::now(),
+            flushed: None,
         }
     }
 }
@@ -131,6 +133,21 @@ impl FrameSink {
         self.tx.send(OutboundFrame::now(frame)).await.map_err(|_| {
             RouterError::backend_with_epoch(channel, epoch, corr, "connection writer closed")
         })
+    }
+
+    /// Shutdown notices must leave the socket writer before an idle daemon exits.
+    /// Queue admission alone does not prove this; the writer acknowledges flush.
+    #[cfg(unix)]
+    pub(crate) async fn send_flushed(&self, frame: Frame) -> Result<(), RouterError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut outbound = OutboundFrame::now(frame);
+        outbound.flushed = Some(tx);
+        self.tx
+            .send(outbound)
+            .await
+            .map_err(|_| RouterError::backend(0, 0, "connection writer closed"))?;
+        rx.await
+            .map_err(|_| RouterError::backend(0, 0, "connection flush failed"))
     }
 
     pub(crate) async fn reserve_owned(

@@ -476,6 +476,9 @@ async fn handle_frame(
     writer: &mpsc::Sender<Frame>,
 ) -> Result<bool, StubError> {
     let Some(frame) = frame else {
+        if env_flag("FAKE_AFT_RECORD_EOF") {
+            record_event(config, json!({"kind": "eof"}))?;
+        }
         return Ok(false);
     };
 
@@ -523,6 +526,12 @@ async fn handle_frame(
                         "kind": "draining",
                         "reason": reason,
                         "deadline_ms": deadline_ms,
+                        "shutdown_marker_seen": env::var_os("FAKE_AFT_SHUTDOWN_JOURNAL")
+                            .and_then(|path| fs::read_to_string(path).ok())
+                            .is_some_and(|journal| journal.lines().any(|line| {
+                                serde_json::from_str::<Value>(line).is_ok_and(|entry|
+                                    entry["event"] == "daemon_shutdown")
+                            })),
                     }),
                 )?,
             }

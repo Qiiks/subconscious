@@ -281,6 +281,7 @@ struct ModuleConnection {
 
 #[derive(Debug, Default)]
 struct ForwardingInner {
+    daemon_draining: bool,
     modules_by_id: HashMap<String, ModuleConnection>,
     endpoint_by_connection: HashMap<ConnectionId, ModuleEndpointId>,
     module_id_by_endpoint: HashMap<ModuleEndpointId, String>,
@@ -395,7 +396,7 @@ impl ForwardingTable {
         sink: FrameSink,
     ) -> Result<ModuleEndpointId, ForwardingError> {
         let mut inner = self.write_inner()?;
-        if inner.closing_connections.contains(&connection_id) {
+        if inner.daemon_draining || inner.closing_connections.contains(&connection_id) {
             return Err(ForwardingError::ConnectionClosing { connection_id });
         }
         if let Some(old_endpoint) = inner.endpoint_by_connection.remove(&connection_id) {
@@ -1285,6 +1286,25 @@ impl ForwardingTable {
             .any(|key| key.channel == route_channel))
     }
 
+    /// Gate every provider atomically, including registrations racing shutdown.
+    /// No supervisor lock is held while taking the forwarding lock.
+    #[cfg(unix)]
+    pub(crate) fn begin_daemon_drain(&self) -> Result<Vec<String>, ForwardingError> {
+        let mut inner = self.write_inner()?;
+        inner.daemon_draining = true;
+        let modules = inner
+            .modules_by_id
+            .iter()
+            .map(|(id, module)| (id.clone(), module.endpoint))
+            .collect::<Vec<_>>();
+        for (_, endpoint) in &modules {
+            inner
+                .draining_endpoints
+                .insert(*endpoint, RouteCloseReason::Restart);
+        }
+        Ok(modules.into_iter().map(|(id, _)| id).collect())
+    }
+
     pub(crate) fn begin_module_drain(
         &self,
         module_id: &str,
@@ -1881,6 +1901,7 @@ fn commit_route_locked(
     let client_sender = pending.client_permit.send(crate::router::OutboundFrame {
         frame: pending.route_open_frame,
         enqueued_at: std::time::Instant::now(),
+        flushed: None,
     });
     if client_sender.is_closed() {
         let abandoned = pending
@@ -2541,6 +2562,24 @@ mod tests {
             FrameSink::new(client_tx),
             client_rx,
         )
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn daemon_drain_gates_current_and_racing_provider_registrations() {
+        let (forwarding, _, endpoint, _, sink, _) = route_fixture("provider");
+        assert_eq!(forwarding.begin_daemon_drain().unwrap(), ["provider"]);
+        assert!(forwarding.endpoint_is_draining(endpoint).unwrap());
+        assert!(matches!(
+            forwarding.register_module_connection(
+                ConnectionId::new(300),
+                "late-provider".into(),
+                2,
+                Concurrency::ModuleManaged,
+                sink,
+            ),
+            Err(ForwardingError::ConnectionClosing { .. })
+        ));
     }
 
     fn test_ping(corr: u64) -> Frame {
