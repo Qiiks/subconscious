@@ -148,6 +148,35 @@ genuinely needs longer.
 - Cap in-flight binds per module endpoint, so a wedged module cannot accumulate
   reservations once the reader's accidental one-bind-per-12s throttle is gone.
 
+### The budget's own doc comment records the reasoning that no longer holds
+
+Worth reading before changing the number, because it is a third instance of a
+pattern this fleet hit twice more the same day (ENGRAM: a comment three lines
+above the carve-out that broke it; CEREB: a per-instance clock whose own doc
+comment said so):
+
+> The default is generous because rejecting a VALID bind is far worse than
+> waiting on a slow one; a consumer that wants a tighter bound retries the bind
+> itself.
+
+**That reasoning is correct and was written when the wait cost only the
+caller.** Under serial dispatch it now costs every later frame on that
+connection, so "waiting on a slow one" means blocking consumers who never asked
+for this module. The tradeoff the comment weighs is real; one side of it grew by
+a factor nobody re-measured, because the growth happened in a different file.
+
+So the number is not a free parameter to tune down. Lowering it alone trades
+head-of-line cost for false rejections of legitimately slow binds — and AFT's
+`on_bind` genuinely does a bounded project walk, which is exactly the valid-but-
+slow case the comment protects. **The mechanism that makes a lower budget safe
+is per-module fast refusal**: a module that is persistently slow gets refused
+in microseconds rather than waited on for the full budget every time, so the
+budget stops being paid repeatedly for a condition already known.
+
+Sequence within Stage 1, therefore: fast refusal first, budget reduction second
+and only once refusal makes it safe. Reversing that order ships the false
+rejections without the protection.
+
 **Stage 2 — the scoped escape hatch.** Spawn **`route.open` only**.
 
 Not "ops that await another process": there are nine such client control ops
