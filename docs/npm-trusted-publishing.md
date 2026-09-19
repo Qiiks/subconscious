@@ -1,6 +1,6 @@
 # npm Trusted Publishing (OIDC) for the monorepo's npm packages
 
-Goal: publish the monorepo's npm packages (`@cortexkit/subc-client`, `@cortexkit/store`) from CI with **no NPM_TOKEN and no manual
+Goal: publish the monorepo's npm packages (`@cortexkit/subc-client`, `@cortexkit/store`, `@cortexkit/log`) from CI with **no NPM_TOKEN and no manual
 passkey** — every release becomes a tag push. Replaces the passkey-gated manual
 `npm publish` that has gated every release since the 0.1.0 bootstrap.
 
@@ -9,6 +9,44 @@ short-lived GitHub OIDC token; npm verifies that token against a **Trusted
 Publisher** you configure once on the package, scoped to this exact repo +
 workflow file. No long-lived secret exists to leak. Provenance attestation is
 generated automatically (supply-chain win).
+
+## Per-package state
+
+Trusted Publishing is configured PER PACKAGE and cannot be edited after
+creation — changing a field means deleting the connection and making a new one.
+So the values below are worth reading before you fill the form, not after.
+
+| package | npm Trusted Publisher | first publish |
+|---|---|---|
+| `@cortexkit/subc-client` | configured | manual, then OIDC |
+| `@cortexkit/store` | configured | manual, then OIDC |
+| `@cortexkit/log` | configured 2026-09-19 | manual 0.2.0 (OIDC cannot create a package that does not exist) |
+
+Form values for this repo, derived from `.github/workflows/release-npm.yml`
+rather than remembered:
+
+    Publisher            GitHub Actions
+    Organization/user    cortexkit
+    Repository           subconscious
+    Workflow filename    release-npm.yml
+    Environment name     LEAVE BLANK
+    Allow `npm publish`  TICK IT
+
+The last two are the ones that fail in a way that does not look like their
+cause:
+
+- **Environment blank.** The workflow declares no job-level `environment:` key.
+  Naming one here makes npm demand a matching claim in the OIDC token that the
+  workflow will never mint, and every publish then fails as an auth error
+  pointing nowhere near the form field that caused it.
+- **Tick `Allow npm publish`.** The workflow runs `npm publish --access public`,
+  not `npm stage publish`. Only staging is allowed by default, so an untickedbox
+  leaves the lane fully wired and refusing on first use — the failure arrives at
+  the next release rather than at setup.
+
+**A package must EXIST before its Trusted Publisher can be configured**, so
+every new package needs one manual `npm publish` with a passkey and 2FA. That is
+the whole reason this file exists.
 
 ## One-time setup (requires Ufuk, ~2 min, at a computer with npm login)
 
