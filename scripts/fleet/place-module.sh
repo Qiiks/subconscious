@@ -186,19 +186,45 @@ say "staged sidecar $sidecar: OK"
 # mtime" on one of their cards; PLEX and three others already write the in-stage
 # form. Both are read, root first, because a seat that improved its declaration
 # must not be punished for it and a seat that has not must keep working.
-# Derived from the PARENT of the passed artifact's directory, never from
-# $STAGING: seats stage wherever they like (FUSI under ~/ck-stage, others under
-# the cortexkit staging root), and a hardcoded root would silently find no
-# declaration for every seat that chose a different one -- reporting "INFERRED
-# from mtime" while a perfectly good declaration sat one directory up.
-root_manifest="$(dirname "$staged_dir")/$MODULE.current"
+# TWO STAGING LAYOUTS EXIST AND NEITHER IS WRONG, so the declaration is looked
+# for in BOTH plausible places and parsed by CONTENT rather than by location.
+#
+#   PER-STAGE DIRECTORY (fusiform, broca)   ~/ck-stage/fusiform-<stamp>/ck-fusiform
+#       -> the root is the PARENT of the artifact's directory
+#   FLAT, SHA-SUFFIXED FILES (plexus)       <staging>/SIGNED.ck-plexus.<sha>
+#       -> the artifact's directory IS the root
+#
+# Deriving only "parent of the artifact directory" looked one level too high for
+# the flat layout and found nothing. Measured against plexus 2026-09-19: the
+# lookup landed on ~/.local/share/cortexkit/plexus.current, which does not exist,
+# so the gate fell through to the in-stage arm and refused a CORRECT artifact
+# with a message naming the wrong cause.
+#
+# FORMAT IS DECIDED BY CONTENT, NOT BY PATH. A file containing `stage=` is the
+# key=value form; anything else is the older positional `<sha> <file> <stamp>`.
+# Deciding by location is how a seat that adopts the better format at the old
+# filename gets its correct declaration parsed as garbage -- which is exactly
+# what happened when PLEX rewrote ck-plexus.current in the new shape.
+root_manifest=""
+for cand in "$(dirname "$staged_dir")/$MODULE.current" \
+            "$staged_dir/$MODULE.current" \
+            "$(dirname "$staged_dir")/ck-$MODULE.current" \
+            "$staged_dir/ck-$MODULE.current"; do
+  if [ -f "$cand" ] && grep -q '^stage=' "$cand" 2>/dev/null; then
+    root_manifest="$cand"
+    break
+  fi
+done
 manifest="$staged_dir/ck-$MODULE.current"
 staged_base=$(basename "$STAGED")
-if [ -f "$root_manifest" ]; then
+if [ -n "$root_manifest" ]; then
   want_stage=$(awk -F= '$1=="stage"{print $2}' "$root_manifest")
   want_rev=$(awk -F= '$1=="revision"{print $2}' "$root_manifest")
-  # Compare the DIRECTORY, since the root form names a stage rather than a file.
-  if [ "$staged_dir" = "$want_stage" ]; then
+  # `stage` names a DIRECTORY under the per-stage layout and the ARTIFACT itself
+  # under the flat one. Accept either rather than forcing a seat to restructure:
+  # what the declaration is FOR is naming which thing is live, and both spellings
+  # do that unambiguously.
+  if [ "$staged_dir" = "$want_stage" ] || [ "$STAGED" = "$want_stage" ]; then
     say "currency: matches $MODULE.current (owner-declared stage), rev ${want_rev:0:12}"
   elif [ "$OLDER" -eq 1 ]; then
     say "currency: placing from $staged_dir although the owner declares $want_stage (--older given)"
