@@ -157,11 +157,21 @@ it; the most specific match wins. **The bare module id is a valid logger** — a
 module that names no components still gets `engram:` on every line and working
 level control; it forgoes only sub-component granularity.
 
-A module declares its logger names in its manifest, as r1 declared tags, so
-`ck logs <id> --loggers` can list what exists. The crate does not refuse an
-undeclared name at runtime (a refusal in a logging call is a worse failure than
-an undeclared name); the manifest declaration is for discoverability and for
-`ck daemon lint`.
+**Manifest declaration of logger names is NOT REQUIRED and cannot be expressed
+today.** `ModuleManifest` carries no logger field and `subc-protocol` has no
+builder method for one, so this paragraph previously stated a requirement no
+adopter could satisfy (ASTRO, 2026-09-19, reading the spec and the protocol
+source together rather than either alone). A normative line nobody can meet has
+one end state: each adopter works out privately that it is optional and skips
+it, until the spec says one thing and twenty repos do another and the next
+reader cannot tell a requirement from a residue.
+
+The intent stands as a FUTURE affordance: if `subc-protocol` grows a logger
+field, a module may declare its names so `ck logs <id> --loggers` can list them
+and `ck daemon lint` can check them. Until then, adopt without declaring.
+Runtime never depended on it either way — the crate does not refuse an
+undeclared name (a refusal inside a logging call is a worse failure than an
+undeclared name), which is one of the three doors the operator confirmed.
 
 ## Files
 
