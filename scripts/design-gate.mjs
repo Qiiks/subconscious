@@ -166,10 +166,18 @@ export function decide({ pullRequest, repoFullName, issue = null, action = "open
     title,
     message,
     linkedIssue: linked?.number ?? null,
-    // A pull request only just marked ready is pushed back to draft; one that
-    // was already open stays open and simply fails, so the author is not
-    // yanked out from under an in-flight review.
-    convertToDraft: action === "ready_for_review",
+    // `opened` and `ready_for_review` are the two moments a pull request
+    // ENTERS the ready state, and a pull request that enters ready without an
+    // approved issue should not be ready. `synchronize`, `edited` and
+    // `reopened` are moments an already-ready pull request changes; pushing it
+    // back to draft there would yank the author out from under an in-flight
+    // review, so those comment only.
+    //
+    // `opened` matters most where there are no required status checks at all:
+    // draft conversion is then the only enforcement the gate has, and a
+    // contributor who opens a non-draft pull request with no linked issue
+    // would otherwise stay ready for review until a human drafted it by hand.
+    convertToDraft: action === "opened" || action === "ready_for_review",
     skipped: false,
   });
 

@@ -17,6 +17,7 @@ import {
   buildCommentBody,
   COMMENT_MARKER,
   decide,
+  draftNote,
   GATE_MESSAGE,
   parseLinkedIssue,
   pullRequestSkipReason,
@@ -277,12 +278,21 @@ describe("decide", () => {
     assert.equal(decision.skipped, true);
   });
 
+  // Both halves of the rule are pinned here on purpose. `opened` and
+  // `ready_for_review` are the moments a pull request enters the ready state
+  // and both convert on failure; the remaining actions are moments an
+  // already-ready pull request changes and must stay comment-only, so that a
+  // reader who sees `opened` converting cannot generalise it to all five.
   const draftCases = [
     ["ready_for_review", "failure-no-issue", "", null, true],
     ["ready_for_review", "failure-unapproved", "Closes #42", unapproved, true],
     ["ready_for_review", "success", "Closes #42", approved, false],
-    ["opened", "failure-no-issue", "", null, false],
+    ["opened", "failure-no-issue", "", null, true],
+    ["opened", "failure-unapproved", "Closes #42", unapproved, true],
+    ["opened", "success", "Closes #42", approved, false],
     ["synchronize", "failure-unapproved", "Closes #42", unapproved, false],
+    ["edited", "failure-no-issue", "", null, false],
+    ["reopened", "failure-unapproved", "Closes #42", unapproved, false],
   ];
 
   for (const [action, name, body, issue, convertToDraft] of draftCases) {
@@ -332,7 +342,13 @@ describe("runPullRequestGate", () => {
     assert.equal(state.comments.length, 1);
     assert.ok(state.comments[0].body.includes(COMMENT_MARKER));
     assert.ok(state.comments[0].body.includes(GATE_MESSAGE));
+    // `opened` converts a failing pull request to draft, so the first comment
+    // also carries the draft note.
+    assert.ok(state.comments[0].body.includes(draftNote(null)));
+    const firstCommentId = state.comments[0].id;
 
+    // `synchronize` does not convert, so the note goes away — but the gate
+    // edits the comment it already has rather than opening a second one.
     const second = await runPullRequestGate({
       api,
       repoFullName: REPO,
@@ -340,8 +356,21 @@ describe("runPullRequestGate", () => {
       action: "synchronize",
       log: silentLog,
     });
-    assert.equal(second.comment.action, "unchanged");
+    assert.equal(second.comment.action, "updated");
     assert.equal(state.comments.length, 1);
+    assert.equal(state.comments[0].id, firstCommentId);
+    assert.ok(!state.comments[0].body.includes(draftNote(null)));
+
+    const third = await runPullRequestGate({
+      api,
+      repoFullName: REPO,
+      pullRequest: pr,
+      action: "synchronize",
+      log: silentLog,
+    });
+    assert.equal(third.comment.action, "unchanged");
+    assert.equal(state.comments.length, 1);
+    assert.equal(state.comments[0].id, firstCommentId);
   });
 
   test("ready_for_review on a blocked PR converts it back to draft and says so", async () => {
