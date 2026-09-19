@@ -10,8 +10,10 @@
  */
 
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { describe, test } from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   buildCommentBody,
@@ -23,7 +25,7 @@ import {
   pullRequestSkipReason,
   runIssueLabeled,
   runPullRequestGate,
-} from "./design-gate.mjs";
+} from "../.github/actions/design-gate/design-gate.mjs";
 
 const REPO = "cortexkit/aft";
 
@@ -594,59 +596,221 @@ describe("runIssueLabeled", () => {
   });
 });
 
+/**
+ * Repo root, found by walking up from this file until a directory carrying a
+ * repository marker appears. Anchoring on a marker rather than on a fixed
+ * number of `..` segments means moving this test file cannot quietly redirect
+ * the security arms at a path that does not exist, and anchoring on the file
+ * rather than on `process.cwd()` means the arms read the same files however
+ * the runner was invoked.
+ */
+const REPO_ROOT = (() => {
+  let dir = dirname(fileURLToPath(import.meta.url));
+  for (;;) {
+    if (existsSync(join(dir, ".git")) || existsSync(join(dir, "Cargo.toml"))) return dir;
+    const parent = dirname(dir);
+    if (parent === dir) return dirname(dirname(fileURLToPath(import.meta.url)));
+    dir = parent;
+  }
+})();
+
+/**
+ * The files that actually run the gate. The security properties have to be
+ * asserted against these two and nowhere else: an assertion pointed at a file
+ * nobody executes proves nothing about what executes.
+ */
+const GATE_FILES = [
+  { label: "reusable workflow", relative: ".github/workflows/design-gate.yml" },
+  { label: "composite action", relative: ".github/actions/design-gate/action.yml" },
+].map(({ label, relative }) => {
+  const path = join(REPO_ROOT, relative);
+  // Read defensively. Reading at describe time and letting ENOENT escape would
+  // abort the block before it registered its tests, and `node --test` reports
+  // that as a SMALLER suite with one failure — a broken fixture that reads as
+  // a suite which mostly passes. The arms below are registered either way and
+  // an absent file fails an arm that names the missing path.
+  let yaml = null;
+  try {
+    yaml = readFileSync(path, "utf8");
+  } catch {
+    yaml = null;
+  }
+  return { label, path, yaml };
+});
+
+function gateFileYaml(file) {
+  assert.ok(file.yaml !== null, `workflow file missing at ${file.path}`);
+  return file.yaml;
+}
+
+/** Drop whole-line YAML comments so prose about a step is not read as a step. */
+function stripCommentLines(yaml) {
+  return yaml
+    .split("\n")
+    .filter((line) => !/^\s*#/.test(line))
+    .join("\n");
+}
+
+/** Every action reference on a `uses:` line. */
+function usesReferences(yaml) {
+  return stripCommentLines(yaml)
+    .split("\n")
+    .map((line) => line.match(/^\s*(?:-\s+)?uses:\s*(\S+)/))
+    .filter((match) => match !== null)
+    .map((match) => match[1]);
+}
+
+/** Every `run:` script body, inline or block scalar. */
+function runScripts(yaml) {
+  const lines = yaml.split("\n");
+  const scripts = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const header = lines[index].match(/^(\s*)(?:-\s+)?run:\s*(.*)$/);
+    if (!header) continue;
+    const [, indent, inline] = header;
+    if (inline && !/^[|>]/.test(inline)) {
+      scripts.push(inline);
+      continue;
+    }
+    const body = [];
+    for (let next = index + 1; next < lines.length; next += 1) {
+      const line = lines[next];
+      if (line.trim() === "") {
+        body.push("");
+        continue;
+      }
+      if (line.match(/^\s*/)[0].length <= indent.length) break;
+      body.push(line);
+    }
+    scripts.push(body.join("\n"));
+  }
+  return scripts;
+}
+
+/**
+ * `git` in command position. Written as a delimited token rather than a
+ * substring so `$GITHUB_ACTION_PATH` — which the gate step legitimately uses —
+ * is not mistaken for an invocation.
+ */
+const GIT_INVOCATION = /(^|[\s;&|(])git([\s;&|)]|$)/;
+
+function invokesGit(script) {
+  return script
+    .split("\n")
+    .map((line) => line.replace(/#.*$/, ""))
+    .some((line) => GIT_INVOCATION.test(line));
+}
+
+/** Step blocks in a `steps:` list, one string per step. */
+function stepBlocks(yaml) {
+  const stepBlocks = [];
+  const lines = yaml.split("\n");
+  let currentBlock = [];
+  let inSteps = false;
+
+  for (const line of lines) {
+    if (/^\s*steps:\s*$/.test(line)) {
+      inSteps = true;
+      continue;
+    }
+    if (inSteps && /^[^\s#]/.test(line)) {
+      if (currentBlock.length) stepBlocks.push(currentBlock.join("\n"));
+      currentBlock = [];
+      inSteps = false;
+      continue;
+    }
+    if (inSteps && /^\s{0,4}[a-zA-Z]/.test(line)) {
+      if (currentBlock.length) stepBlocks.push(currentBlock.join("\n"));
+      currentBlock = [];
+      inSteps = false;
+      continue;
+    }
+    if (inSteps) {
+      if (/^\s*-\s+/.test(line)) {
+        if (currentBlock.length) stepBlocks.push(currentBlock.join("\n"));
+        currentBlock = [line];
+      } else if (currentBlock.length) {
+        currentBlock.push(line);
+      }
+    }
+  }
+  if (currentBlock.length) stepBlocks.push(currentBlock.join("\n"));
+  return stepBlocks;
+}
+
+function checkoutStepsReferencingHead(yaml) {
+  return stepBlocks(stripCommentLines(yaml))
+    .filter((step) => step.includes("actions/checkout"))
+    .filter((step) => step.includes("github.event.pull_request.head"));
+}
+
 describe("workflow security properties", () => {
-  const workflowPath = new URL("../.github/workflows/design-gate.yml", import.meta.url);
-  const workflowYaml = readFileSync(workflowPath, "utf8");
-
-  test("actions/checkout steps never reference PR head", () => {
-    // Extract each step block across the workflow
-    const stepBlocks = [];
-    const lines = workflowYaml.split("\n");
-    let currentBlock = [];
-    let inSteps = false;
-
-    for (const line of lines) {
-      if (/^\s*steps:\s*$/.test(line)) {
-        inSteps = true;
-        continue;
-      }
-      if (inSteps && /^[^\s#]/.test(line)) {
-        if (currentBlock.length) stepBlocks.push(currentBlock.join("\n"));
-        currentBlock = [];
-        inSteps = false;
-        continue;
-      }
-      if (inSteps && /^\s{0,4}[a-zA-Z]/.test(line)) {
-        if (currentBlock.length) stepBlocks.push(currentBlock.join("\n"));
-        currentBlock = [];
-        inSteps = false;
-        continue;
-      }
-      if (inSteps) {
-        if (/^\s*-\s+/.test(line)) {
-          if (currentBlock.length) stepBlocks.push(currentBlock.join("\n"));
-          currentBlock = [line];
-        } else if (currentBlock.length) {
-          currentBlock.push(line);
-        }
-      }
-    }
-    if (currentBlock.length) stepBlocks.push(currentBlock.join("\n"));
-
-    const checkoutSteps = stepBlocks.filter((step) => step.includes("actions/checkout"));
-    assert.ok(checkoutSteps.length > 0, "must have at least one actions/checkout step");
-    for (const step of checkoutSteps) {
-      assert.ok(
-        !step.includes("github.event.pull_request.head"),
-        `actions/checkout step must never reference PR head (found: ${step})`,
+  // The gate runs on `pull_request_target`, in the base repository's context
+  // with access to its secrets. Contributor code from the pull request head
+  // must never be checked out or executed. The old shape relied on
+  // `actions/checkout` defaulting to the base ref, which is a property of an
+  // argument left out; these arms pin the stronger property that there is no
+  // checkout and no `git` to give an argument to in the first place.
+  for (const file of GATE_FILES) {
+    test(`${file.label} checks nothing out`, () => {
+      const references = usesReferences(gateFileYaml(file));
+      assert.deepEqual(
+        references.filter((reference) => reference.includes("actions/checkout")),
+        [],
+        `${file.path} must not use actions/checkout`,
       );
-    }
+    });
+
+    test(`${file.label} runs no git command`, () => {
+      const offenders = runScripts(gateFileYaml(file)).filter(invokesGit);
+      assert.deepEqual(offenders, [], `${file.path} must not invoke git`);
+    });
+
+    test(`${file.label} has no checkout step referencing the PR head`, () => {
+      assert.deepEqual(
+        checkoutStepsReferencingHead(gateFileYaml(file)),
+        [],
+        `${file.path} must never check out the pull request head`,
+      );
+    });
+  }
+
+  // The three arms above run against files that (correctly) contain no
+  // checkout at all, so the head-ref arm would pass over an empty set no
+  // matter how the detector behaved. This pins the detector itself, so the
+  // arm cannot rot into a test that asserts nothing.
+  test("the head-ref detector catches a checkout of the PR head", () => {
+    const unsafe = [
+      "jobs:",
+      "  gate:",
+      "    steps:",
+      "      - uses: actions/checkout@v5",
+      "        with:",
+      "          ref: ${{ github.event.pull_request.head.sha }}",
+    ].join("\n");
+    assert.equal(checkoutStepsReferencingHead(unsafe).length, 1);
+    assert.equal(usesReferences(unsafe).filter((r) => r.includes("actions/checkout")).length, 1);
+
+    const safe = unsafe.split("\n").slice(0, 4).join("\n");
+    assert.equal(checkoutStepsReferencingHead(safe).length, 0);
+  });
+
+  // Likewise for the git detector: the gate step's own command mentions
+  // `$GITHUB_ACTION_PATH`, and a substring check would call that an
+  // invocation and pass for the wrong reason ever after.
+  test("the git detector reads command position, not substrings", () => {
+    assert.equal(invokesGit('node "${GITHUB_ACTION_PATH}/design-gate.mjs" pull-request'), false);
+    assert.equal(invokesGit("# git clone would be wrong here"), false);
+    assert.equal(invokesGit("git clone https://example.invalid/repo"), true);
+    assert.equal(invokesGit("cd /tmp && git checkout $REF"), true);
   });
 
   test("pull-request job uses the App token step output instead of secrets.GITHUB_TOKEN", () => {
+    const workflowYaml = gateFileYaml(GATE_FILES[0]);
+
     // Isolate the pull-request job (design-gate)
     const prJobMatch = workflowYaml.match(
-      /design-gate:\s*\n([\s\S]*?)(?=\n\s{2}[a-zA-Z0-9_-]+:|$)/,
+      /\n  design-gate:\s*\n([\s\S]*?)(?=\n\s{2}[a-zA-Z0-9_-]+:\s*\n|$)/,
     );
     assert.ok(prJobMatch, "design-gate job must be present in workflow");
     const prJobYaml = prJobMatch[1];
@@ -660,24 +824,26 @@ describe("workflow security properties", () => {
     assert.ok(appTokenStepMatch, "must have an actions/create-github-app-token step with an id");
     const appTokenId = appTokenStepMatch[1];
 
-    // Find the step that runs the design gate script
-    const evalStepMatch = prJobYaml.match(
-      /-\s+name:[^\n]*\n(?:[^\n]*\n)*?\s*run:\s*node\s+scripts\/design-gate\.mjs\s+pull-request[\s\S]*?(?=\n\s{6}-\s|\n\s{4}[a-zA-Z]|$)/,
+    // The gate now runs as a composite action rather than an inline `run:`, so
+    // the token arrives as the action's `github-token` input.
+    const gateStep = stepBlocks(stripCommentLines(prJobYaml)).find((step) =>
+      step.includes("actions/design-gate@"),
     );
-    assert.ok(evalStepMatch, "must have a step running design-gate.mjs pull-request");
-    const evalStepYaml = evalStepMatch[0];
-
-    // Assert that GITHUB_TOKEN does not use secrets.GITHUB_TOKEN
+    assert.ok(gateStep, "must have a step using the design-gate composite action");
     assert.ok(
-      !evalStepYaml.includes("secrets.GITHUB_TOKEN"),
+      gateStep.includes("mode: pull-request"),
+      `pull-request job must run the gate in pull-request mode (found: ${gateStep})`,
+    );
+
+    assert.ok(
+      !gateStep.includes("secrets.GITHUB_TOKEN"),
       "pull-request job must not use secrets.GITHUB_TOKEN",
     );
 
-    // Assert that GITHUB_TOKEN uses the App token step's output
     const expectedOutput = `steps.${appTokenId}.outputs.token`;
     assert.ok(
-      evalStepYaml.includes(expectedOutput),
-      `pull-request job GITHUB_TOKEN must reference ${expectedOutput} (found: ${evalStepYaml})`,
+      gateStep.includes(expectedOutput),
+      `pull-request job token must reference ${expectedOutput} (found: ${gateStep})`,
     );
   });
 });

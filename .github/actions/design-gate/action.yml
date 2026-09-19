@@ -1,0 +1,52 @@
+name: Design gate
+description: >-
+  Evaluate the design-approved gate for the pull request or the issue-label
+  event that triggered the calling workflow run.
+
+# Why the gate script lives inside an action rather than in a workflow step:
+#
+# The gate runs on `pull_request_target`, which executes in the base
+# repository's context with access to its secrets. Contributor code from the
+# pull request head must NEVER be checked out or executed here. The old shape
+# relied on `actions/checkout` defaulting to the base ref — correct, but it is
+# a property of an argument that was left out, so any later edit that adds a
+# `ref:` silently destroys it.
+#
+# Packaging the script as an action removes the argument instead of trusting
+# it. The runner fetches this directory itself, so there is no checkout step
+# and no ref for a caller to influence: the reusable workflow that calls this
+# action has no `actions/checkout` and no `git` invocation at all, which
+# `scripts/design-gate.test.mjs` asserts against both files.
+#
+# The script reads everything it needs from the event the runner already
+# provides (`GITHUB_REPOSITORY` and `GITHUB_EVENT_PATH`) and talks to GitHub
+# over the API, so it never needs a working tree.
+
+inputs:
+  mode:
+    description: >-
+      `pull-request` to evaluate the pull request in the triggering event, or
+      `issue-labeled` to release the pull requests waiting on a newly approved
+      issue.
+    required: true
+  github-token:
+    description: >-
+      Token the gate reads the linked issue with, and posts the gate comment,
+      draft conversion, ready-for-review and check run with.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v5
+      with:
+        node-version: "24"
+
+    - name: Evaluate the design gate
+      shell: bash
+      # `mode` arrives as an environment variable rather than being expanded
+      # into the command line, so its value is never parsed as shell.
+      run: node "${GITHUB_ACTION_PATH}/design-gate.mjs" "${DESIGN_GATE_MODE}"
+      env:
+        DESIGN_GATE_MODE: ${{ inputs.mode }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
