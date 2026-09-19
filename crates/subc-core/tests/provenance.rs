@@ -219,6 +219,7 @@ async fn supervisor_provenance_detects_replaced_executable_image() {
             )],
             reserved: false,
             reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
         })
         .unwrap();
     wait_for_registration(&daemon, "provenance-replacement").await;

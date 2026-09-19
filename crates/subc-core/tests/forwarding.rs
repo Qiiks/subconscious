@@ -659,6 +659,10 @@ async fn a_protocol_none_module_is_never_probed_while_its_subc_twin_is_restarted
 ///   plus `exit 0`, plus an elapsed time well inside the budget.
 /// * ignored -> `signal 9` after the FULL budget, which is what the old
 ///   behaviour looked like for every `none` module on every teardown.
+// Unix only by the daemon's own contract: Windows has no SIGTERM and no
+// portable stand-in, so `supervise.rs` documents the graceful-stop step as
+// absent there and the arms this test distinguishes collapse into one.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn protocol_none_teardown_sigterms_first_and_only_kills_a_child_that_ignores_it() {
     const DRAIN_BUDGET: Duration = Duration::from_millis(900);
@@ -7602,6 +7606,11 @@ fn stub_spec(server: &TestServer, module_id: &str) -> ModuleSpec {
 /// Every variant is a different observation about the supervisor: whether it
 /// signalled at all, whether it waited for the child's own exit, and whether it
 /// still kills a child that will not take the hint.
+// `WriteMarkerAndExitZero` and `Ignore` are only constructed by the SIGTERM
+// teardown test, which is unix-only because the daemon sends no signal on
+// Windows; the match below stays exhaustive on every platform so the variants
+// stay declared there too.
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Clone, Copy)]
 enum SigtermMode<'a> {
     /// No handler, so SIGTERM keeps its default disposition and the process dies
@@ -7663,6 +7672,8 @@ fn never_connecting_spec(
     )
 }
 
+// Only the unix-only SIGTERM teardown test waits on a marker file.
+#[cfg(unix)]
 async fn wait_for_path(path: &Path, wait: Duration) {
     let deadline = Instant::now() + wait;
     loop {

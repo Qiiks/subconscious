@@ -561,7 +561,7 @@ impl RouteBindBreakers {
                 ))
             })
             .collect::<serde_json::Map<String, serde_json::Value>>();
-        (!open.is_empty()).then(|| serde_json::Value::Object(open))
+        (!open.is_empty()).then_some(serde_json::Value::Object(open))
     }
 }
 

@@ -5626,6 +5626,7 @@ mod terminal_history_tests {
             env: Vec::new(),
             reserved: false,
             reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
         });
 
         assert!(
@@ -6807,7 +6808,7 @@ mod jitter_tests {
 
 #[cfg(all(test, target_os = "linux"))]
 mod cgroup_placement_tests {
-    use super::{apply_cgroup_placement, ModuleSpec, SuperviseError};
+    use super::{apply_cgroup_placement, ModuleProtocol, ModuleSpec, SuperviseError};
     use std::{
         io,
         path::{Path, PathBuf},
@@ -6827,6 +6828,7 @@ mod cgroup_placement_tests {
                 env: Vec::new(),
                 reserved: false,
                 reserved_prefixes: Vec::new(),
+                protocol: ModuleProtocol::Subc,
             },
             path,
         )
