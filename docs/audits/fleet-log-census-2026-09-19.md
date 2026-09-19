@@ -12,6 +12,27 @@ carries one of five other formats, and three of them have no level field at all.
 The spec was approved, both crates were built and landed, eleven seats took
 `cortexkit-log` as a **dependency** — and one routes output through it.
 
+## One census-method correction, from THALAMUS, the same day
+
+My earlier wave roster used a **manifest**-shaped question (`grep subc-core
+Cargo.toml`) and read thalamus as carrying nothing. THALAMUS re-ran it with the
+lock-derived test and found they **were** in the population:
+
+```
+grep -c '^name = "subc-core"' Cargo.lock    1
+subc_core:: in *.rs                          2 sites
+```
+
+A git-rev pin made the row read clean: a *version bump* could not reach them, so
+"not a path-dep consumer" was true and "not a consumer" was false. **Two
+different claims, and the manifest question answered the wrong one.** ASTRO hit
+the mirror image — a `[workspace.dependencies]` line no member used, invisible to
+cargo and visible to grep, which would have put them in the wave falsely.
+
+The authority is the lock, because it is cargo's own answer to *what does this
+build link*. Recorded here because this document is itself a census and the same
+error is available to it.
+
 ## Format census
 
 Sorted by conformance. `X` = spec violation.
