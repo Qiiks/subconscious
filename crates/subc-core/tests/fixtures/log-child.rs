@@ -40,10 +40,26 @@ fn main() {
 
     if let Some(path) = env::var_os("LOG_CHILD_ENV_PATH").map(PathBuf::from) {
         let ck_log = env::var("CK_LOG").ok();
-        fs::write(
-            path,
-            ck_log.map_or_else(|| "absent".to_string(), |value| format!("present:{value}")),
-        )
-        .expect("write fixture environment observation");
+        let observation =
+            ck_log.map_or_else(|| "absent".to_string(), |value| format!("present:{value}"));
+
+        // WRITE-THEN-RENAME, so a reader sees either NO FILE or the COMPLETE
+        // one. `fs::write` creates the file and then fills it, and a reader
+        // landing between those two steps gets an EMPTY file that exists.
+        //
+        // That is not hypothetical: the Windows CI leg failed on
+        // `left: ""  right: "absent"` (2026-09-19). The waiting test polled
+        // `path.exists()`, which became true at creation, and read before the
+        // content landed.
+        //
+        // Fixing it here rather than by strengthening the poll to "non-empty"
+        // REMOVES THE RACE instead of narrowing it -- a partial write is still
+        // non-empty, so that poll would have failed less often and lied the same
+        // way. It also means `exists()` implies complete for every current and
+        // future reader of this fixture, so the test's predicate and its
+        // assertion agree by construction rather than by matching edits.
+        let tmp = path.with_extension("tmp");
+        fs::write(&tmp, &observation).expect("write fixture environment observation");
+        fs::rename(&tmp, &path).expect("publish fixture environment observation");
     }
 }
