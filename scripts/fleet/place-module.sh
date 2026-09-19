@@ -59,6 +59,7 @@ while (($# > 0)); do
     --gone) GONE="$2"; shift 2 ;;
     --place) PLACE=1; shift ;;
     --older) OLDER=1; shift ;;
+    --before) BEFORE_CMD="$2"; shift 2 ;;
     # A card that MIGRATES THE STORE cannot be rolled back by binary alone: the
     # old binary meets a newer schema and refuses on store_ahead, which is the
     # correct fail-closed behaviour and also means the binary snapshot restores
@@ -106,6 +107,28 @@ DEST="${DEST:-$BIN_DIR/ck-$MODULE}"
 
 say() { printf '%s\n' "$*"; }
 refuse() { printf 'REFUSED: %s\n' "$*" >&2; exit 2; }
+
+# BEFORE-READINGS: what exists only while the OUTGOING image runs.
+#
+# ENGRAM's rule (2026-09-19), from a quota incident where they killed a runaway
+# loop and lost the one reading that would have said whether it was about to
+# stop itself: BEFORE AN INTERVENTION THAT ENDS A LIVE PHENOMENON, ASK WHAT
+# READING ONLY EXISTS WHILE IT IS RUNNING, AND TAKE THAT READING FIRST.
+#
+# A placement IS such an intervention -- the outgoing process dies at the
+# restart, taking its gauges, counters and in-flight state with it. Every other
+# arm here reads the FILE, so none of them can supply this. It was being done ad
+# hoc when a card happened to ask, which is how I placed an aft card and only
+# afterwards wanted the outgoing image's steady-state write rate, by which point
+# the process carrying it was gone.
+#
+# Output is labelled and printed; it decides NOTHING, because a reading whose
+# meaning is known in advance belongs in --marker or --control instead.
+if [ -n "${BEFORE_CMD:-}" ]; then
+  say "=== before-readings (from the OUTGOING image; gone after restart)"
+  sh -c "$BEFORE_CMD" 2>&1 | sed 's/^/  /' \
+    || say "  (before-reading exited non-zero; recorded, not fatal)"
+fi
 
 say "=== gate"
 
