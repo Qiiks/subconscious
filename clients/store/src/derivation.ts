@@ -15,7 +15,7 @@ export function postgresDatabaseName(moduleId: string): string {
  * function, so resolving your own path by different rules silently splits it
  * from the directory the supervisor serves. Rule changes land THERE first;
  * this mirror is pinned by the shared golden fixture
- * (`crates/subc-core/tests/golden/data_home_resolution.json`).
+ * (`crates/subc-daemon/tests/golden/data_home_resolution.json`).
  *
  * Rules in order: non-empty `XDG_DATA_HOME` AS-IS (relative included, no
  * trimming — compose sites trim); on Windows non-empty `APPDATA`, else

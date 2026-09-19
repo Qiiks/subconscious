@@ -120,7 +120,7 @@ describe("sqliteStorePath path-hazard refusal (issue #32)", () => {
   });
 
   test("matches the shared UTF-8 path-component length refusal vectors", () => {
-    const golden = require("../../../crates/subc-core/tests/golden/module_id_path_component_refusals.json") as {
+    const golden = require("../../../crates/subc-daemon/tests/golden/module_id_path_component_refusals.json") as {
       vectors: {
         name: string;
         module_id: { unit: string; repeat: number };
@@ -156,7 +156,7 @@ describe("data-home resolver (mirror of subc default_data_home)", () => {
   // rather than a cfg, so unlike the Rust harnesses this one runs EVERY row
   // on every host: 'any' rows under both platforms, unix rows under linux,
   // windows rows under win32.
-  const golden = require("../../../crates/subc-core/tests/golden/data_home_resolution.json") as {
+  const golden = require("../../../crates/subc-daemon/tests/golden/data_home_resolution.json") as {
     cases: { name: string; platform: string; env: Record<string, string>; expect: string }[];
     composed: {
       name: string;
