@@ -329,6 +329,7 @@ count_in() {  # count_in <table> <file> <needle>
 # Collect every discriminating table, then prefer one whose control reads on both
 # images. Refusing only when NO such table exists keeps the arm as strict as it
 # was without failing valid cards (PLEX, 190406a, first card to hit it).
+marker_table=""
 if [ "$MARKER" = "none" ]; then
   # No literal to compare. Substitute the strongest available discriminator:
   # a rebuild always moves LC_UUID, and two files sharing one are the same build.
@@ -394,12 +395,18 @@ else
 fi
 say "marker discriminates in the $marker_table table"
 fi
+# Under --marker none there is no marker table to bind the control to, so the
+# control's job changes: it proves the COUNTING INSTRUMENT works on both images
+# (a needle known present reading >0 in strings on each), not that a marker's
+# table is readable. Without this arm `--marker none --control X` accepted X
+# unread, which is a control that proves nothing (found on ENGRAM c5a4c94).
 if [ -n "$CONTROL" ]; then
-  c_staged=$(count_in "$marker_table" "$STAGED" "$CONTROL")
-  c_live=$(count_in "$marker_table" "$DEST" "$CONTROL")
-  say "control $marker_table:\"$CONTROL\" staged $c_staged / live $c_live"
+  control_table="${marker_table:-strings}"
+  c_staged=$(count_in "$control_table" "$STAGED" "$CONTROL")
+  c_live=$(count_in "$control_table" "$DEST" "$CONTROL")
+  say "control $control_table:\"$CONTROL\" staged $c_staged / live $c_live"
   { [ "$c_staged" -gt 0 ] && [ "$c_live" -gt 0 ]; } \
-    || refuse "control must read on BOTH images in the SAME table the marker used, else the marker's count is uninformative"
+    || refuse "control must read on BOTH images in the $control_table table, else the instrument itself is unproven on one of them"
 fi
 
 # --gone asserts a REMOVAL, which is the inverse of a marker: a marker asks "did the
