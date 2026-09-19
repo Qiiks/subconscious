@@ -90,6 +90,54 @@ copy of*, and they consult it rather than each other.
 Terminal history is already durable via the journal (0.18.9); this is about
 consistency within a daemon lifetime, not across one.
 
+## VERDICT: THE PREMISE IS HALF WRONG, AND THIS ITEM SHRINKS
+
+Athena reviewed this note and said the route.open commit is ALREADY fenced, so
+the acceptance test below would pass at HEAD with no new record -- green for the
+wrong reason. It instructed me to write that test against the current tree
+BEFORE commissioning anything. I checked the source instead of writing it,
+because the source settles it faster and more honestly:
+
+    forwarding.rs:406-414   registering a module connection bumps
+                            `inner.next_generation` and inserts the new
+                            ModuleEndpointId, after REMOVING the old endpoint
+                            for that connection_id (:402-403)
+
+    forwarding.rs:1847-1850 commit_route_locked RE-RESOLVES the reservation's
+                            endpoint in `module_id_by_endpoint` and returns
+                            ForwardingError::StaleModuleEndpoint when it is gone
+
+So a route.open that began against endpoint generation N CANNOT commit against
+N+1: the commit's own lookup fails first. THE FENCE EXISTS. Athena was right and
+this note's central claim was wrong.
+
+Two further facts found while checking, which matter for anyone who revisits:
+
+  1. THE ENDPOINT GENERATION IS NOT THE REGISTRY GENERATION. It is
+     `ForwardingTable::next_generation`, bumped only when a module connection is
+     registered in the forwarding table. `Registry::generation()` has three bump
+     sites (register, replace_catalog_for_connection, deregister_connection), so
+     a live module calling `catalog.update` advances the REGISTRY generation and
+     leaves the ENDPOINT generation untouched. I briefly thought catalog.update
+     made the stale-commit window reachable on a live connection; it does not.
+
+  2. REACHING THE WINDOW AT ALL REQUIRES THE OLD CONNECTION TO DIE. A second
+     HELLO for a registered module_id is refused `duplicate_module_id`
+     (control.rs:1134-1136), so the endpoint generation advances only after the
+     previous connection goes away -- and that kills the in-flight bind relay
+     anyway, which is the `route.bind relay abandoned` path rather than a stale
+     commit.
+
+WHAT REMAINS is strictly smaller than this note proposed: the six reads still
+span three authorities and can still disagree with each other in ways the commit
+fence does not cover (a pre-check reading `unknown_module` while a tombstone is
+being written, which is the defect shipped at 79015b6b). That is a
+PRE-CHECK STALENESS problem, not a commit-correctness one, and it does not need
+a new authority -- it needs the pre-checks to read one snapshot.
+
+I am leaving the original text below unedited rather than rewriting it, so the
+next reader sees what was claimed and what the source said.
+
 ## Acceptance, and the mutation that decides it
 
 The arm a weaker implementation passes vacuously is **the fence**, because a
