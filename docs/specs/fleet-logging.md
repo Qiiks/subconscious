@@ -210,6 +210,24 @@ an undeclared name); the manifest declaration is for discoverability and for
 
 Per-module policy, writer-executed, no central authority — with the reasons.
 
+**Segments are not backup-class.** They are regenerable, bounded by the
+retention window, and can grow to the alarm size in a day. A module whose
+engram backup descriptor names its store FILE (`whole-db`, `path: "store.db"`)
+already captures nothing under `logs/`, by construction rather than by
+exclusion: naming one file cannot sweep its parent. A DIRECTORY-shaped
+descriptor would capture segments, so a module writing one must exclude
+`logs/` explicitly. Stated here because the seat writing a descriptor in six
+months will not have read the thread this came from (THALAMUS, ASTRO, ENGRAM,
+2026-09-19).
+
+**Wherever two components must agree on a path, one resolves it and the other
+is told.** A module's segment directory derives from the data directory the
+daemon hands it at HELLO (or the state directory a rig points it at), never
+from a second resolution of the same environment: a re-derived path reads as
+equivalent and is the mechanism behind every isolated instance that appended
+to the operator's segment this week. ENGRAM's descriptor path holds the same
+invariant from the other end.
+
 - **Policy is per-module** because volumes differ by orders of magnitude
   (engram's GC walk at `progress` verbosity versus claustrum's audit-adjacent
   events versus synapse perf). It lives in the one place the daemon already
