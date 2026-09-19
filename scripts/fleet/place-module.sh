@@ -117,6 +117,32 @@ for cand in "$staged_base.sha256.postsign" "$staged_base.sha256"; do
 done
 [ -n "$sidecar" ] || refuse "no sidecar beside the staged artifact (bare-binary staging directories are refused)"
 (cd "$staged_dir" && shasum -c "$sidecar" >/dev/null 2>&1) || refuse "staged sidecar does not verify its own artifact: $sidecar"
+
+# BOTH FILES MUST BE THE SAME KIND OF THING, and this is a separate question
+# from every other arm here.
+#
+# `strings` and `nm` produce output for files that are not the binary you meant:
+# a shell script, a text file, an archive. So a marker reading "staged 1 / live
+# 0" and a control reading 1/1 can BOTH be satisfied by a text file that happens
+# to contain those words -- every arm green, nothing placed that runs.
+#
+# PLEX found this by adversarial test of their own staging script (2026-09-19):
+# it PASSED against a plain text file containing the control word. Their line is
+# the general one -- A PRESENT CONTROL PROVES THE INSTRUMENT READ SOMETHING, NOT
+# THAT IT READ THE RIGHT KIND OF THING.
+#
+# My gate happened to refuse their exact case, but on SIGNING POSTURE ("staged []
+# vs running [Signature=adhoc]") -- an accident of this host, not a design. With
+# codesign absent, or a running binary that is itself unsigned, the text file
+# sails through.
+staged_kind=$(file -b "$STAGED" 2>/dev/null | cut -d, -f1)
+live_kind=$(file -b "$DEST" 2>/dev/null | cut -d, -f1)
+case "$staged_kind" in
+  *"Mach-O"*|*"ELF"*|*"PE32"*) : ;;
+  *) refuse "staged artifact is not an executable image: $STAGED reads as \"$staged_kind\". strings and nm answer for text files too, so the marker and control arms below would be satisfied by a file that cannot run; nothing has been placed" ;;
+esac
+[ "$staged_kind" = "$live_kind" ] || refuse "staged and running artifacts are DIFFERENT KINDS: staged \"$staged_kind\" vs running \"$live_kind\"; nothing has been placed"
+say "kind: $staged_kind (matches running)"
 say "staged sidecar $sidecar: OK"
 
 # ---- CURRENCY: is this the artifact its OWNER says is live? ----
