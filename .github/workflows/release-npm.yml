@@ -15,6 +15,7 @@ on:
     tags:
       - "subc-client@*"
       - "store@*"
+      - "log@*"
 
 concurrency:
   group: release-npm-${{ github.ref }}-${{ github.sha }}
@@ -44,6 +45,7 @@ jobs:
           case "$PKG" in
             subc-client) DIR="clients/subc-client" ;;
             store)       DIR="clients/store" ;;
+            log)         DIR="clients/log" ;;
             *) echo "::error::No package mapping for tag prefix '$PKG'"; exit 1 ;;
           esac
           echo "dir=$DIR" >> "$GITHUB_OUTPUT"
