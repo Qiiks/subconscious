@@ -363,8 +363,22 @@ if [ -n "$MIGRATES" ]; then
   # and cp captures a torn .db beside a WAL it does not include -- a snapshot
   # that restores to a state which never existed. .backup is the online backup
   # API and is WAL-correct against a running writer.
+  # `mode=ro` is right HERE because --migrates runs while the module still holds
+  # the store open, so a -wal exists. It is not a universal choice: on a WAL-less
+  # whole-db artifact (this snapshot itself, once written) mode=ro REFUSES with
+  # error 14 on some SQLite builds and `immutable=1` is the honest reader
+  # instead. Flag by artifact, not by preference (CKCRED, 2026-09-19).
+  #
+  # DELIBERATELY NO immutable=1 FALLBACK HERE: if mode=ro fails because the
+  # module was stopped first, immutable=1 would SUCCEED and snapshot the last
+  # checkpointed state -- silently dropping every transaction in the WAL, which
+  # is the worst possible outcome for a rollback artifact. Refuse instead.
   sqlite3 "file:$MIGRATES?mode=ro" ".backup $store_rb" 2>/dev/null \
-    || refuse "store snapshot failed for $MIGRATES; nothing has been placed"
+    || refuse "store snapshot failed for $MIGRATES; nothing has been placed.
+        If the module is STOPPED, its store has a -wal and no -shm, and a
+        read-only open cannot replay it. Start the module and re-run, or copy
+        the .db AND its -wal to a scratch dir and snapshot the copy. Do NOT
+        reach for immutable=1: it would succeed and silently omit the WAL."
   [ -s "$store_rb" ] || refuse "store snapshot $store_rb is empty; nothing has been placed"
   (cd "$STAGING" && shasum -a 256 "$(basename "$store_rb")" > "$(basename "$store_rb").sha256")
   say "store rollback $(basename "$store_rb") ($(stat -f %z "$store_rb" 2>/dev/null || stat -c %s "$store_rb") bytes)"
