@@ -50,6 +50,18 @@ pub mod error_codes {
     pub const MODULE_WARMING: &str = "module_warming";
     pub const TARGET_UNAVAILABLE: &str = "target_unavailable";
     pub const MODULE_TIMEOUT: &str = "module_timeout";
+    /// The target module is declared as speaking no subc wire protocol
+    /// (`protocol: "none"` in daemon config), so it has no control lane and can
+    /// never accept a route. The daemon supervises its process and nothing else.
+    ///
+    /// TERMINAL, and deliberately neither of its two neighbours. It is not
+    /// `unknown_module`, which means "never heard of it, it may appear" and is
+    /// retried; retrying here would storm the daemon forever, because the answer
+    /// is a property of the module's declaration rather than of its current
+    /// state. It is not `module_removed` either: the module is configured,
+    /// running, and supervised. Only an edit to its configuration can change
+    /// this answer, and a caller cannot wait that out.
+    pub const MODULE_NO_PROTOCOL: &str = "module_no_protocol";
 
     /// Whether a `route.open` refusal carrying `code` may be retried in place
     /// within the caller's deadline, or is terminal for the target as named.

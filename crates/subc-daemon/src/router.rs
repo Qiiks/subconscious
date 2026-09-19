@@ -909,6 +909,7 @@ mod tests {
         sync::{mpsc as std_mpsc, Arc},
         time::Duration,
     };
+    use subc_control::ModuleProtocol;
     use subc_protocol::{manifest::Concurrency, ErrorBody, Flags, FrameType, Priority};
     use tokio::sync::mpsc;
 
@@ -1090,6 +1091,7 @@ mod tests {
                     env: Vec::new(),
                     reserved: false,
                     reserved_prefixes: Vec::new(),
+                    protocol: ModuleProtocol::Subc,
                 },
                 false,
             )

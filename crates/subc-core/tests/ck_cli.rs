@@ -13,7 +13,8 @@ use ed25519_dalek::{Signer, SigningKey};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use subc_control::{
-    ClientControlRequest, ClientControlResponse, SupervisorEntry, SupervisorHealthStatus,
+    ClientControlRequest, ClientControlResponse, ModuleProtocol, SupervisorEntry,
+    SupervisorHealthStatus,
 };
 use subc_daemon::{
     read_frame, test_support::TestTempDir as TempDir, write_frame, Frame, HealthConfig, ModuleSpec,
@@ -1931,6 +1932,69 @@ async fn module_list_renders_status_words_not_wire_booleans() {
     module.stop().await.unwrap();
 }
 
+/// What an operator is told about a module that speaks no subc wire.
+///
+/// `live` stays a boolean on the wire, but for this module it answers a weaker
+/// question than it does for every other row on the screen: the daemon can say
+/// the process it launched is alive and nothing more, because there is no
+/// registration to check. Rendering that as the same `running` an ordinary
+/// module gets would quietly upgrade the claim, so the gap is named instead --
+/// beside the declaration that explains it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_status_names_the_protocol_and_refuses_to_render_live_as_a_boolean() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor_with_fast_health(&server);
+    let module_id = "nats";
+    let mut spec = stub_spec_with_env(module_id, vec![("FAKE_AFT_NEVER_CONNECT", "1")]);
+    spec.protocol = ModuleProtocol::None;
+    let module = supervisor.spawn(spec).unwrap();
+    wait_for_supervisor_entry(&server.connection_file_path, module_id, |entry| {
+        entry.state == "running" && entry.protocol == ModuleProtocol::None && entry.live
+    })
+    .await;
+
+    let output = ck_with_subc(
+        &server.connection_file_path,
+        ["module", "status", module_id, "--verbose"],
+    );
+    assert_exit(&output, 0);
+    let rendered = text(&output.stdout);
+    assert!(
+        rendered.contains("\n  protocol: none\n"),
+        "the declaration must appear on its own line: {rendered}"
+    );
+    assert!(
+        rendered.contains("n/a (no protocol)"),
+        "live must not render as a liveness word for a module with no wire: {rendered}"
+    );
+    assert!(
+        !rendered.contains("supervision: enabled \u{b7} running"),
+        "live rendered as if the daemon had checked a registration it never had: {rendered}"
+    );
+
+    let listed = ck_with_subc(
+        &server.connection_file_path,
+        ["module", "list", "--verbose"],
+    );
+    assert_exit(&listed, 0);
+    let listed = text(&listed.stdout);
+    assert!(
+        listed.contains("n/a (no protocol)"),
+        "the list's live column must carry the same caveat as status: {listed}"
+    );
+
+    // `ck --json` is the machine surface and stays the wire verbatim: the
+    // renderer's caveat is a rendering, never a rewrite of the field.
+    let status_json = assert_json_success(ck_with_subc(
+        &server.connection_file_path,
+        ["module", "status", module_id, "--json"],
+    ));
+    assert_eq!(status_json["module"]["protocol"], "none");
+    assert_eq!(status_json["module"]["live"], true);
+
+    module.stop().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn module_status_renders_key_value_block_byte_for_byte() {
     let server = TestServer::start().await;
@@ -2987,6 +3051,7 @@ fn stub_spec_with_env(module_id: &str, env: Vec<(&str, &str)>) -> ModuleSpec {
             .collect(),
         reserved: false,
         reserved_prefixes: Vec::new(),
+        protocol: ModuleProtocol::Subc,
     }
 }
 
@@ -3076,6 +3141,7 @@ fn scripted_supervisor_entry(module_id: &str, drain_timeout_ms: Option<u64>) -> 
         state: "running".to_string(),
         enabled: true,
         live: true,
+        protocol: ModuleProtocol::Subc,
         health: SupervisorHealthStatus::Ok,
         last_probe_ms: None,
         last_exit_code: None,
@@ -3163,6 +3229,7 @@ async fn spawn_quota_stub(
             ],
             reserved: false,
             reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
         })
         .unwrap();
     wait_for_supervisor_entry(&server.connection_file_path, module_id, |entry| {

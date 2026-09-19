@@ -10,7 +10,8 @@ use std::{
 
 use serde_json::Value;
 use subc_control::{
-    ClientControlRequest, ClientControlResponse, ConsumerIdentity, PollKind, SupervisorHealthStatus,
+    ClientControlRequest, ClientControlResponse, ConsumerIdentity, ModuleProtocol, PollKind,
+    SupervisorHealthStatus,
 };
 use subc_daemon::{
     read_frame, test_support::TestTempDir, write_frame, ExitKind, ForwardingTable, Frame,
@@ -488,6 +489,344 @@ async fn non_advertising_module_is_unknown_and_never_probed() {
     assert_eq!(status.health.last_probe_ms, None);
 
     module.stop().await.unwrap();
+}
+
+/// The defect and the fix in one test, because either half alone is unreadable.
+///
+/// A `protocol: "none"` module never registers and never answers `health.check`.
+/// Under a prober that classifies silence, that is a module being restarted on
+/// its crash budget for doing exactly what it was configured to do.
+///
+/// THE THREE ARMS ANSWER THREE DIFFERENT QUESTIONS:
+///
+/// * `never_connects_none` is the PRODUCTION SHAPE -- a third-party server that
+///   never dials subc, declared `none`. It must sit at `Running` with an
+///   untouched budget and an empty terminal ring.
+/// * `registers_but_silent_subc` is the CONTROL THAT PROVES THE PROBER IS LIVE
+///   at this cadence and threshold. Without it, every "was not restarted"
+///   assertion above could be satisfied by a prober that does nothing at all.
+/// * `registers_but_silent_none` is THE ARM THE GATE IS TESTED BY. It is the
+///   same fixture as the control, differing only in the declaration, so it can
+///   only stay unrestarted if the suppression is reached.
+///
+/// The third arm exists because the first CANNOT detect the gate being removed:
+/// today's prober only ever arms for a module that is registered AND advertises
+/// `health.check`, so a never-connecting module is never probed under either
+/// protocol. That makes the production shape safe today by accident of the
+/// scheduler rather than by this declaration -- which is precisely why the
+/// declaration needs an arm that fails without it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_protocol_none_module_is_never_probed_while_its_subc_twin_is_restarted() {
+    let server = TestServer::start().await;
+    let supervisor =
+        supervisor(&server, 3, Duration::from_millis(10)).with_health_config(health_config(
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+            1,
+            HealthAction::Report,
+            HealthAction::Report,
+            false,
+        ));
+
+    // Ten cadences of the 20ms probe clock. A module the prober is willing to
+    // touch fails its single-probe threshold long before this elapses, which is
+    // what the control arm below demonstrates on the same budget.
+    const TEN_CADENCES: Duration = Duration::from_millis(200);
+
+    let never_connects_none = supervisor
+        .spawn(never_connecting_spec("nats-like-none", None, SigtermMode::Default).0)
+        .unwrap();
+
+    let mut silent_subc_spec = stub_spec_with_env(
+        &server,
+        "silent-subc-twin",
+        [
+            ("FAKE_AFT_ADVERTISE_HEALTH", "1"),
+            ("FAKE_AFT_HEALTH_NEVER_REPLY", "1"),
+        ],
+    );
+    silent_subc_spec.protocol = ModuleProtocol::Subc;
+    let registers_but_silent_subc = supervisor.spawn(silent_subc_spec).unwrap();
+
+    let mut silent_none_spec = stub_spec_with_env(
+        &server,
+        "silent-none-twin",
+        [
+            ("FAKE_AFT_ADVERTISE_HEALTH", "1"),
+            ("FAKE_AFT_HEALTH_NEVER_REPLY", "1"),
+        ],
+    );
+    silent_none_spec.protocol = ModuleProtocol::None;
+    let registers_but_silent_none = supervisor.spawn(silent_none_spec).unwrap();
+
+    // The control first: it is the only arm that can fail by waiting, and it
+    // establishes that a prober capable of restarting is running before the two
+    // negative arms claim anything from silence.
+    let restarted = wait_for_status(&registers_but_silent_subc, SETUP_TIMEOUT, |status| {
+        status.restart_count >= 1
+    })
+    .await;
+    assert!(
+        restarted.restart_count >= 1,
+        "a subc module that never answers health.check must be restarted; this is the \
+         behaviour protocol: none exists to suppress"
+    );
+
+    sleep(TEN_CADENCES).await;
+
+    for module in [&never_connects_none, &registers_but_silent_none] {
+        let status = module.status().unwrap();
+        assert_eq!(
+            status.state,
+            ModuleState::Running,
+            "{} must still be running: nothing about it is a fault",
+            module.module_id()
+        );
+        assert_eq!(
+            status.restart_count,
+            0,
+            "{} spent crash budget on a protocol it does not speak",
+            module.module_id()
+        );
+        assert_eq!(
+            status.health.last_probe_ms,
+            None,
+            "{} was probed despite declaring no subc wire",
+            module.module_id()
+        );
+        assert!(
+            module.terminal_history().entries.is_empty(),
+            "{} has a terminal record, so something tore it down",
+            module.module_id()
+        );
+    }
+
+    // `live` for a module with no wire to register on: the process is up, and
+    // that is the whole claim.
+    let status = never_connects_none.status().unwrap();
+    assert!(
+        status.live,
+        "a running protocol: none module must not read as not-live forever"
+    );
+    assert!(
+        !status.registration_active,
+        "precondition: this module must never have registered"
+    );
+
+    never_connects_none.stop().await.unwrap();
+    registers_but_silent_none.stop().await.unwrap();
+    registers_but_silent_subc.stop().await.unwrap();
+}
+
+/// Teardown asks before it forces, and the two arms are the difference between
+/// asking and pretending to.
+///
+/// A subc module is asked over its own connection. A module that speaks no subc
+/// wire has no connection to be asked over, so without a signal the drain budget
+/// is pure delay in front of a SIGKILL -- which, for the store this mode exists
+/// to supervise, turns every ordinary restart into a recovery on next start.
+///
+/// The arms differ ONLY in what the child does with the signal:
+///
+/// * handled -> a marker file that cannot exist unless SIGTERM was delivered,
+///   plus `exit 0`, plus an elapsed time well inside the budget.
+/// * ignored -> `signal 9` after the FULL budget, which is what the old
+///   behaviour looked like for every `none` module on every teardown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn protocol_none_teardown_sigterms_first_and_only_kills_a_child_that_ignores_it() {
+    const DRAIN_BUDGET: Duration = Duration::from_millis(900);
+
+    let server = TestServer::start().await;
+    let supervisor =
+        supervisor_with_drain_timeout(&server, 2, Duration::from_millis(10), DRAIN_BUDGET);
+
+    let marker = server.temp_dir.join("sigterm-handled.marker");
+    let (handled_spec, handled_ready) = never_connecting_spec(
+        "none-graceful",
+        Some(&server.temp_dir),
+        SigtermMode::WriteMarkerAndExitZero(&marker),
+    );
+    let handled = supervisor.spawn(handled_spec).unwrap();
+    wait_for_path(
+        &handled_ready.expect("ready path configured"),
+        SETUP_TIMEOUT,
+    )
+    .await;
+
+    let started = Instant::now();
+    handled.restart(None).await.unwrap();
+    let status =
+        wait_for_status(&handled, SETUP_TIMEOUT, |status| status.last_exit.is_some()).await;
+    let handled_elapsed = started.elapsed();
+    let exit = status.last_exit.expect("waited for an exit");
+
+    assert!(
+        marker.exists(),
+        "no SIGTERM reached the child: the marker file is written by its handler and \
+         cannot appear any other way"
+    );
+    assert_eq!(
+        (exit.code, exit.signal),
+        (Some(0), None),
+        "a child that handled SIGTERM must be recorded as exiting cleanly, not as killed"
+    );
+    assert!(
+        handled_elapsed < DRAIN_BUDGET,
+        "a cooperative stop took {handled_elapsed:?}, at or past the {DRAIN_BUDGET:?} budget, \
+         which is what waiting-then-killing looks like"
+    );
+
+    let (ignored_spec, ignored_ready) =
+        never_connecting_spec("none-stubborn", Some(&server.temp_dir), SigtermMode::Ignore);
+    let ignored = supervisor.spawn(ignored_spec).unwrap();
+    wait_for_path(
+        &ignored_ready.expect("ready path configured"),
+        SETUP_TIMEOUT,
+    )
+    .await;
+
+    let started = Instant::now();
+    ignored.restart(None).await.unwrap();
+    let status =
+        wait_for_status(&ignored, SETUP_TIMEOUT, |status| status.last_exit.is_some()).await;
+    let ignored_elapsed = started.elapsed();
+    let exit = status.last_exit.expect("waited for an exit");
+
+    assert_eq!(
+        exit.signal,
+        Some(9),
+        "a child that ignores SIGTERM must still be killed once the budget is spent"
+    );
+    assert!(
+        ignored_elapsed >= DRAIN_BUDGET,
+        "the kill came after {ignored_elapsed:?}, before the {DRAIN_BUDGET:?} budget was spent: \
+         the drain budget is not being honoured"
+    );
+
+    handled.stop().await.unwrap();
+    ignored.stop().await.unwrap();
+}
+
+/// A caller asking a `protocol: "none"` module for a route is asking for
+/// something that can never exist, and the refusal has to say so in a code the
+/// SDKs classify as terminal.
+///
+/// `unknown_module` and `target_unavailable` are both RETRYABLE, and both would
+/// be lies here: the module is configured, running, and supervised, and no
+/// amount of waiting changes the answer. A retryable code turns every consumer
+/// that reaches for this module into a retry loop against the daemon for the
+/// lifetime of the process.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn route_open_to_a_protocol_none_module_is_refused_as_terminal_and_counted() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "none-no-routes";
+    let module = supervisor
+        .spawn(never_connecting_spec(module_id, None, SigtermMode::Default).0)
+        .unwrap();
+    wait_for_status(&module, SETUP_TIMEOUT, |status| {
+        status.state == ModuleState::Running
+    })
+    .await;
+
+    let project = TestProject::new();
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let before = server_counter_key(
+        &mut client,
+        700,
+        "route_open_refused_by_code",
+        "module_no_protocol",
+    )
+    .await;
+
+    let error =
+        attach_error_on_stream(&mut client, &project, 701, "ses-no-protocol", module_id).await;
+
+    assert_eq!(
+        error.code,
+        subc_protocol::error_codes::MODULE_NO_PROTOCOL,
+        "a module that speaks no subc wire must be refused by its own code, not by one \
+         that invites a retry"
+    );
+    assert!(
+        !subc_protocol::error_codes::is_retryable_route_open(&error.code),
+        "the refusal code must classify terminal in the shared predicate the SDKs call"
+    );
+    let after = server_counter_key(
+        &mut client,
+        702,
+        "route_open_refused_by_code",
+        "module_no_protocol",
+    )
+    .await;
+    assert_eq!(
+        after,
+        before + 1,
+        "the refusal must be counted under its own key, or an operator cannot see \
+         consumers reaching for a module that serves nothing"
+    );
+
+    module.stop().await.unwrap();
+}
+
+/// `supervisor.list` has to carry the declaration, because `live` cannot be read
+/// without it: `true` means "registered and routable" for one protocol and
+/// "the process is up" for the other, and a reader with only the boolean cannot
+/// tell which claim it is holding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervisor_list_carries_the_declared_protocol_beside_live() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let none_module = supervisor
+        .spawn(never_connecting_spec("listed-none", None, SigtermMode::Default).0)
+        .unwrap();
+    let subc_module = spawn_stub(&server, &supervisor, "listed-subc").await;
+    wait_for_status(&none_module, SETUP_TIMEOUT, |status| status.live).await;
+    wait_for_status(&subc_module, SETUP_TIMEOUT, |status| status.live).await;
+
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    write_frame(
+        &mut client,
+        &control_request_frame(710, ClientControlRequest::SupervisorList {}),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+    let frame = read_frame_timeout(&mut client).await;
+    let modules = match serde_json::from_slice::<ClientControlResponse>(&frame.body).unwrap() {
+        ClientControlResponse::SupervisorList { modules, .. } => modules,
+        other => panic!("unexpected supervisor.list response: {other:?}"),
+    };
+    let entry = |module_id: &str| {
+        modules
+            .iter()
+            .find(|entry| entry.module_id == module_id)
+            .unwrap_or_else(|| panic!("{module_id} missing from supervisor.list"))
+            .clone()
+    };
+
+    let none_entry = entry("listed-none");
+    assert_eq!(none_entry.protocol, ModuleProtocol::None);
+    assert!(
+        none_entry.live,
+        "a running protocol: none module is as live as the daemon can say it is"
+    );
+
+    let subc_entry = entry("listed-subc");
+    assert_eq!(
+        subc_entry.protocol,
+        ModuleProtocol::Subc,
+        "a module that declares nothing is a subc module, exactly as it was before \
+         this field existed"
+    );
+    assert!(subc_entry.live);
+
+    none_module.stop().await.unwrap();
+    subc_module.stop().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6511,6 +6850,87 @@ fn stub_spec(server: &TestServer, module_id: &str) -> ModuleSpec {
     stub_spec_with_env(server, module_id, std::iter::empty::<(&str, &str)>())
 }
 
+/// What the never-connecting stub does when SIGTERM arrives.
+///
+/// Every variant is a different observation about the supervisor: whether it
+/// signalled at all, whether it waited for the child's own exit, and whether it
+/// still kills a child that will not take the hint.
+#[derive(Clone, Copy)]
+enum SigtermMode<'a> {
+    /// No handler, so SIGTERM keeps its default disposition and the process dies
+    /// of signal 15. The shape of an ordinary third-party server.
+    Default,
+    /// Write this marker, then exit 0.
+    WriteMarkerAndExitZero(&'a Path),
+    /// Install a handler that does nothing, so the signal is delivered and
+    /// deliberately not acted on.
+    Ignore,
+}
+
+/// A module that never dials subc: no connect, no HELLO, no registration, for
+/// its whole life. This is what `protocol: "none"` is for, and it is why the
+/// stub grew a mode rather than these tests spawning `sleep` -- `sleep` is alive
+/// and unregistered too, but it cannot report what it did with a signal.
+///
+/// Returns the readiness path when `ready_dir` is given. A test that signals the
+/// child must wait for it: the stub installs its SIGTERM handler during startup,
+/// and a signal arriving before that gets the DEFAULT disposition, which would
+/// make a cooperative-stop assertion fail for a reason that has nothing to do
+/// with the supervisor.
+fn never_connecting_spec(
+    module_id: &str,
+    ready_dir: Option<&Path>,
+    sigterm: SigtermMode<'_>,
+) -> (ModuleSpec, Option<PathBuf>) {
+    let mut env = vec![
+        ("FAKE_AFT_MODULE_ID".to_string(), module_id.to_string()),
+        ("FAKE_AFT_NEVER_CONNECT".to_string(), "1".to_string()),
+    ];
+    match sigterm {
+        SigtermMode::Default => {}
+        SigtermMode::WriteMarkerAndExitZero(marker) => env.push((
+            "FAKE_AFT_SIGTERM_MARKER_PATH".to_string(),
+            marker.to_string_lossy().into_owned(),
+        )),
+        SigtermMode::Ignore => env.push(("FAKE_AFT_IGNORE_SIGTERM".to_string(), "1".to_string())),
+    }
+    let ready = ready_dir.map(|dir| dir.join(format!("{module_id}.ready")));
+    if let Some(ready) = ready.as_ref() {
+        env.push((
+            "FAKE_AFT_NEVER_CONNECT_READY_PATH".to_string(),
+            ready.to_string_lossy().into_owned(),
+        ));
+    }
+
+    (
+        ModuleSpec {
+            module_id: module_id.to_string(),
+            program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
+            args: Vec::new(),
+            env,
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::None,
+        },
+        ready,
+    )
+}
+
+async fn wait_for_path(path: &Path, wait: Duration) {
+    let deadline = Instant::now() + wait;
+    loop {
+        if path.exists() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{} did not appear within {wait:?}",
+            path.display()
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
 fn reserved_stub_spec(server: &TestServer, module_id: &str) -> ModuleSpec {
     let mut spec = stub_spec(server, module_id);
     spec.reserved = true;
@@ -6537,6 +6957,7 @@ where
         env,
         reserved: false,
         reserved_prefixes: Vec::new(),
+        protocol: ModuleProtocol::Subc,
     }
 }
 

@@ -28,7 +28,9 @@ use rmcp::{
     ClientHandler, RoleClient, ServiceExt,
 };
 use serde_json::{json, Value};
-use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse, SupervisorEntry};
+use subc_control::{
+    CatalogEntry, ClientControlRequest, ClientControlResponse, ModuleProtocol, SupervisorEntry,
+};
 use subc_daemon::{
     read_frame, serve_listener, write_frame, ControlHandler, ForwardingTable, Frame,
     ModuleProcessLiveness, ModuleSpec, Registry, RestartPolicy, Router, ServerAuth,
@@ -3910,6 +3912,7 @@ fn stub_spec(module_id: &str, events_path: &Path, extra_env: &[(&str, &str)]) ->
         env,
         reserved: false,
         reserved_prefixes: Vec::new(),
+        protocol: ModuleProtocol::Subc,
     }
 }
 
@@ -3932,6 +3935,7 @@ fn mcp_module_spec(
         )],
         reserved: false,
         reserved_prefixes: Vec::new(),
+        protocol: ModuleProtocol::Subc,
     }
 }
 

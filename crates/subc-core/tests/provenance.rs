@@ -14,7 +14,8 @@ use subc_control::RunningImageEvidence;
 #[cfg(target_os = "windows")]
 use subc_control::RunningImageUnavailableReason;
 use subc_control::{
-    ClientControlRequest, ClientControlResponse, ModuleDeclaredProvenance, RunningImageAgreement,
+    ClientControlRequest, ClientControlResponse, ModuleDeclaredProvenance, ModuleProtocol,
+    RunningImageAgreement,
 };
 #[cfg(target_os = "linux")]
 use subc_daemon::test_support::TestTempDir;
@@ -251,6 +252,7 @@ fn stub_spec(module_id: &str, env: Vec<(&str, &str)>) -> ModuleSpec {
             .collect(),
         reserved: false,
         reserved_prefixes: Vec::new(),
+        protocol: ModuleProtocol::Subc,
     }
 }
 

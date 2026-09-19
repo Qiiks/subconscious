@@ -1,6 +1,6 @@
 use std::{ops::Deref, path::PathBuf, sync::Arc, time::Duration};
 
-use subc_control::TerminalDisposition;
+use subc_control::{ModuleProtocol, TerminalDisposition};
 use subc_daemon::{
     stderr_tail::{CaptureState, StderrTailSnapshot, TailEntry},
     test_support::TestTempDir,
@@ -216,6 +216,7 @@ async fn failed_spawn_during_enable_allows_a_later_retry() {
                 env: Vec::new(),
                 reserved: false,
                 reserved_prefixes: Vec::new(),
+                protocol: ModuleProtocol::Subc,
             },
             false,
         )
@@ -761,6 +762,7 @@ fn stub_spec<'a>(
         env,
         reserved: false,
         reserved_prefixes: Vec::new(),
+        protocol: ModuleProtocol::Subc,
     }
 }
 
@@ -805,6 +807,7 @@ async fn a_dead_module_leaves_its_stderr_readable_from_the_supervisor() {
             ],
             reserved: false,
             reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
         })
         .unwrap();
 
@@ -860,6 +863,7 @@ async fn a_silent_module_reports_captured_and_empty_rather_than_uncaptured() {
             env: vec![("FAKE_AFT_EXIT_CODE".to_string(), "3".to_string())],
             reserved: false,
             reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
         })
         .unwrap();
 
@@ -933,6 +937,7 @@ async fn a_supervised_module_inherits_the_parent_environment() {
             ],
             reserved: false,
             reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
         })
         .unwrap();
 
@@ -979,6 +984,7 @@ async fn stderr_from_before_a_restart_survives_with_a_marked_boundary() {
             ],
             reserved: false,
             reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
         })
         .unwrap();
 
@@ -1044,6 +1050,7 @@ async fn a_wedged_old_stderr_pump_is_stopped_before_the_next_restart_boundary() 
             ],
             reserved: false,
             reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
         })
         .unwrap();
 
@@ -1099,6 +1106,7 @@ async fn child_stdout_and_stderr_reach_the_capture_file_while_only_stderr_reache
             ],
             reserved: false,
             reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
         })
         .unwrap();
 
@@ -1161,6 +1169,7 @@ async fn concurrent_child_pipes_never_tear_a_line_in_the_capture_file() {
             env: vec![("LOG_CHILD_BURST".to_string(), BURST.to_string())],
             reserved: false,
             reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
         })
         .unwrap();
 

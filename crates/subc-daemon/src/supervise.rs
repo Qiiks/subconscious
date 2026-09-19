@@ -11,8 +11,8 @@ use std::{
 use cortexkit_log::Retention;
 use serde_json::Value;
 use subc_control::{
-    ClientControlPush, RouteCloseReason, SupervisorHealthStatus, TerminalDisposition,
-    TerminalExitKind,
+    ClientControlPush, ModuleProtocol, RouteCloseReason, SupervisorHealthStatus,
+    TerminalDisposition, TerminalExitKind,
 };
 use subc_protocol::{
     manifest::{SelfSignalKind, SignalAnchor},
@@ -186,6 +186,15 @@ pub struct ModuleSpec {
     /// supervisor; the owner module's current spawn nonce authorizes claims under
     /// each prefix.
     pub reserved_prefixes: Vec<String>,
+    /// The wire protocol this module speaks, as DECLARED in daemon config.
+    ///
+    /// [`ModuleProtocol::None`] changes three things and nothing else: health
+    /// probing is suppressed, teardown sends SIGTERM before waiting, and
+    /// `route.open` is refused. Spawn is identical -- the launch nonce and
+    /// `SUBC_MODULE_ID` still go into the child environment, because they are
+    /// harmless to a process that ignores them and a second spawn path would be
+    /// a second thing to keep correct.
+    pub protocol: ModuleProtocol,
 }
 
 /// Bounded restart policy for crash exits.
@@ -477,6 +486,19 @@ pub struct ModuleStatus {
     pub enabled: bool,
     pub process_alive: bool,
     pub registration_active: bool,
+    /// The module's declared wire protocol, carried beside `live` because it is
+    /// what makes `live` readable: the two fields answer one question together.
+    pub protocol: ModuleProtocol,
+    /// Whether the module is serving, under the strongest definition the daemon
+    /// can assert for its protocol.
+    ///
+    /// A subc module must also be REGISTERED: its process being alive says
+    /// nothing about whether it can take a request. A `protocol: "none"` module
+    /// never registers, so that term is dropped and this falls back to "enabled,
+    /// running, and the process the daemon launched is alive" -- which is all
+    /// the daemon observes about a process that speaks no subc wire. It stays a
+    /// `bool` on the wire for compatibility; renderers pair it with `protocol`
+    /// rather than printing it bare.
     pub live: bool,
     /// Crash restarts spent INSIDE `restart_window` as of this read. Older
     /// restarts have already released their slot, so this count can go down
@@ -1643,10 +1665,18 @@ impl SupervisedModule {
             .get_module(&self.inner.module_id)
             .map_err(SuperviseError::Registry)?
             .is_some();
-        let live = snapshot.enabled
-            && snapshot.state == ModuleState::Running
-            && snapshot.process_alive
-            && registration_active;
+        let protocol = self.declared_protocol()?;
+        let running_process =
+            snapshot.enabled && snapshot.state == ModuleState::Running && snapshot.process_alive;
+        // Registration is the difference between the two protocols and the only
+        // one: a subc module that has not registered cannot serve a request even
+        // though its process is up, and a `none` module never registers at all,
+        // so requiring it there would pin `live` to false for the whole life of
+        // a perfectly healthy process.
+        let live = match protocol {
+            ModuleProtocol::Subc => running_process && registration_active,
+            ModuleProtocol::None => running_process,
+        };
 
         Ok(ModuleStatus {
             module_id: self.inner.module_id.clone(),
@@ -1654,6 +1684,7 @@ impl SupervisedModule {
             enabled: snapshot.enabled,
             process_alive: snapshot.process_alive,
             registration_active,
+            protocol,
             live,
             restart_count,
             lifetime_restarts: snapshot.lifetime_restarts,
@@ -1844,6 +1875,22 @@ impl SupervisedModule {
         reply_rx.await.map_err(|_| SuperviseError::CommandClosed {
             module_id: self.inner.module_id.clone(),
         })?
+    }
+
+    /// This module's declared protocol, read from the same stored configuration
+    /// the rescan diff compares and `update_configuration` rewrites, so a status
+    /// read and the supervise loop can never disagree about which protocol is in
+    /// force.
+    pub(crate) fn declared_protocol(&self) -> Result<ModuleProtocol, SuperviseError> {
+        Ok(self
+            .inner
+            .configuration
+            .lock()
+            .map_err(|_| SuperviseError::StatePoisoned {
+                module_id: Some(self.inner.module_id.clone()),
+            })?
+            .spec
+            .protocol)
     }
 
     pub(crate) fn configuration(&self) -> Result<(ModuleSpec, HealthConfig), SuperviseError> {
@@ -2125,6 +2172,24 @@ impl HealthProbeRuntime {
         registry: &Registry,
         snapshot: &SharedSnapshot,
     ) {
+        // THE PROBE GATE FOR A MODULE THAT SPEAKS NO SUBC WIRE, placed here
+        // because this is the only place that ever arms a probe: leaving
+        // `advertised` false and `next_probe_at` empty makes `due()` false
+        // forever, so `run_health_probe_cycle` -- and with it every arm of
+        // `probe_module_health`, including the one that reads an absent
+        // registration as proof the module is gone and escalates to a restart --
+        // is unreachable for this module.
+        //
+        // That arm is right for a subc module and is exactly wrong here: a
+        // `protocol: "none"` module never registers by declaration, so the
+        // absence it would classify is the module working as configured.
+        if spec.protocol == ModuleProtocol::None {
+            self.registered_connection = None;
+            self.advertised = false;
+            self.next_probe_at = None;
+            return;
+        }
+
         let registration = match registry.get_module(&spec.module_id) {
             Ok(registration) => registration,
             Err(err) => {
@@ -2705,6 +2770,7 @@ async fn health_restart_child(
         .await?;
         drain_optional_child(
             &spec.module_id,
+            spec.protocol,
             registry,
             snapshot,
             &runtime.terminal_ring,
@@ -2748,6 +2814,7 @@ async fn health_restart_child(
     .await?;
     drain_optional_child(
         &spec.module_id,
+        spec.protocol,
         registry,
         snapshot,
         &runtime.terminal_ring,
@@ -2881,6 +2948,7 @@ mod tests {
             env: Vec::new(),
             reserved: false,
             reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
         });
 
         assert!(
@@ -2928,6 +2996,7 @@ mod tests {
             env: Vec::new(),
             reserved: false,
             reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
         };
 
         let result = set_child_enabled(
@@ -2960,6 +3029,7 @@ mod tests {
             env: Vec::new(),
             reserved: false,
             reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
         };
 
         let result = handle_reload_spawn_failure(
@@ -2989,6 +3059,7 @@ mod tests {
                 env: Vec::new(),
                 reserved: false,
                 reserved_prefixes: Vec::new(),
+                protocol: ModuleProtocol::Subc,
             },
             supervisor.runtime_config(),
             Arc::clone(&snapshot),
@@ -3023,6 +3094,7 @@ mod tests {
             env: Vec::new(),
             reserved: false,
             reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
         };
         let module = supervisor.supervised_module(
             initial.clone(),
@@ -3242,6 +3314,7 @@ async fn handle_supervisor_command(
         SupervisorCommand::Drain { reply } => {
             let result = drain_optional_child(
                 &spec.module_id,
+                spec.protocol,
                 registry,
                 snapshot,
                 &runtime.terminal_ring,
@@ -3271,6 +3344,7 @@ async fn handle_supervisor_command(
                 .await?;
                 drain_optional_child(
                     &spec.module_id,
+                    spec.protocol,
                     registry,
                     snapshot,
                     &runtime.terminal_ring,
@@ -3416,6 +3490,7 @@ async fn restart_child(
     if child.is_some() {
         drain_optional_child(
             &spec.module_id,
+            spec.protocol,
             registry,
             snapshot,
             &runtime.terminal_ring,
@@ -3484,6 +3559,7 @@ async fn reload_child(
     if child.is_some() {
         drain_optional_child(
             &spec.module_id,
+            spec.protocol,
             registry,
             snapshot,
             &runtime.terminal_ring,
@@ -3677,6 +3753,7 @@ async fn set_child_enabled(
         .await?;
         drain_optional_child(
             &spec.module_id,
+            spec.protocol,
             registry,
             snapshot,
             &runtime.terminal_ring,
@@ -4863,6 +4940,7 @@ fn control_flags() -> Flags {
 #[allow(clippy::too_many_arguments)]
 async fn drain_optional_child(
     module_id: &str,
+    protocol: ModuleProtocol,
     registry: &Registry,
     snapshot: &SharedSnapshot,
     terminal_ring: &Arc<Mutex<TerminalRing>>,
@@ -4874,6 +4952,7 @@ async fn drain_optional_child(
     if let Some(child) = child.take() {
         drain_child_to_state(
             module_id,
+            protocol,
             registry,
             snapshot,
             terminal_ring,
@@ -4898,6 +4977,7 @@ async fn drain_optional_child(
 #[allow(clippy::too_many_arguments)]
 async fn drain_child_to_state(
     module_id: &str,
+    protocol: ModuleProtocol,
     registry: &Registry,
     snapshot: &SharedSnapshot,
     terminal_ring: &Arc<Mutex<TerminalRing>>,
@@ -4912,6 +4992,15 @@ async fn drain_child_to_state(
             state.enabled = enabled;
         }
     })?;
+
+    // The wait below is the same budget for both protocols; what differs is
+    // whether anything has ASKED the child to stop before it starts. A subc
+    // module was told over its own connection before reaching here. A module
+    // that speaks no subc wire was told nothing, so without this the budget is
+    // only a delay in front of SIGKILL.
+    if protocol == ModuleProtocol::None {
+        request_graceful_stop(module_id, &child);
+    }
 
     let exit_report = match timeout(drain_timeout, child.wait()).await {
         Ok(Ok(status)) => classify_reaped_child_exit(snapshot, &child, &status),
@@ -4969,6 +5058,63 @@ async fn drain_child_to_state(
     child.drain_stderr(module_id).await;
 
     wait_for_registration_release(registry, module_id, REGISTRY_RELEASE_TIMEOUT).await
+}
+
+/// Ask a `protocol: "none"` child to stop, the only way such a child can be
+/// asked.
+///
+/// A subc module is asked over its own connection: the drain sends
+/// `route.closing`/`route.closed` to its consumers, a GOODBYE per route, then a
+/// module GOODBYE, and the module stops itself. A module that speaks no subc
+/// wire receives none of that, so before this the drain budget was pure delay in
+/// front of a SIGKILL -- and for a process with a store to flush (JetStream is
+/// the reason this mode exists) a SIGKILL turns every ordinary teardown into a
+/// recovery on the next start.
+///
+/// NEVER CALLED FOR A SUBC MODULE, and that is a rule rather than an
+/// optimisation: a subc module's graceful stop is already running by the time a
+/// child is drained, and a signal would race it.
+///
+/// Best-effort by construction. A child that has already exited is the ordinary
+/// case rather than an error (the kill lands on a reaped or exiting pid), so a
+/// failure is logged at debug and the wait-then-kill below still decides the
+/// outcome.
+#[cfg(unix)]
+fn request_graceful_stop(module_id: &str, child: &SupervisedChild) {
+    let Some(pid) = child
+        .id()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .and_then(rustix::process::Pid::from_raw)
+    else {
+        debug!(
+            module_id,
+            "no pid to signal for protocol: none teardown; falling through to the drain wait"
+        );
+        return;
+    };
+    match rustix::process::kill_process(pid, rustix::process::Signal::TERM) {
+        Ok(()) => debug!(module_id, "sent SIGTERM to protocol: none module"),
+        Err(err) => debug!(
+            module_id,
+            error = %err,
+            "SIGTERM to protocol: none module failed; the drain wait and kill still apply"
+        ),
+    }
+}
+
+/// Windows has no SIGTERM and no portable stand-in for one. The graceful stops
+/// Windows does offer need cooperation this supervisor cannot assume: a console
+/// control event requires sharing a console with the child, and `WM_CLOSE`
+/// requires the child to pump a message loop. A supervised server process does
+/// neither, so there is nothing to send and teardown is the wait followed by the
+/// kill. Emulating a signal here would mean inventing a stop protocol, which is
+/// the thing `protocol: "none"` exists to avoid.
+#[cfg(not(unix))]
+fn request_graceful_stop(module_id: &str, _child: &SupervisedChild) {
+    debug!(
+        module_id,
+        "no graceful stop signal exists on this platform; protocol: none teardown waits, then kills"
+    );
 }
 
 fn terminal_disposition(final_state: ModuleState) -> TerminalDisposition {
@@ -5201,9 +5347,9 @@ mod terminal_history_tests {
         drained_after_quiescence_wait, handle_reload_spawn_failure, health_restart_child,
         lock_snapshot, on_child_exit, record_deliberate_severance, record_terminal,
         reset_restart_count, spawn_and_mark_running, update_snapshot, wait_error_exit_report,
-        ExitKind, ExitReport, ModuleSpec, ModuleState, NextAction, ProcessIdentity, RestartPolicy,
-        SuperviseError, SupervisedModule, Supervisor, SupervisorHandle, SupervisorHealthStatus,
-        SupervisorSnapshot,
+        ExitKind, ExitReport, ModuleProtocol, ModuleSpec, ModuleState, NextAction, ProcessIdentity,
+        RestartPolicy, SuperviseError, SupervisedModule, Supervisor, SupervisorHandle,
+        SupervisorHealthStatus, SupervisorSnapshot,
     };
     // The supervisor's clock, distinct from the `std::time::Instant` these tests
     // use for their own wall-clock deadlines: crash-restart instants must be on
@@ -5253,6 +5399,7 @@ mod terminal_history_tests {
             env: Vec::new(),
             reserved: true,
             reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
         });
         assert!(
             supervisor
@@ -5275,6 +5422,7 @@ mod terminal_history_tests {
             env: Vec::new(),
             reserved: true,
             reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
         });
         assert!(supervisor
             .reserved_hello_rejection("never-spawned", Some("minted"))
@@ -5450,6 +5598,7 @@ mod terminal_history_tests {
                 env: Vec::new(),
                 reserved: false,
                 reserved_prefixes: Vec::new(),
+                protocol: ModuleProtocol::Subc,
             })
             .unwrap();
         update_snapshot(
@@ -5561,6 +5710,7 @@ mod terminal_history_tests {
                 env: vec![("FAKE_AFT_EXIT_CODE".to_string(), "23".to_string())],
                 reserved: false,
                 reserved_prefixes: Vec::new(),
+                protocol: ModuleProtocol::Subc,
             })
             .unwrap();
 
@@ -5606,6 +5756,7 @@ mod terminal_history_tests {
             env: Vec::new(),
             reserved: false,
             reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
         };
 
         let crash_snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
@@ -5693,6 +5844,7 @@ mod terminal_history_tests {
             env: Vec::new(),
             reserved: false,
             reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
         };
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
         let process = ProcessIdentity {
@@ -5743,6 +5895,7 @@ mod terminal_history_tests {
             env: Vec::new(),
             reserved: false,
             reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
         };
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
 
@@ -5785,6 +5938,7 @@ mod terminal_history_tests {
             env: Vec::new(),
             reserved: false,
             reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
         }
     }
 
@@ -6042,6 +6196,7 @@ mod terminal_history_tests {
             env: vec![("FAKE_AFT_EXIT_CODE".to_string(), "23".to_string())],
             reserved: false,
             reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
         };
         let mut child = spawn_and_mark_running(&spec, &runtime, &snapshot).unwrap();
         let process = ProcessIdentity {
@@ -6058,6 +6213,7 @@ mod terminal_history_tests {
 
         drain_child_to_state(
             &spec.module_id,
+            spec.protocol,
             &registry,
             &snapshot,
             &runtime.terminal_ring,
@@ -6100,11 +6256,13 @@ mod terminal_history_tests {
             env: vec![("FAKE_AFT_EXIT_CODE".to_string(), "23".to_string())],
             reserved: false,
             reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
         };
         let child = spawn_and_mark_running(&spec, &runtime, &snapshot).unwrap();
 
         drain_child_to_state(
             &spec.module_id,
+            spec.protocol,
             &registry,
             &snapshot,
             &runtime.terminal_ring,
@@ -6253,8 +6411,8 @@ mod health_tombstone_tests {
     use tokio::sync::mpsc;
 
     use super::{
-        probe_module_health, HealthAction, HealthConfig, HealthProbeEvidence, ModuleSpec,
-        RestartPolicy, Supervisor, SupervisorRuntimeConfig,
+        probe_module_health, HealthAction, HealthConfig, HealthProbeEvidence, ModuleProtocol,
+        ModuleSpec, RestartPolicy, Supervisor, SupervisorRuntimeConfig,
     };
     use crate::{
         control::ControlHandler,
@@ -6296,6 +6454,7 @@ mod health_tombstone_tests {
             env: Vec::new(),
             reserved: false,
             reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
         };
         let module = supervisor
             .supervise_configured(spec.clone(), false)
@@ -6455,7 +6614,7 @@ mod health_tombstone_tests {
 
 #[cfg(test)]
 mod child_env_tests {
-    use super::{apply_child_env, ModuleSpec};
+    use super::{apply_child_env, ModuleProtocol, ModuleSpec};
     use std::{ffi::OsStr, path::PathBuf};
     use tokio::process::Command;
 
@@ -6467,6 +6626,7 @@ mod child_env_tests {
             env,
             reserved: false,
             reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
         }
     }
 

@@ -94,6 +94,54 @@ The block is read when a module starts being supervised (daemon start, or a
 rescan that adds the module). Like `drain_timeout_ms`, editing it for an
 already-running module takes effect on the next daemon start.
 
+## `protocol` declares whether a module speaks subc at all
+
+```jsonc
+{
+  "version": 1,
+  "modules": {
+    "nats": {
+      "program": "/usr/local/bin/nats-server",
+      "protocol": "none",
+      "drain_timeout_ms": 10000
+    }
+  }
+}
+```
+
+`protocol` is per-module and optional. Absent and `"subc"` are the same value:
+every module written before this key existed is a subc module, and there is no
+third "unspecified" state. Any other value is refused at parse time, naming the
+module and the value, because falling back to `"subc"` on a typo silently
+restores the exact supervision the operator was trying to turn off.
+
+`"none"` means the process speaks no subc wire: it never sends `HELLO`, never
+registers, never answers `health.check`, and can never serve a route. The daemon
+still supervises the PROCESS — spawn, process facts for `supervisor.provenance`,
+exit classification, terminal records, and the full crash-restart budget — and
+that is the whole reason such a program runs under subc at all.
+
+What changes for a `"none"` module:
+
+| Behaviour | `"subc"` | `"none"` |
+| --- | --- | --- |
+| Health probing | `health.check` on the configured cadence, escalating on the failure threshold | Suppressed. Silence from a module that speaks no wire is not evidence of anything. |
+| `live` | enabled, running, process alive, AND registered | enabled, running, process alive. `ck` renders it as `n/a (no protocol)` rather than a liveness word, because the daemon is asserting less. |
+| Teardown | route drain, `route.closed` pushes, per-route GOODBYEs, module GOODBYE, then the drain budget | `SIGTERM`, then the same drain budget, then `SIGKILL`. Read the result in `ck module terminals <id>`: `exit 0` or `exit_signal: 15` is a clean stop, `exit_signal: 9` means the child ignored the signal and the budget ran out. On Windows there is no graceful signal, so teardown is the wait and then the kill. |
+| `route.open` | ordinary routing | refused with `module_no_protocol`, which every SDK classifies as terminal rather than retrying |
+
+The teardown wait is `drain_timeout_ms` — the same key, the same default, and
+the same per-restart `--now`/`--drain-ms` overrides. A module with a store to
+flush should set it to what that flush actually costs.
+
+`reserved: true` with `protocol: "none"` is refused at parse. `reserved` is
+enforced on a module's `HELLO`, and a module that never registers never sends
+one, so the pair declares a protection that could never be checked.
+
+A `protocol` change on a running module is a pending-reload difference, like
+`program` or `args`: `supervisor.rescan --dry-run` reports it, and it takes
+effect when the module is next reloaded.
+
 ## Pre-auth limits are not configuration
 
 There is deliberately no `auth_deadline_ms` or

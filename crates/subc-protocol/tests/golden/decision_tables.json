@@ -7,6 +7,7 @@
     "forwarding_error": "terminal",
     "invalid_project_root": "terminal",
     "module_reloading": "retryable",
+    "module_no_protocol": "terminal",
     "module_removed": "terminal",
     "module_timeout": "retryable",
     "module_warming": "retryable",

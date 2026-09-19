@@ -1506,12 +1506,53 @@ pub struct SupervisorRescanResult {
     pub capability_warnings: Vec<String>,
 }
 
+/// Which wire protocol a supervised module speaks to subc, as DECLARED in
+/// daemon config. Never inferred from observed behaviour.
+///
+/// The distinction this exists to keep is between a module that should have
+/// registered and has not yet, and one that never will. A `Subc` module that has
+/// not registered is a subc module that is LATE -- it may be booting, it may be
+/// wedged, and the supervisor's health probing and restart escalation are the
+/// right response. A `None` module is a third-party process (the NATS server is
+/// the first) that subc launches, supervises, and stops, and that is all: it
+/// speaks no subc wire at all, so treating its silence as a fault would restart
+/// a perfectly healthy process forever.
+///
+/// Inferring the difference from "has not registered within N seconds" would
+/// collapse exactly the two cases that must stay apart, which is why this is a
+/// declaration.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModuleProtocol {
+    /// The module registers over channel 0, answers `health.check`, and can
+    /// serve routes. Every module predating this field is one of these, which is
+    /// why it is the default.
+    #[default]
+    Subc,
+    /// The module speaks no subc wire. It is supervised as a process only.
+    None,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SupervisorEntry {
     pub module_id: String,
     pub state: String,
     pub enabled: bool,
+    /// Whether this module is serving.
+    ///
+    /// For a `Subc` module: enabled, running, process alive, AND registered.
+    /// For a `None` module the registration term is dropped, because a module
+    /// that speaks no subc wire never registers and the daemon cannot assert
+    /// more than "the process it launched is alive". READ IT WITH `protocol`:
+    /// `live: true` means something weaker for a `None` module, and a renderer
+    /// that prints it as a bare boolean for one is claiming more than the daemon
+    /// knows.
     pub live: bool,
+    /// The module's declared wire protocol. Absent on daemons predating the
+    /// field, where every module was a subc module, so the default is exactly
+    /// what those daemons meant.
+    #[serde(default)]
+    pub protocol: ModuleProtocol,
     pub health: SupervisorHealthStatus,
     /// When the daemon last collected this module's health, as unix
     /// milliseconds. Absent means NEVER PROBED (a module inside its first probe

@@ -114,6 +114,45 @@ const FAKE_AFT_ORPHAN_WRITER_LINE_ENV: &str = "FAKE_AFT_ORPHAN_WRITER_LINE";
 /// Distinguishes "I am the orphan, sleep then write" from "spawn an orphan"
 /// on the same binary.
 const FAKE_AFT_ORPHAN_WRITER_MODE_ENV: &str = "FAKE_AFT_ORPHAN_WRITER_MODE";
+/// Presence makes the stub NEVER dial subc: no connect, no HELLO, no
+/// registration, ever. It then stays alive until something stops it.
+///
+/// This is the shape of a third-party server supervised under
+/// `protocol: "none"` -- a `nats-server` is the first real one -- and a
+/// supervision test needs a child that is genuinely alive and genuinely
+/// unregistered at the same moment. A `sleep` binary would be both, but it
+/// cannot be asked what it did with a signal, and what it does with a signal is
+/// the other half of what these tests need to observe.
+const FAKE_AFT_NEVER_CONNECT_ENV: &str = "FAKE_AFT_NEVER_CONNECT";
+/// Where to write a marker file when SIGTERM arrives, just before exiting 0.
+///
+/// The marker is the witness that the supervisor ASKED before it forced: the
+/// file cannot exist unless the signal was delivered and this process handled
+/// it, and the accompanying exit 0 is what distinguishes a cooperative stop from
+/// the SIGKILL the drain falls back to.
+///
+/// Unix only, like the mode it configures: Windows has no SIGTERM to hand a
+/// process, so the supervisor does not send one and there is nothing to witness.
+#[cfg(unix)]
+const FAKE_AFT_SIGTERM_MARKER_PATH_ENV: &str = "FAKE_AFT_SIGTERM_MARKER_PATH";
+/// Presence installs a SIGTERM handler that does nothing, so the signal is
+/// delivered and deliberately not acted on.
+///
+/// This is the control for the marker mode above. Without it, a test that sees a
+/// clean exit cannot tell the child's cooperation from the default disposition
+/// of an unhandled SIGTERM, and a teardown that never sent a signal at all would
+/// be indistinguishable from one that did. Unix only, for the same reason.
+#[cfg(unix)]
+const FAKE_AFT_IGNORE_SIGTERM_ENV: &str = "FAKE_AFT_IGNORE_SIGTERM";
+/// Where to write a file once this process is parked AND any configured SIGTERM
+/// handler is installed.
+///
+/// A never-connecting process has no registration for a test to wait on, so
+/// without this a test would have to guess when the child is ready. The guess
+/// matters: a SIGTERM that arrives before the handler is installed gets the
+/// signal's DEFAULT disposition, and a cooperative-stop assertion would then
+/// fail for a reason that has nothing to do with the supervisor.
+const FAKE_AFT_NEVER_CONNECT_READY_PATH_ENV: &str = "FAKE_AFT_NEVER_CONNECT_READY_PATH";
 /// Id used when `FAKE_AFT_MODULE_ID` is absent.
 ///
 /// TESTS THAT ASSERT A MODULE APPEARS IN THE CATALOG MUST CONFIGURE AN ID THAT
@@ -170,9 +209,68 @@ async fn main() -> Result<(), StubError> {
         run_exit_only(exit_code).await?;
         unreachable!("run_exit_only always exits the process");
     }
+    // Checked before `StubConfig::from_env()` for the same reason as the arms
+    // above: a process that never dials subc has no business requiring the
+    // `--subc` argument that only a subc-speaking child needs.
+    if env_flag(FAKE_AFT_NEVER_CONNECT_ENV) {
+        return run_never_connect().await;
+    }
 
     let config = StubConfig::from_env()?;
     run(config).await
+}
+
+/// Stay alive without ever touching subc, and respond to SIGTERM the way this
+/// run was configured to.
+///
+/// Three configured dispositions, each an observation a supervision test needs:
+///
+/// * a marker path -> write the file, exit 0. "I was asked and I complied."
+/// * ignore -> a handler that does nothing, so the signal lands and changes
+///   nothing. Forces the supervisor to spend its full budget and then kill.
+/// * neither -> no handler at all, so SIGTERM keeps its default disposition and
+///   the process dies of signal 15.
+async fn run_never_connect() -> Result<(), StubError> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let marker = env::var(FAKE_AFT_SIGTERM_MARKER_PATH_ENV).ok();
+        let ignore = env_flag(FAKE_AFT_IGNORE_SIGTERM_ENV);
+        if marker.is_some() || ignore {
+            // Registering a handler at all REPLACES SIGTERM's default
+            // disposition for this process, which is what makes the ignore mode
+            // genuinely unkillable by SIGTERM rather than merely slow.
+            let mut terminate = signal(SignalKind::terminate()).map_err(StubError::Io)?;
+            // Announced only now: the handler above must already be installed,
+            // or a test that waits for this file and then signals would still
+            // race the default disposition.
+            announce_never_connect_ready()?;
+            loop {
+                terminate.recv().await;
+                if let Some(path) = marker.as_deref() {
+                    fs::write(path, b"sigterm\n").map_err(StubError::Io)?;
+                    std::process::exit(0);
+                }
+            }
+        }
+    }
+
+    announce_never_connect_ready()?;
+
+    // Park. The supervisor's teardown -- signal, or the kill behind it -- is what
+    // ends this process; nothing here decides to stop on its own, because a test
+    // that waits for a self-terminating child is measuring the child's timer
+    // rather than the supervisor's teardown.
+    std::future::pending::<()>().await;
+    unreachable!("a pending future never resolves");
+}
+
+fn announce_never_connect_ready() -> Result<(), StubError> {
+    let Ok(path) = env::var(FAKE_AFT_NEVER_CONNECT_READY_PATH_ENV) else {
+        return Ok(());
+    };
+    fs::write(path, b"ready\n").map_err(StubError::Io)
 }
 
 fn fixture_from_sidecar() -> Result<Option<FixtureSpec>, StubError> {

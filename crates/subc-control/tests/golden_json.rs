@@ -4,11 +4,12 @@ use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use subc_control::{
     CatalogEntry, ClientControlPush, ClientControlRequest, ClientControlResponse, ConsumerIdentity,
-    DaemonBuildProvenance, DaemonObservedProcess, ModuleDeclaredProvenance, PollKind,
-    RouteCloseReason, RunningImageAgreement, RunningImageEvidence, StderrCaptureState, StderrTail,
-    StderrTailEntry, SupervisorDaemonProvenance, SupervisorEntry, SupervisorHealthEntry,
-    SupervisorHealthStatus, SupervisorModuleProvenance, SupervisorObservedProcess,
-    SupervisorRescanResult, SupervisorRoute, SupervisorRouteConsumer, SupervisorRouteModule,
+    DaemonBuildProvenance, DaemonObservedProcess, ModuleDeclaredProvenance, ModuleProtocol,
+    PollKind, RouteCloseReason, RunningImageAgreement, RunningImageEvidence, StderrCaptureState,
+    StderrTail, StderrTailEntry, SupervisorDaemonProvenance, SupervisorEntry,
+    SupervisorHealthEntry, SupervisorHealthStatus, SupervisorModuleProvenance,
+    SupervisorObservedProcess, SupervisorRescanResult, SupervisorRoute, SupervisorRouteConsumer,
+    SupervisorRouteModule,
 };
 use subc_protocol::{
     manifest::{
@@ -802,6 +803,7 @@ fn supervisor_entry() -> SupervisorEntry {
         state: "running".to_string(),
         enabled: true,
         live: true,
+        protocol: ModuleProtocol::Subc,
         health: SupervisorHealthStatus::Degraded,
         last_probe_ms: Some(1_700_000_000_000),
         last_exit_code: None,
@@ -895,6 +897,46 @@ fn supervisor_entry_policy_fields_round_trip_and_old_wire_stays_unknown() {
     assert_eq!(decoded.drain_timeout_ms, None);
     assert_eq!(decoded.restart_backoff_ms, None);
     assert_eq!(decoded.restart_max_backoff_ms, None);
+}
+
+/// A payload with no `protocol` key comes from a daemon that had only one kind
+/// of module, and `subc` is exactly what it meant. The default is what keeps
+/// every already-deployed reader and every already-written payload valid; without
+/// it, the first daemon to grow this field would make every older `supervisor.list`
+/// response undecodable.
+#[test]
+fn supervisor_entry_without_a_protocol_key_decodes_as_a_subc_module() {
+    let without_protocol = r#"{
+        "module_id":"aft-tools",
+        "state":"running",
+        "enabled":true,
+        "live":true,
+        "health":"degraded"
+    }"#;
+
+    let decoded: SupervisorEntry =
+        serde_json::from_str(without_protocol).expect("a payload with no protocol key decodes");
+
+    assert_eq!(decoded.protocol, ModuleProtocol::Subc);
+}
+
+/// The two protocols must be distinguishable ON THE WIRE, not just in Rust: a
+/// reader deciding whether `live: true` means "serving requests" or only "the
+/// process is up" has nothing else to read.
+#[test]
+fn supervisor_entry_carries_the_declared_protocol_verbatim() {
+    let subc = serde_json::to_value(supervisor_entry()).expect("entry serializes");
+    assert_eq!(subc["protocol"], "subc");
+
+    let none_entry = SupervisorEntry {
+        protocol: ModuleProtocol::None,
+        ..supervisor_entry()
+    };
+    let encoded = serde_json::to_value(&none_entry).expect("entry serializes");
+    assert_eq!(encoded["protocol"], "none");
+
+    let decoded: SupervisorEntry = serde_json::from_value(encoded).expect("round trip decodes");
+    assert_eq!(decoded.protocol, ModuleProtocol::None);
 }
 
 /// A daemon that predates the windowed budget must stay decodable, and its

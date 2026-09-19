@@ -1248,7 +1248,7 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1257,7 +1257,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.18.21"
+version = "0.19.0"
 dependencies = [
  "base64",
  "cortexkit-log",
@@ -1283,7 +1283,7 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.18.19"
+version = "0.19.0"
 dependencies = [
  "cortexkit-log",
  "cortexkit-paths",
@@ -1291,6 +1291,7 @@ dependencies = [
  "getrandom 0.2.17",
  "loom",
  "rlimit",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
@@ -1339,7 +1340,7 @@ dependencies = [
 
 [[package]]
 name = "subc-protocol"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "serde",
  "serde_json",

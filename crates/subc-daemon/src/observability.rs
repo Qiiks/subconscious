@@ -23,6 +23,7 @@ const ROUTE_OPEN_REFUSAL_COUNTER_CODES: &[&str] = &[
     "module_warming",
     "target_unavailable",
     "module_removed",
+    "module_no_protocol",
     "unknown_module",
     "module_reloading",
     "op_not_allowed",

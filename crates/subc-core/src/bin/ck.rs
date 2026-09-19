@@ -5133,7 +5133,7 @@ fn print_module_table(modules: &[Value], verbose: bool) {
                     display_field(module, "module_id"),
                     display_field(module, "state"),
                     enabled_word(module.get("enabled").and_then(Value::as_bool)),
-                    running_word(module.get("live").and_then(Value::as_bool)),
+                    live_word(module),
                     human_health_status(&display_field(module, "health")),
                 ]
             })
@@ -5314,6 +5314,11 @@ fn print_status_table(
         format_restart_budget(module),
         format_effective_policy(module)
     );
+    // Only for a module that declares one, so every subc module's status renders
+    // exactly as it did before this field existed.
+    if declares_no_protocol(module) {
+        println!("  protocol: none");
+    }
     println!("  last exit: {}", format_last_exit(module));
     println!(
         "  {}",
@@ -5353,7 +5358,7 @@ fn print_status_table(
         println!(
             "  supervision: {} · {} · {failures} consecutive failures · last action {last_action} · {drops} frame drops",
             enabled_word(module.get("enabled").and_then(Value::as_bool)),
-            running_word(module.get("live").and_then(Value::as_bool)),
+            live_word(module),
         );
         if health_status == "ok" {
             if let Some(detail) = health.and_then(health_operator_detail) {
@@ -5419,6 +5424,29 @@ fn running_word(value: Option<bool>) -> String {
         Some(false) => "stopped".to_string(),
         None => "-".to_string(),
     }
+}
+
+/// Whether this module declares that it speaks no subc wire.
+///
+/// A daemon that predates the field sends no `protocol` key, and every module on
+/// such a daemon is a subc module, so an absent key reads the same as `"subc"`.
+fn declares_no_protocol(module: &Value) -> bool {
+    module.get("protocol").and_then(Value::as_str) == Some("none")
+}
+
+/// How `live` reads for an operator.
+///
+/// `live` stays a boolean on the wire, but the two protocols do not answer the
+/// same question with it. For a subc module it means the daemon has a registered
+/// module it can route a request to. For a module that speaks no subc wire there
+/// is nothing to register, so the daemon can only say that the process it
+/// launched is alive -- and printing that as the same word would claim the
+/// weaker fact was checked the stronger way.
+fn live_word(module: &Value) -> String {
+    if declares_no_protocol(module) {
+        return "n/a (no protocol)".to_string();
+    }
+    running_word(module.get("live").and_then(Value::as_bool))
 }
 
 fn human_health_status(status: &str) -> String {

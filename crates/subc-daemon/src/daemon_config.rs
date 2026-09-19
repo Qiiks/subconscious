@@ -10,6 +10,7 @@ use std::{
 
 use cortexkit_log::Retention;
 use serde::Deserialize;
+use subc_control::ModuleProtocol;
 use subc_jsonc::jsonc_to_json;
 use subc_protocol::manifest::is_valid_capability_identifier;
 
@@ -241,6 +242,9 @@ pub struct ConfiguredModule {
     /// module id under one of these prefixes must echo this owner module's current
     /// spawn nonce.
     pub reserved_prefixes: Vec<String>,
+    /// Which wire protocol this module speaks, as declared. Absent in config
+    /// means `Subc`, which is what every module written before this key meant.
+    pub protocol: ModuleProtocol,
     pub health: HealthConfig,
     /// Effective drain budget (ms) for this module's teardown, already resolved
     /// against the daemon-wide default at parse time. `None` = built-in default.
@@ -305,6 +309,7 @@ impl ConfiguredModule {
             env,
             reserved: self.reserved,
             reserved_prefixes: self.reserved_prefixes.clone(),
+            protocol: self.protocol,
         }
     }
 }
@@ -382,6 +387,11 @@ struct RawModuleConfig {
     reserved: bool,
     #[serde(default)]
     reserved_prefixes: Vec<String>,
+    /// Read as a raw string rather than a serde enum so an unusable value is
+    /// refused as an `InvalidValue` naming the module and the value the operator
+    /// typed, instead of a serde variant error that names neither.
+    #[serde(default)]
+    protocol: Option<String>,
     #[serde(default)]
     health: Option<RawHealthConfig>,
     #[serde(default)]
@@ -626,6 +636,24 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
                 Some(value) => Some(value),
                 None => default_route_bind_relay_timeout_ms,
             };
+            let protocol = parse_module_protocol(module.protocol.as_deref(), path, &module_id)?;
+            // A reserved module is one only the daemon-spawned process may
+            // REGISTER as, enforced by matching a launch nonce in its HELLO. A
+            // module that speaks no subc wire sends no HELLO, so the gate has
+            // nothing to check and the pairing states an intent the daemon
+            // cannot carry out. Refusing at parse is better than accepting a
+            // security-looking declaration that protects nothing.
+            if protocol == ModuleProtocol::None && module.reserved {
+                return Err(DaemonConfigError::InvalidValue {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "module '{module_id}' sets reserved: true with protocol: \"none\"; \
+                         reserved is enforced on the module's HELLO and a protocol: \"none\" \
+                         module never registers, so the reservation could never be checked",
+                        module_id = module_id.escape_debug()
+                    ),
+                });
+            }
             let restart = parse_restart_config(module.restart, path, &module_id)?;
             let log = module
                 .log
@@ -641,6 +669,7 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
                 enabled: module.enabled,
                 reserved: module.reserved,
                 reserved_prefixes: module.reserved_prefixes,
+                protocol,
                 health,
                 // Per-module wins; the daemon-wide value is the fallback. `0` is
                 // legitimate ("never wait"), so this is `.or`, not `filter+or`.
@@ -785,6 +814,36 @@ fn parse_logging_config(
         retention,
         alarm_segment_mb,
     })
+}
+
+/// Resolve a module's declared `protocol` key.
+///
+/// Absent and `"subc"` are the SAME answer on purpose: a config written before
+/// this key existed meant "a subc module", so there is no third state for
+/// "unspecified" to drift into. Anything else is refused with the value quoted,
+/// because the alternative -- falling back to `subc` for a typo like `"non"` --
+/// silently restores the exact supervision behaviour the operator was trying to
+/// turn off.
+fn parse_module_protocol(
+    raw: Option<&str>,
+    path: &Path,
+    module_id: &str,
+) -> Result<ModuleProtocol, DaemonConfigError> {
+    match raw {
+        None | Some("subc") => Ok(ModuleProtocol::Subc),
+        Some("none") => Ok(ModuleProtocol::None),
+        // `{other:?}` quotes and escapes the operator's own bytes, so a value
+        // carrying control characters cannot rewrite the terminal of whoever
+        // reads the refusal.
+        Some(other) => Err(DaemonConfigError::InvalidValue {
+            path: path.to_path_buf(),
+            message: format!(
+                "module '{module_id}' declares protocol {other:?}; supported values are \
+                 \"subc\" (the default when the key is absent) and \"none\"",
+                module_id = module_id.escape_debug(),
+            ),
+        }),
+    }
 }
 
 fn validate_reserved_capabilities(
@@ -1911,6 +1970,107 @@ mod tests {
         )
         .expect_err("reserved capabilities use the capability identifier grammar");
         assert!(error.to_string().contains("reserved_capabilities key"));
+    }
+
+    /// The three accepted shapes, and the one that matters is that two of them
+    /// are THE SAME ANSWER. A config written before this key existed and a
+    /// config that spells out `"subc"` must produce an identical module, or the
+    /// key would have quietly introduced a third state for every module in every
+    /// deployed config file.
+    #[test]
+    fn an_absent_protocol_key_and_an_explicit_subc_are_the_same_module() {
+        let parse = |module_body: &str| {
+            parse_doc(
+                &format!(
+                    r#"{{
+                      "version": 1,
+                      "modules": {{ "aft": {{ "program": "aft"{module_body} }} }}
+                    }}"#
+                ),
+                Path::new("subc.jsonc"),
+            )
+            .expect("module parses")
+            .modules
+            .remove(0)
+        };
+
+        let absent = parse("");
+        let explicit = parse(r#", "protocol": "subc""#);
+        let none = parse(r#", "protocol": "none""#);
+
+        assert_eq!(absent.protocol, ModuleProtocol::Subc);
+        assert_eq!(explicit.protocol, ModuleProtocol::Subc);
+        assert_eq!(
+            absent, explicit,
+            "an absent protocol key must produce exactly the module an explicit subc does"
+        );
+        assert_eq!(none.protocol, ModuleProtocol::None);
+        // The declaration has to survive into what the supervisor is handed;
+        // parsing it into a field nothing reads would leave every behaviour
+        // gated on it unreachable.
+        assert_eq!(none.module_spec().protocol, ModuleProtocol::None);
+    }
+
+    /// An unusable value is refused WITH THE VALUE IN THE MESSAGE. Falling back
+    /// to `subc` on a typo would restore the exact supervision the operator was
+    /// trying to turn off -- health probing, restart-on-silence, SIGKILL
+    /// teardown -- and the config file would still read as if it had been
+    /// applied.
+    #[test]
+    fn an_unsupported_protocol_value_is_refused_by_name() {
+        let error = parse_doc(
+            r#"{
+              "version": 1,
+              "modules": { "nats": { "program": "nats-server", "protocol": "grpc" } }
+            }"#,
+            Path::new("subc.jsonc"),
+        )
+        .expect_err("an unknown protocol must not fall back to a default");
+
+        assert!(
+            matches!(error, DaemonConfigError::InvalidValue { .. }),
+            "expected InvalidValue, got {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("grpc"),
+            "the refusal must name the offending value: {message}"
+        );
+        assert!(
+            message.contains("nats"),
+            "the refusal must name the module so it can be found in the file: {message}"
+        );
+    }
+
+    /// `reserved` is enforced on a module's HELLO. A module that speaks no subc
+    /// wire never sends one, so the pair declares a protection that could never
+    /// be applied -- worse than no protection, because the config file states it.
+    #[test]
+    fn reserved_true_with_protocol_none_is_refused_with_the_reason() {
+        let error = parse_doc(
+            r#"{
+              "version": 1,
+              "modules": {
+                "nats": { "program": "nats-server", "protocol": "none", "reserved": true }
+              }
+            }"#,
+            Path::new("subc.jsonc"),
+        )
+        .expect_err("a reservation that can never be checked must not parse");
+
+        assert!(
+            matches!(error, DaemonConfigError::InvalidValue { .. }),
+            "expected InvalidValue, got {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("nats") && message.contains("reserved"),
+            "the refusal must name the module and the offending key: {message}"
+        );
+        assert!(
+            message.contains("HELLO") || message.contains("never registers"),
+            "the refusal must say WHY the pair cannot work: {message}"
+        );
     }
 
     #[test]

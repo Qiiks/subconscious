@@ -1,6 +1,6 @@
 [package]
 name = "subc-daemon"
-version = "0.18.19"
+version = "0.19.0"
 edition = "2021"
 publish = true
 description = "Embeddable subc daemon: bootstrap, module supervision, and opaque-byte splice routing."
@@ -21,7 +21,7 @@ rlimit = "0.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-subc-control = { path = "../subc-control", version = "0.13.1" }
+subc-control = { path = "../subc-control", version = "0.14.0" }
 subc-jsonc = { path = "../subc-jsonc", version = "0.1.0" }
 subc-protocol = { path = "../subc-protocol", version = "0.21.0" }
 subc-transport = { path = "../subc-transport", version = "0.7.0" }
@@ -30,6 +30,12 @@ tracing = "0.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 subc-cgroup = { path = "../subc-cgroup" }
+
+[target.'cfg(unix)'.dependencies]
+# SIGTERM for `protocol: "none"` teardown. This crate forbids unsafe code, so
+# `libc::kill` is not reachable from here; rustix wraps the same syscall safely
+# and is already in the tree via subc-transport.
+rustix = { version = "1", default-features = false, features = ["process"] }
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

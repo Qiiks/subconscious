@@ -7,6 +7,7 @@
   "live": true,
   "max_restarts": 3,
   "module_id": "aft-tools",
+  "protocol": "subc",
   "restart_backoff_ms": 257,
   "restart_count": 2,
   "restart_max_backoff_ms": 9876,

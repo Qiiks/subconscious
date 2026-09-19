@@ -10,10 +10,10 @@ use serde::{Deserialize, Serialize};
 use subc_control::{
     ops, CapabilityRequirementStatus, CatalogEntry, ClientControlPush, ClientControlRequest,
     ClientControlResponse, ConsumerIdentity, DaemonBuildProvenance, DaemonObservedProcess,
-    ModuleDeclaredProvenance, PollKind, RouteCloseReason, StderrCaptureState, StderrTail,
-    StderrTailEntry, SupervisorDaemonProvenance, SupervisorEntry, SupervisorHealthEntry,
-    SupervisorModuleProvenance, SupervisorObservedProcess, SupervisorRescanResult, SupervisorRoute,
-    SupervisorRouteConsumer, SupervisorRouteModule,
+    ModuleDeclaredProvenance, ModuleProtocol, PollKind, RouteCloseReason, StderrCaptureState,
+    StderrTail, StderrTailEntry, SupervisorDaemonProvenance, SupervisorEntry,
+    SupervisorHealthEntry, SupervisorModuleProvenance, SupervisorObservedProcess,
+    SupervisorRescanResult, SupervisorRoute, SupervisorRouteConsumer, SupervisorRouteModule,
 };
 use subc_protocol::{
     error_codes,
@@ -1691,6 +1691,24 @@ impl ControlHandler {
             if let Some((status, warming)) =
                 self.supervisor_status(&target_module_id, frame.header.corr)?
             {
+                // BEFORE the two availability codes below, because for a module
+                // that speaks no subc wire both of them are false comfort: they
+                // say "not right now" and are retried, and this module will
+                // never register no matter how long the caller waits. The
+                // absence here is the declaration being honoured, not a module
+                // that is late.
+                if status.protocol == ModuleProtocol::None {
+                    return Ok(vec![self.route_open_refusal_frame(
+                        ctx,
+                        &frame,
+                        &target_module_id,
+                        error_codes::MODULE_NO_PROTOCOL,
+                        format!(
+                            "module_id '{target_module_id}' is declared protocol: none; \
+                             it speaks no subc wire and serves no routes"
+                        ),
+                    )?]);
+                }
                 let code = if warming {
                     "module_warming"
                 } else {
@@ -2116,6 +2134,7 @@ impl ControlHandler {
                     state: status.state.to_string(),
                     enabled: status.enabled,
                     live: status.live,
+                    protocol: status.protocol,
                     health: status.health.status,
                     last_probe_ms: status.health.last_probe_ms,
                     last_exit_code: status.last_exit.as_ref().and_then(|e| e.code),
@@ -4795,6 +4814,7 @@ mod tests {
                 ],
                 reserved: false,
                 reserved_prefixes: Vec::new(),
+                protocol: ModuleProtocol::Subc,
             })
             .unwrap();
 
@@ -4883,6 +4903,7 @@ mod tests {
                 env: vec![("FAKE_AFT_EXIT_CODE".to_string(), "23".to_string())],
                 reserved: false,
                 reserved_prefixes: Vec::new(),
+                protocol: ModuleProtocol::Subc,
             })
             .unwrap();
 
@@ -6739,6 +6760,7 @@ mod tests {
                     env: Vec::new(),
                     reserved: false,
                     reserved_prefixes: Vec::new(),
+                    protocol: ModuleProtocol::Subc,
                 },
                 true,
             )
@@ -6785,6 +6807,7 @@ mod tests {
                     env: Vec::new(),
                     reserved: false,
                     reserved_prefixes: Vec::new(),
+                    protocol: ModuleProtocol::Subc,
                 },
                 true,
             )
@@ -6954,6 +6977,7 @@ mod tests {
                     env: Vec::new(),
                     reserved: false,
                     reserved_prefixes: Vec::new(),
+                    protocol: ModuleProtocol::Subc,
                 },
                 true,
             )
@@ -7053,6 +7077,7 @@ mod tests {
                     env: Vec::new(),
                     reserved: false,
                     reserved_prefixes: Vec::new(),
+                    protocol: ModuleProtocol::Subc,
                 },
                 false,
             )
