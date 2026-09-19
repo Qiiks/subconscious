@@ -17,6 +17,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   buildCommentBody,
+  CHECK_NAME,
   COMMENT_MARKER,
   decide,
   draftNote,
@@ -419,6 +420,85 @@ describe("runPullRequestGate", () => {
     assert.equal(result.draftConverted, false);
     assert.equal(state.comments.length, 0);
     assert.equal(state.convertedToDraft.length, 0);
+  });
+
+  // Branch protection requires the check named CHECK_NAME, and
+  // `runPullRequestGate` — the path a `pull_request_target` event takes — is
+  // what publishes it on an ordinary pull request. Both outcomes are pinned:
+  // a publish that hard-coded `success` would still satisfy a test that only
+  // exercised a passing pull request, and would wave every blocked one
+  // through.
+  test("publishes the required check run as a failure when the gate blocks", async () => {
+    const pr = pullRequest({ body: "No issue here" });
+    const { api, state } = createFixtureApi({ pullRequests: [pr] });
+
+    const result = await runPullRequestGate({
+      api,
+      repoFullName: REPO,
+      pullRequest: pr,
+      log: silentLog,
+    });
+
+    assert.equal(result.conclusion, "failure");
+    assert.equal(state.checkRuns.length, 1);
+    assert.equal(state.checkRuns[0].conclusion, "failure");
+    assert.equal(state.checkRuns[0].headSha, pr.headSha);
+    assert.equal(state.checkRuns[0].summary, GATE_MESSAGE);
+  });
+
+  test("publishes the required check run as a success when the gate passes", async () => {
+    const pr = pullRequest({ body: "Closes #42" });
+    const { api, state } = createFixtureApi({
+      issues: [{ number: 42, state: "open", labels: ["design-approved"] }],
+      pullRequests: [pr],
+    });
+
+    const result = await runPullRequestGate({
+      api,
+      repoFullName: REPO,
+      pullRequest: pr,
+      log: silentLog,
+    });
+
+    assert.equal(result.conclusion, "success");
+    assert.equal(state.checkRuns.length, 1);
+    assert.equal(state.checkRuns[0].conclusion, "success");
+    assert.equal(state.checkRuns[0].headSha, pr.headSha);
+  });
+
+  // The name is the contract with branch protection, and it has to come from
+  // the script rather than from whatever a calling repository named its job.
+  // The fixture never sees the name — the real client supplies it — so pin it
+  // where it is actually set, and pin that it is set from CHECK_NAME rather
+  // than from a second copy of the string that could drift away from it.
+  test("the published check run is named from CHECK_NAME, in one place", () => {
+    assert.equal(CHECK_NAME, "design-gate");
+
+    const source = readFileSync(
+      new URL("../.github/actions/design-gate/design-gate.mjs", import.meta.url),
+      "utf8",
+    );
+    const checkRunPosts = source.match(/check-runs`,\s*\{\s*\n\s*name:\s*([^,\n]+)/g) ?? [];
+    assert.equal(checkRunPosts.length, 1, "expected exactly one check-runs POST");
+    assert.ok(
+      checkRunPosts[0].includes("name: CHECK_NAME"),
+      `the check-runs POST must take its name from CHECK_NAME (found: ${checkRunPosts[0]})`,
+    );
+  });
+
+  test("the pull-request job is allowed to publish the check run", () => {
+    const workflowYaml = readFileSync(
+      new URL("../.github/workflows/design-gate.yml", import.meta.url),
+      "utf8",
+    );
+    const prJob = workflowYaml.match(
+      /\n  design-gate:\s*\n([\s\S]*?)(?=\n\s{2}[a-zA-Z0-9_-]+:\s*\n|$)/,
+    );
+    assert.ok(prJob, "design-gate job must be present in workflow");
+    assert.ok(
+      /checks:\s*write/.test(prJob[1]),
+      "the pull-request job needs checks: write, or the required check is never published",
+    );
   });
 
   test("passing gate leaves a clean PR without a comment", async () => {

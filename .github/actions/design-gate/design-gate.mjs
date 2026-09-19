@@ -248,12 +248,22 @@ async function syncComment({ api, pullRequest, decision, draftConverted = false 
 
 /**
  * Run the gate for one pull request event: decide, push a newly-ready PR back
- * to draft when it fails, and keep the single gate comment in sync.
+ * to draft when it fails, publish the gate's check run, and keep the single
+ * gate comment in sync.
  *
  * Draft conversion and commenting are best-effort — a fork pull request runs
  * with a read-only token and both will be refused. The returned conclusion
  * never depends on them: a side step that fails must not turn a failing gate
  * green.
+ *
+ * Publishing the check run is NOT best-effort, because it is the gate's
+ * output rather than a side effect of it. Branch protection requires the
+ * check named `CHECK_NAME`, and that name belongs to this script: the job
+ * status a workflow reports is named after whatever the calling repository
+ * happened to call its job, so making that the required name would put a
+ * caller's job id into the branch-protection contract. A sha that never
+ * receives this check run is blocked with nothing in the run list to explain
+ * it, so a refused publish has to be loud.
  */
 export async function runPullRequestGate({
   api,
@@ -273,6 +283,17 @@ export async function runPullRequestGate({
       log.warn?.(`design-gate: could not convert #${pullRequest.number} to draft: ${error}`);
     }
   }
+
+  // The check run reports the same pass-or-block decision the contributor
+  // reads in the gate comment on the pull request. A check run that concluded
+  // differently from the comment would tell the contributor the gate passed
+  // while the comment told them it blocked, which is worse than no check run.
+  await api.createCheckRun({
+    headSha: pullRequest.headSha,
+    conclusion: decision.conclusion,
+    title: decision.title,
+    summary: decision.message,
+  });
 
   let comment = { action: "none" };
   try {

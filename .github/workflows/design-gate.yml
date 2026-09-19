@@ -55,10 +55,12 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
 
 jobs:
-  # This job id is half of the check name. A job called from a reusable
-  # workflow reports as `<caller job id> / <this job id>`, so with the caller
-  # file in docs/contribution-gate.md the check is `design-gate / design-gate`.
-  # Renaming either half renames the required check.
+  # This job's own status reports as `<caller job id> / <this job id>`, because
+  # that is how GitHub names a job called from a reusable workflow. That name
+  # is informational and must NOT be the required status check: half of it
+  # belongs to the calling repository, so renaming a caller's job would break
+  # its own branch protection. The required check is `design-gate`, published
+  # on the PR head by the gate script itself, which owns the name outright.
   design-gate:
     # The event arm is decided here rather than in the caller so that a caller
     # cannot skip the gate by leaving an `if:` out.
@@ -69,6 +71,7 @@ jobs:
       contents: read # fetch the gate action
       issues: read # read the linked issue's labels
       pull-requests: write # post the gate comment, convert back to draft
+      checks: write # publish the design-gate check run on the PR head
     steps:
       # Mint an app token so commenting and draft conversion work on fork PRs.
       # The default GITHUB_TOKEN on fork pull_request runs was read-only;
