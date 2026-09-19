@@ -336,6 +336,31 @@ pub struct SelfSignalDeclaration {
     pub name: String,
     /// Signal classification. `Busy` participates in drain quiescence; the
     /// remaining kinds are descriptive for operators and analysts.
+    ///
+    /// # A `Busy` GAUGE COUNTS WORK THE DRAIN CAN AFFECT, AND NOTHING ELSE
+    ///
+    /// The daemon waits for every declared `Busy` gauge to reach zero before
+    /// tearing a module down, up to the drain ceiling. That wait is only worth
+    /// anything for work whose RESULT WOULD BE DELIVERED if it finished during
+    /// the drain.
+    ///
+    /// The test: **if this request completed one millisecond before the
+    /// teardown, would anyone receive its answer?** If no, it does not belong
+    /// in a `Busy` gauge, and counting it makes the daemon wait out its whole
+    /// ceiling for something that cannot usefully complete.
+    ///
+    /// The case that names the rule (CEREB, 2026-09-19): cerebellum's
+    /// management requests can park for up to 300 s awaiting a HUMAN's consent
+    /// decision. Those were counted as in-flight, so a drain begun while a
+    /// prompt was open waited on a person until the 30 s ceiling expired --
+    /// and the pending answer dies with the process either way, so the wait
+    /// bought nothing. The fix splits the accounting: `executing` counts toward
+    /// `Busy`, `awaiting_consent` is reported as its own informational gauge.
+    ///
+    /// The same shape exists anywhere a request blocks on an external party the
+    /// restart invalidates -- a human, a peer seat, a vendor call whose reply
+    /// has nowhere to land. Those are legitimately IN FLIGHT and are not
+    /// legitimately `Busy`.
     pub kind: SelfSignalKind,
     /// Whether the signal only observes the surface or changes it.
     pub effect: SelfSignalEffect,
