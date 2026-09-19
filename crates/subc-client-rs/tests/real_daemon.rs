@@ -1660,11 +1660,32 @@ fn spawn_daemon_child(daemon_bin: &Path, runtime_dir: &Path, config_dir: &Path) 
     // multi-threaded process and these tests are threaded; run the suite with
     // `env -u SUBC_MODULE_ID -u SUBC_LAUNCH_NONCE` instead, which is what CI does
     // by virtue of not running under the supervisor.
+    // XDG_DATA_HOME IS LOAD-BEARING AND WAS MISSING, and runtime+config are not a
+    // substitute for it. The supervisor's child stdout/stderr capture directory is
+    // `daemon_run_dir()/logs`, and `daemon_run_dir()` derives from the DATA home
+    // (daemon_config.rs: `default_data_home().join("cortexkit").join("run")`) --
+    // not from XDG_RUNTIME_DIR, which is what this test was setting.
+    //
+    // So every run of this suite supervised modules named `subc-client-rs-echo`
+    // and `subc-client-rs-catalog-fake-aft` and created capture files for them in
+    // the OPERATOR'S REAL `~/.local/share/cortexkit/run/logs/`. Reported by
+    // iceteaSA on #106 from a directory listing; reproduced here by deleting the
+    // file, running this suite, and watching it reappear.
+    //
+    // The residue is inert (the modules write nothing to stderr, so the files stay
+    // zero bytes) and the hazard is not: a fixture module id that COLLIDES with a
+    // real one would append test output into the file an operator reads for the
+    // live module, and the reading stays well-formed.
+    let data_dir = runtime_dir
+        .parent()
+        .expect("runtime dir is inside the test temp tree")
+        .join("data");
     Command::new(daemon_bin)
         .env_remove(subc_protocol::SUBC_MODULE_ID_ENV)
         .env_remove(subc_protocol::SUBC_LAUNCH_NONCE_ENV)
         .env("XDG_RUNTIME_DIR", runtime_dir)
         .env("XDG_CONFIG_HOME", config_dir)
+        .env("XDG_DATA_HOME", &data_dir)
         .env("SUBC_PORT", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
