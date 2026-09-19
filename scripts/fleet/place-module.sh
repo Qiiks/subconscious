@@ -15,6 +15,32 @@
 # a position-based view (`tail`) over a pattern-based one for verdicts, since a
 # verdict you failed to predict still occupies the last line.
 
+# THE INVARIANT THIS SCRIPT DEFENDS, STATED ONCE, EXECUTABLY NOWHERE YET:
+#
+#     THE THING BEING VERIFIED IS THE THING THAT WILL RUN.
+#
+# Every arm below is an INSTANCE of a way that sentence can be false: PATH
+# resolving to a different file than the one placed; a sidecar describing
+# another file; a rollback verified against itself; a marker counted in the
+# wrong table; a text file that is not an executable at all. Not one of the arms
+# says the sentence.
+#
+# BROCA's diagnostic (2026-09-19) is why that matters and it is uncomfortable:
+# A GUARD THAT CATCHES STRANGERS IS DEFENDING AN INVARIANT; A GUARD THAT KEEPS
+# CATCHING THE PERSON WHO WROTE IT IS COMPENSATING FOR ONE NOBODY HAS WRITTEN
+# DOWN. At least three of these arms have refused MY OWN cards. I had read that
+# as the gate working -- and it is, which is exactly what keeps the tell quiet:
+# a gate that never fires is obviously untested and gets examined, while a gate
+# that keeps catching its author reads as vigilance and gets praised.
+#
+# So this header is a statement of intent and a standing TODO, not a claim of
+# coverage. The arms are load-bearing and each one is here because it caught a
+# real defect; what is missing is a check of the sentence itself, which would
+# make the next novel falsification route fail by name instead of sailing past
+# five arms that were each written for a different one. If you add an arm here,
+# ask BROCA's question first: what else is the same shape and would NOT be
+# caught by the arm I am about to write?
+#
 # Place a staged module binary with every gate arm that has caught a real defect.
 #
 # Each arm exists because it failed once, and each failure was a TRUE statement about
