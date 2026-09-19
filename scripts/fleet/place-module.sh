@@ -46,7 +46,7 @@ set -euo pipefail
 
 STAGING="${CK_STAGING:-$HOME/.local/share/cortexkit/staging}"
 BIN_DIR="${CK_BIN_DIR:-$HOME/.local/share/cortexkit/bin}"
-MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; GONE=""; RESTART=1; PLACE=0; OLDER=0
+MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; GONE=""; RESTART=1; PLACE=0; OLDER=0; MIGRATES=""
 
 while (($# > 0)); do
   case "$1" in
@@ -59,6 +59,13 @@ while (($# > 0)); do
     --gone) GONE="$2"; shift 2 ;;
     --place) PLACE=1; shift ;;
     --older) OLDER=1; shift ;;
+    # A card that MIGRATES THE STORE cannot be rolled back by binary alone: the
+    # old binary meets a newer schema and refuses on store_ahead, which is the
+    # correct fail-closed behaviour and also means the binary snapshot restores
+    # nothing. Naming the store here snapshots it too, so the rollback is
+    # BINARY + STORE. Raised by FUSI before a v5->v6 placement, after this script
+    # had printed "rollback ... verified" on every migrating card it ever placed.
+    --migrates) MIGRATES="$2"; shift 2 ;;
     --check-only) shift ;;  # now the default; accepted so older call sites keep working
     --no-restart) RESTART=0; shift ;;
     *) echo "REFUSED: unknown argument '$1'" >&2; exit 2 ;;
@@ -132,9 +139,25 @@ if [ -f "$manifest" ]; then
     exit 2
   fi
 else
+  # `|| true` IS LOAD-BEARING AND WAS MISSING. Under `set -euo pipefail`, a grep
+  # that matches nothing exits 1, pipefail propagates it to the assignment, and
+  # set -e KILLS THE SCRIPT -- after the sidecar line and before any other arm.
+  # The operator sees one line of output and a script that stopped, which reads
+  # like a gate that finished rather than one that died.
+  #
+  # It fires whenever a staging directory holds no `ck-<module>.<hex>` artifact
+  # -- which is every FUSI card, because they name theirs plainly `ck-fusiform`
+  # inside a timestamped directory. A NAMING CONVENTION THIS GATE INVENTED,
+  # silently refusing every artifact that does not follow it.
+  #
+  # Found 2026-09-19 by running the gate on a card and getting two lines back,
+  # then `bash -x` rather than assuming the run was fine. My own check reported
+  # `exit=0` because I read `$?` through a pipe and got `tail`'s status -- the
+  # exit-code trap from the same evening, inside the verification of the tool
+  # that catches it.
   newest=$(ls -t "$staged_dir" 2>/dev/null \
     | grep -E "^(SIGNED\.)?ck-$MODULE\.[0-9a-f]+$" \
-    | head -1)
+    | head -1) || true
   if [ -n "$newest" ] && [ "$newest" != "$staged_base" ]; then
     if [ "$OLDER" -eq 1 ]; then
       say "currency: INFERRED from mtime (no ck-$MODULE.current); placing $staged_base although $newest is newer (--older given)"
@@ -272,6 +295,21 @@ rb_digest=$(shasum -a 256 "$rb" | awk '{print $1}')
   || refuse "rollback snapshot does not match the live binary it was copied from (live $live_digest, snapshot $rb_digest); nothing has been placed"
 (cd "$STAGING" && shasum -a 256 "$(basename "$rb")" > "$(basename "$rb").sha256")
 say "rollback $(basename "$rb") matches live (${live_digest%"${live_digest#????????}"}), holds: $("$rb" --version 2>&1 | head -1)"
+
+if [ -n "$MIGRATES" ]; then
+  [ -f "$MIGRATES" ] || refuse "--migrates named $MIGRATES, which is not a file; nothing has been placed"
+  store_rb="$STAGING/$(basename "$MIGRATES").rollback-$(date -u +%Y%m%dT%H%M%SZ)"
+  # sqlite3 .backup, NOT cp: the module holds the store open with a live -wal,
+  # and cp captures a torn .db beside a WAL it does not include -- a snapshot
+  # that restores to a state which never existed. .backup is the online backup
+  # API and is WAL-correct against a running writer.
+  sqlite3 "file:$MIGRATES?mode=ro" ".backup $store_rb" 2>/dev/null \
+    || refuse "store snapshot failed for $MIGRATES; nothing has been placed"
+  [ -s "$store_rb" ] || refuse "store snapshot $store_rb is empty; nothing has been placed"
+  (cd "$STAGING" && shasum -a 256 "$(basename "$store_rb")" > "$(basename "$store_rb").sha256")
+  say "store rollback $(basename "$store_rb") ($(stat -f %z "$store_rb" 2>/dev/null || stat -c %s "$store_rb") bytes)"
+  say "ROLLBACK IS BINARY + STORE: this card migrates, so restoring the binary alone would meet a newer schema and refuse"
+fi
 
 say "=== place"
 cp "$STAGED" "$DEST.tmp" && mv "$DEST.tmp" "$DEST"
