@@ -46,7 +46,18 @@ struct RunningDaemon {
 }
 
 impl RunningDaemon {
+    /// Like `start`, but deliberately WITHOUT the capture redirect, to exercise
+    /// the shape every sibling repo's harness has: a daemon booted through
+    /// `run_with_config` by a caller that never sets `capture_logs_dir`.
+    async fn start_without_capture_redirect(name: &str, config_doc: Option<String>) -> Self {
+        Self::start_inner(name, config_doc, false).await
+    }
+
     async fn start(name: &str, config_doc: Option<String>) -> Self {
+        Self::start_inner(name, config_doc, true).await
+    }
+
+    async fn start_inner(name: &str, config_doc: Option<String>, redirect: bool) -> Self {
         let temp_dir = unique_temp_dir(name);
         let connection_file_path = temp_dir.join("subc-conn.json");
         let config_path = temp_dir.join("config").join("cortexkit").join("subc.jsonc");
@@ -61,9 +72,13 @@ impl RunningDaemon {
         // live data home under fixture module ids.
         let config = BootstrapConfig::new(&connection_file_path, 0)
             .with_terminal_journal_path(temp_dir.join("run").join("terminals.jsonl"))
-            .with_capture_logs_dir(temp_dir.join("run").join("logs"))
             .with_daemon_config_path(&config_path)
             .unwrap();
+        let config = if redirect {
+            config.with_capture_logs_dir(temp_dir.join("run").join("logs"))
+        } else {
+            config
+        };
         let task = tokio::spawn(run_with_config(config));
         let mut client = wait_for_client(&connection_file_path, START_TIMEOUT).await;
         let _ =
@@ -1691,4 +1706,59 @@ where
 
 fn unique_temp_dir(name: &str) -> TestTempDir {
     TestTempDir::new(name)
+}
+
+/// An in-process daemon with NO `capture_logs_dir` must capture NOWHERE --
+/// not into the operator's real run directory.
+///
+/// THIS ARM PROTECTS TWELVE SIBLING REPOS RATHER THAN THIS ONE. Their
+/// integration tests boot a daemon through `run_with_config`; until 2026-09-19
+/// an absent capture dir fell back to `daemon_run_dir()/logs`, so every one of
+/// them wrote `<module_id>.stderr.log` into the operator's live
+/// `~/.local/share/cortexkit/run/logs/` -- none of them asked for it, and none
+/// could see it from their side.
+///
+/// Asserts on the FIXTURE tree, not on the real run directory: an assertion
+/// against the real path would pass on a machine where the file happens not to
+/// exist yet and fail for unrelated reasons on one where it does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unset_capture_dir_captures_nowhere() {
+    let module_id = "no-capture-probe";
+    let daemon = RunningDaemon::start_without_capture_redirect(
+        "daemon-config-no-capture",
+        Some(config_doc([stub_module(module_id, true, [])])),
+    )
+    .await;
+
+    wait_for_supervisor_entry(
+        &daemon.connection_file_path,
+        module_id,
+        |entry| entry.live,
+        STATE_TIMEOUT,
+    )
+    .await;
+
+    // ASSERT ON THE PATH THE DEFECT WOULD USE, which is the REAL run directory.
+    //
+    // My first version of this asserted the fixture tree was empty -- and was
+    // VACUOUS, because under the old fallback the file lands in the real run dir
+    // and the fixture tree is empty either way. It would have passed against the
+    // defect it exists to catch.
+    //
+    // Naming a real path is safe here ONLY because the module id is unique to
+    // this test: that file can exist only if this daemon wrote it, so the
+    // assertion is about this run rather than about the machine.
+    let leaked = subc_core::daemon_config::daemon_run_dir()
+        .join("logs")
+        .join(format!("{module_id}.stderr.log"));
+
+    // Give a capture that WOULD be written time to appear.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert!(
+        !leaked.exists(),
+        "an unset capture dir wrote into the OPERATOR'S REAL run directory at {}; \
+         absent means no capture, not the real directory",
+        leaked.display()
+    );
 }

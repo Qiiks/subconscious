@@ -145,6 +145,16 @@ impl BootstrapConfig {
         Self::from_env_with_daemon_config_path(daemon_config::default_config_path())
     }
 
+    /// The SHIPPED BINARY's config, which is the only caller that should capture
+    /// child output into the operator's real run directory.
+    ///
+    /// Kept separate from `from_env` deliberately: see `capture_logs_dir` on this
+    /// struct for why an absent value must mean NO CAPTURE rather than the real
+    /// directory.
+    pub fn from_env_for_daemon_binary() -> Result<Self, BootstrapError> {
+        Ok(Self::from_env()?.with_capture_logs_dir(daemon_config::daemon_run_dir().join("logs")))
+    }
+
     pub fn from_env_with_daemon_config_path(
         daemon_config_path: impl AsRef<Path>,
     ) -> Result<Self, BootstrapError> {
@@ -356,7 +366,10 @@ fn connection_file_path_with_source(
 /// existing connection file, this returns `Ok(())` after logging and the caller
 /// exits with status 0.
 pub async fn run() -> Result<(), BootstrapError> {
-    run_with_config(BootstrapConfig::from_env()?).await
+    // `run` IS THE BINARY'S ENTRY POINT, so it is the one caller that captures
+    // child output into the operator's real run directory. Every other caller
+    // reaches `run_with_config` directly and gets no capture unless it asks.
+    run_with_config(BootstrapConfig::from_env_for_daemon_binary()?).await
 }
 
 /// Serve a daemon from an explicit config. This is the entry point the twelve
@@ -539,10 +552,37 @@ async fn serve_bound_daemon(
                 "{:032x}",
                 u128::from_be_bytes(bound.connection_info.daemon_id)
             ),
-        )
-        .with_capture_logs_dir(
-            capture_logs_dir.unwrap_or_else(|| daemon_config::daemon_run_dir().join("logs")),
         );
+    // ABSENT MEANS NO CAPTURE, NOT "THE REAL RUN DIRECTORY", and the difference
+    // is a production-corruption hazard rather than a preference.
+    //
+    // This line used to be `unwrap_or_else(|| daemon_run_dir().join("logs"))`,
+    // so ANY caller that did not set the field captured supervised children into
+    // the operator's live `~/.local/share/cortexkit/run/logs/`. That is twelve
+    // sibling repos whose integration tests boot an in-process daemon through
+    // `run_with_config` -- none of which asked for it, and none of which can see
+    // it from their side.
+    //
+    // Harmless while fixture module ids are fixture-shaped: this host carries 20
+    // zero-byte files from subc's own tests (good-aft, missing-aft,
+    // preview-consumer...). THE HAZARD IS A COLLISION. A fixture named "broca"
+    // or "aft" appends to a PRODUCTION capture file that operators read
+    // forensically and that placement gates count lines in -- with no residue to
+    // notice, because the file legitimately exists and legitimately grows.
+    //
+    // Found by BROCA (2026-09-19) from the other side: their rigs spawn the
+    // SHIPPED ck-subc and set XDG_CONFIG_HOME + XDG_RUNTIME_DIR but not
+    // XDG_DATA_HOME, so every local rig run supervised a module named "broca"
+    // and captured it into production's broca.stderr.log -- the same file I
+    // count seal lines in before and after placing their binaries.
+    //
+    // The supervisor already treats `None` as no-capture (supervise.rs:3950), so
+    // this only removes an invented default. The binary keeps capturing via
+    // `BootstrapConfig::from_env_for_daemon_binary`.
+    let supervisor = match capture_logs_dir {
+        Some(dir) => supervisor.with_capture_logs_dir(dir),
+        None => supervisor,
+    };
     // Collect per-module route.bind relay overrides BEFORE handing the
     // `configured_modules` vector to the supervisor (which only needs each
     // module's `drain_timeout_ms`). Each entry was filled in by parse-time
