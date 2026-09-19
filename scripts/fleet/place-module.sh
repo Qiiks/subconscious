@@ -270,7 +270,28 @@ if [ -n "$CONTROL" ]; then
   done
   [ -n "$marker_table" ] || refuse "the control reads on both images in NONE of the tables where the marker discriminates ($marker_tables): the marker's count is uninformative, because nothing proves the instrument can see that table at all"
 else
-  marker_table="${marker_tables## }"; marker_table="${marker_table%% *}"
+  # --control IS REQUIRED, and the reason is the counter one layer down.
+  #
+  #   count_in nm  -> nm -a "$f" 2>/dev/null | grep -cF "$needle" || true
+  #
+  # That returns 0 when the needle is ABSENT and 0 when THE TOOL FAILED --
+  # stderr suppressed, `|| true` swallowing the status. Measured: `nm -a` on a
+  # non-Mach-O file returns 0 while `strings` on the same file returns 3.
+  #
+  # So a marker reading "staged 1 / live 0" is consistent with the live image
+  # genuinely lacking it AND with the instrument failing on the live image. A
+  # false PASS, in the direction that places a binary.
+  #
+  # The control closes it by construction: it must read >0 on BOTH images in the
+  # marker's table, which proves the instrument can see that table on both files.
+  # It was already implemented and merely OPTIONAL, so every card omitting one
+  # ran with the hole open.
+  #
+  # This is PLEX's rule applied to my own gate (2026-09-19): name the observation
+  # that CANNOT occur if the probe is working, and check for that rather than for
+  # the answer. Here the impossible observation is a control reading zero on an
+  # image that demonstrably contains it.
+  refuse "--control is required: without a needle known to be present in BOTH images, a marker reading 0 on the live image is indistinguishable from the counting tool having failed on it (nm -a on a non-Mach-O returns 0, silently). Pass --marker none for a change that adds no literal."
 fi
 say "marker discriminates in the $marker_table table"
 fi
