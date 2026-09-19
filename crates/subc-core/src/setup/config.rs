@@ -275,7 +275,7 @@ pub fn restart_required_from_pending_keys(
     let mut sections = Vec::new();
     for key in pending_dotted_keys {
         let top = key.as_ref().split('.').next().unwrap_or("");
-        if subc_core::daemon_config::RestartRequiredSection::ALL
+        if subc_daemon::daemon_config::RestartRequiredSection::ALL
             .iter()
             .map(|section| section.label())
             .any(|label| label == top)
@@ -655,7 +655,7 @@ fn remove_exact_value_at(object: &mut Map<String, Value>, keys: &[&str], desired
 #[cfg(test)]
 mod tests {
     use super::*;
-    use subc_core::test_support::TestTempDir;
+    use subc_daemon::test_support::TestTempDir;
 
     fn fixture_path(name: &str) -> TestTempDir {
         TestTempDir::new(name)
@@ -749,7 +749,7 @@ mod tests {
         );
 
         apply(&change).expect("apply insertion");
-        let loaded = subc_core::daemon_config::load(&config).expect("daemon parses JSONC");
+        let loaded = subc_daemon::daemon_config::load(&config).expect("daemon parses JSONC");
         assert!(
             loaded.is_some(),
             "daemon must load the inserted configuration"

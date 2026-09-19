@@ -137,7 +137,7 @@ mod tests {
     use serde_json::{Map, Value};
 
     use super::*;
-    use subc_core::test_support::TestTempDir;
+    use subc_daemon::test_support::TestTempDir;
 
     fn fixture_dir(name: &str) -> TestTempDir {
         TestTempDir::new(name)

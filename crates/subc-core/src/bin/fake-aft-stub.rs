@@ -16,7 +16,7 @@ use std::{
 
 use serde::Deserialize;
 use serde_json::{json, Value};
-use subc_core::{read_frame, write_frame, Frame};
+use subc_daemon::{read_frame, write_frame, Frame};
 use subc_protocol::{
     manifest::{
         CapabilityDeclarations, Concurrency, ExecutionMode, IdentityScope, InternalTransport,
@@ -411,7 +411,7 @@ where
 async fn drain_writer<W>(
     write_half: W,
     mut rx: mpsc::Receiver<Frame>,
-) -> Result<(), subc_core::FrameIoError>
+) -> Result<(), subc_daemon::FrameIoError>
 where
     W: AsyncWrite + Unpin,
 {
@@ -421,9 +421,15 @@ where
         while let Ok(frame) = rx.try_recv() {
             write_frame(&mut writer, &frame).await?;
         }
-        writer.flush().await.map_err(subc_core::FrameIoError::Io)?;
+        writer
+            .flush()
+            .await
+            .map_err(subc_daemon::FrameIoError::Io)?;
     }
-    writer.flush().await.map_err(subc_core::FrameIoError::Io)?;
+    writer
+        .flush()
+        .await
+        .map_err(subc_daemon::FrameIoError::Io)?;
     Ok(())
 }
 
@@ -1877,8 +1883,8 @@ enum StubError {
         source: AuthError,
     },
     Io(io::Error),
-    FrameIo(subc_core::FrameIoError),
-    FrameBuild(subc_core::FrameBuildError),
+    FrameIo(subc_daemon::FrameIoError),
+    FrameBuild(subc_daemon::FrameBuildError),
     Json(serde_json::Error),
     WriterClosed,
     WriterTask(tokio::task::JoinError),
@@ -2013,8 +2019,8 @@ impl Error for StubError {
     }
 }
 
-impl From<subc_core::FrameIoError> for StubError {
-    fn from(err: subc_core::FrameIoError) -> Self {
+impl From<subc_daemon::FrameIoError> for StubError {
+    fn from(err: subc_daemon::FrameIoError) -> Self {
         Self::FrameIo(err)
     }
 }

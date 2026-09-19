@@ -7,6 +7,8 @@ members = [
     "crates/subc-client-rs",
     "crates/subc-jsonc",
     "crates/subc-core",
+    "crates/subc-daemon",
+    "crates/subc-daemon/tests/consumer",
     "crates/subc-mcp",
     "crates/mcp-stdio-adapter",
     "crates/agent-token-vectors",
@@ -21,7 +23,8 @@ members = [
 #   in aft's Cargo.toml ->  subc-protocol = { path = "../subconscious/crates/subc-protocol" }
 #   (git dependency is the CI / cross-machine upgrade when needed.)
 # - crates/subc-control  : the client-facing control wire contract.
-# - crates/subc-core     : the daemon.
+# - crates/subc-core     : CLI, installer, and daemon executable.
+# - crates/subc-daemon   : publishable in-process daemon library.
 #
 # NOTE: cortexkit-paths is NOT here — it's a product-neutral primitive living in
 # the cortexkit/commons monorepo (https://github.com/cortexkit/commons) and is

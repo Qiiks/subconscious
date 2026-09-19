@@ -17,8 +17,8 @@ use subc_control::{
     ClientControlRequest, ClientControlResponse, ModuleDeclaredProvenance, RunningImageAgreement,
 };
 #[cfg(target_os = "linux")]
-use subc_core::test_support::TestTempDir;
-use subc_core::{
+use subc_daemon::test_support::TestTempDir;
+use subc_daemon::{
     read_frame, write_frame, Frame, ModuleSpec, RestartPolicy, Supervisor, SupervisorHandle,
     SupervisorProcessLiveness,
 };

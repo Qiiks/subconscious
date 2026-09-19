@@ -12,7 +12,7 @@ use serde_json::Value;
 use subc_control::{
     ClientControlRequest, ClientControlResponse, ConsumerIdentity, PollKind, SupervisorHealthStatus,
 };
-use subc_core::{
+use subc_daemon::{
     read_frame, test_support::TestTempDir, write_frame, ExitKind, ForwardingTable, Frame,
     HealthAction, HealthConfig, ModuleSpec, ModuleState, ModuleStatus, Registry, RestartPolicy,
     SupervisedModule, Supervisor, SupervisorHandle, SupervisorProcessLiveness,
@@ -368,7 +368,10 @@ async fn health_restart_spawn_failure_marks_failed_and_start_recovers() {
     assert!(failed.enabled);
     assert_eq!(failed.pid, None);
     assert_eq!(
-        subc_core::ModuleProcessLiveness::process_live(server.process_liveness.as_ref(), module_id),
+        subc_daemon::ModuleProcessLiveness::process_live(
+            server.process_liveness.as_ref(),
+            module_id
+        ),
         None,
         "failed health respawn must be removed from process-liveness tracking"
     );
@@ -553,7 +556,7 @@ async fn route_open_round_trip_via_tagged_shape_forwards_through_stub() {
     // subc canonicalizes project_root via cortexkit-paths (ProjectRootId) before
     // relaying — NOT raw fs::canonicalize, which keeps Windows' verbatim \\?\ prefix.
     // Assert against the same canonicalization subc uses so this holds on every OS.
-    let canonical_project = subc_core::ProjectRootId::from_path(project.path())
+    let canonical_project = subc_daemon::ProjectRootId::from_path(project.path())
         .unwrap()
         .as_path()
         .to_path_buf();
@@ -3253,7 +3256,7 @@ async fn route_open_vanished_project_root_attaches_under_its_recorded_identity()
     let project = TestProject::new();
     let vanished_root = project.path().join("worktree");
     std::fs::create_dir(&vanished_root).unwrap();
-    let identity_while_present = subc_core::ProjectRootId::from_path(&vanished_root)
+    let identity_while_present = subc_daemon::ProjectRootId::from_path(&vanished_root)
         .unwrap()
         .as_path()
         .to_path_buf();
@@ -6541,7 +6544,7 @@ async fn wait_for_registration(
     registry: &Registry,
     module_id: &str,
     wait: Duration,
-) -> subc_core::ModuleRegistration {
+) -> subc_daemon::ModuleRegistration {
     let deadline = Instant::now() + wait;
     loop {
         if let Some(registration) = registry.get_module(module_id).unwrap() {

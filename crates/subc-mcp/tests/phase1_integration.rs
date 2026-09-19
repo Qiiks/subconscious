@@ -29,7 +29,7 @@ use rmcp::{
 };
 use serde_json::{json, Value};
 use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse, SupervisorEntry};
-use subc_core::{
+use subc_daemon::{
     read_frame, serve_listener, write_frame, ControlHandler, ForwardingTable, Frame,
     ModuleProcessLiveness, ModuleSpec, Registry, RestartPolicy, Router, ServerAuth,
     SupervisedModule, Supervisor, SupervisorHandle, SupervisorProcessLiveness,
@@ -98,7 +98,7 @@ struct TestDaemon {
     forwarding: Arc<ForwardingTable>,
     connection_file_path: PathBuf,
     temp_dir: PathBuf,
-    task: JoinHandle<Result<(), subc_core::ServerError>>,
+    task: JoinHandle<Result<(), subc_daemon::ServerError>>,
 }
 
 impl Drop for TestDaemon {

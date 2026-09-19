@@ -42,7 +42,7 @@ fn daemon_budgets_match_contract_fixture() {
         match row.name.as_str() {
             "drain_timeout" => {
                 assert_eq!(
-                    subc_core::DEFAULT_DRAIN_TIMEOUT.as_millis() as u64,
+                    subc_daemon::DEFAULT_DRAIN_TIMEOUT.as_millis() as u64,
                     row.ms,
                     "drain_timeout mismatch: DEFAULT_DRAIN_TIMEOUT must equal golden row"
                 );
@@ -52,7 +52,7 @@ fn daemon_budgets_match_contract_fixture() {
             }
             "route_bind_relay_timeout" => {
                 assert_eq!(
-                    subc_core::DEFAULT_ROUTE_BIND_RELAY_TIMEOUT.as_millis() as u64,
+                    subc_daemon::DEFAULT_ROUTE_BIND_RELAY_TIMEOUT.as_millis() as u64,
                     row.ms,
                     "route_bind_relay_timeout mismatch: DEFAULT_ROUTE_BIND_RELAY_TIMEOUT must equal golden row"
                 );
@@ -62,7 +62,7 @@ fn daemon_budgets_match_contract_fixture() {
             }
             "auth_deadline" => {
                 assert_eq!(
-                    subc_core::DEFAULT_AUTH_DEADLINE.as_millis() as u64,
+                    subc_daemon::DEFAULT_AUTH_DEADLINE.as_millis() as u64,
                     row.ms,
                     "auth_deadline mismatch: DEFAULT_AUTH_DEADLINE must equal golden row"
                 );

@@ -10,7 +10,7 @@ use std::{
 };
 
 use serde_json::{json, Value};
-use subc_core::{read_frame, test_support::TestTempDir, write_frame, Frame};
+use subc_daemon::{read_frame, test_support::TestTempDir, write_frame, Frame};
 use subc_protocol::{Flags, FrameType, Priority};
 
 mod common;

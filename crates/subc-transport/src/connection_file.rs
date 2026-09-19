@@ -400,7 +400,7 @@ pub fn discovery_candidates(explicit: Option<&Path>, env_named: Option<&OsStr>) 
 }
 
 /// Read the reader-side environment and return the first usable connection file.
-/// Unlike writer-side `subc_core::bootstrap::connection_file_path()`, this searches
+/// Unlike writer-side `subc_daemon::bootstrap::connection_file_path()`, this searches
 /// every location where an already-running daemon may have written its file.
 pub fn discover(explicit: Option<&Path>) -> Result<Discovered, DiscoveryError> {
     let env_named = non_empty_os_var("SUBC_CONNECTION_FILE");

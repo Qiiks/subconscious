@@ -570,7 +570,7 @@ mod tests {
     };
 
     use super::*;
-    use subc_core::test_support::TestTempDir;
+    use subc_daemon::test_support::TestTempDir;
 
     fn upgrade_target(binary: &str) -> UpgradeTarget {
         upgrade_roster(Component::ALL)

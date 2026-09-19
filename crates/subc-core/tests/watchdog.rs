@@ -8,7 +8,7 @@ use std::{
 };
 
 use subc_control::ClientControlRequest;
-use subc_core::{
+use subc_daemon::{
     bootstrap::{run_with_config, BootstrapConfig, BootstrapError},
     read_frame, serve_listener,
     test_support::TestTempDir,
@@ -51,7 +51,7 @@ async fn watchdog_tick_against_live_daemon_succeeds_silently() {
     let watchdog_logs = capture
         .entries()
         .into_iter()
-        .filter(|line| line.contains("subc_core::watchdog"))
+        .filter(|line| line.contains("subc_daemon::watchdog"))
         .collect::<Vec<_>>();
     assert!(
         watchdog_logs.is_empty(),
@@ -75,7 +75,7 @@ async fn watchdog_detects_wire_version_divergence() {
         .run_once()
         .await
         .expect_err("missing wire_version must diverge from a daemon-published file");
-    assert_eq!(err.stage(), subc_core::WatchdogStage::ConnectionFile);
+    assert_eq!(err.stage(), subc_daemon::WatchdogStage::ConnectionFile);
     assert!(err.to_string().contains("wire_version"), "error: {err}");
 
     server_task.abort();
@@ -98,7 +98,7 @@ async fn watchdog_detects_daemon_id_divergence() {
         .run_once()
         .await
         .expect_err("daemon_id must match the live daemon identity");
-    assert_eq!(err.stage(), subc_core::WatchdogStage::ConnectionFile);
+    assert_eq!(err.stage(), subc_daemon::WatchdogStage::ConnectionFile);
     assert!(err.to_string().contains("daemon_id"), "error: {err}");
 
     server_task.abort();
@@ -155,7 +155,7 @@ async fn watchdog_rejects_a_daemon_that_answers_the_wrong_control_response() {
     // operator to the wrong layer.
     assert_eq!(
         err.stage(),
-        subc_core::WatchdogStage::Describe,
+        subc_daemon::WatchdogStage::Describe,
         "a wrong control response is a describe-stage fault, not a transport one"
     );
     assert!(

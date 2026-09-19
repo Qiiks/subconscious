@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse};
-use subc_core::{fleet_lint, read_frame, write_frame, Frame, DEFAULT_DRAIN_TIMEOUT};
+use subc_daemon::{fleet_lint, read_frame, write_frame, Frame, DEFAULT_DRAIN_TIMEOUT};
 use subc_protocol::{BindIdentity, Flags, FrameType, Priority, RouteTarget};
 use subc_transport::{
     authenticate_client, connection_file, ConnectionInfo, DiscoveryError, TriedCandidate,
@@ -573,7 +573,7 @@ struct DashboardUpdateLines {
 async fn fleet_lint_command(config: Option<&Path>, verbose: bool) -> Result<(), CkError> {
     let config = config
         .map(PathBuf::from)
-        .unwrap_or_else(subc_core::daemon_config::default_config_path);
+        .unwrap_or_else(subc_daemon::daemon_config::default_config_path);
     let report = fleet_lint::lint(&config, verbose)
         .await
         .map_err(|error| CkError::FleetLintConfig(error.to_string()))?;
@@ -1518,7 +1518,7 @@ fn last_log_timestamp(path: &Path) -> String {
 
 fn discover_log_sources(module_id: &str, include_rotated: bool) -> Result<Vec<LogSource>, CkError> {
     let module_logs = FleetLogConfig::for_module(module_id, FleetLane::Module).logs_dir;
-    let run_logs = subc_core::daemon_config::daemon_run_dir().join("logs");
+    let run_logs = subc_daemon::daemon_config::daemon_run_dir().join("logs");
     let mut sources = Vec::new();
     collect_sources_in_dir(
         &module_logs,
@@ -7038,7 +7038,7 @@ mod tests {
 
     use super::*;
     use subc_control::{StderrCaptureState, StderrTail, StderrTailEntry};
-    use subc_core::test_support::TestTempDir;
+    use subc_daemon::test_support::TestTempDir;
 
     #[test]
     fn provenance_value_escapes_terminal_controls() {

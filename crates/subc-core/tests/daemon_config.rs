@@ -11,7 +11,7 @@ use subc_control::{
     ClientControlRequest, ClientControlResponse, ConsumerIdentity, SupervisorEntry,
     SupervisorRescanResult,
 };
-use subc_core::{
+use subc_daemon::{
     bootstrap::{run_with_config, run_with_daemon_config_path, BootstrapConfig},
     daemon_config, read_frame,
     test_support::TestTempDir,
@@ -42,7 +42,7 @@ struct RunningDaemon {
     // preserves it on panic). Never read directly.
     #[allow(dead_code)]
     temp_dir: TestTempDir,
-    task: JoinHandle<Result<(), subc_core::bootstrap::BootstrapError>>,
+    task: JoinHandle<Result<(), subc_daemon::bootstrap::BootstrapError>>,
 }
 
 impl RunningDaemon {
@@ -1748,7 +1748,7 @@ async fn an_unset_capture_dir_captures_nowhere() {
     // Naming a real path is safe here ONLY because the module id is unique to
     // this test: that file can exist only if this daemon wrote it, so the
     // assertion is about this run rather than about the machine.
-    let leaked = subc_core::daemon_config::daemon_run_dir()
+    let leaked = subc_daemon::daemon_config::daemon_run_dir()
         .join("logs")
         .join(format!("{module_id}.stderr.log"));
 

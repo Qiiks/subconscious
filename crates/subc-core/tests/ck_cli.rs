@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use subc_control::{
     ClientControlRequest, ClientControlResponse, SupervisorEntry, SupervisorHealthStatus,
 };
-use subc_core::{
+use subc_daemon::{
     read_frame, test_support::TestTempDir as TempDir, write_frame, Frame, HealthConfig, ModuleSpec,
     RestartPolicy, SupervisedModule, Supervisor, SupervisorHandle, SupervisorProcessLiveness,
 };

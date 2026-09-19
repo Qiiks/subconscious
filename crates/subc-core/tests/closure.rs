@@ -7,7 +7,7 @@ use std::{
 };
 
 use subc_control::{ops, ClientControlRequest, ClientControlResponse, PollKind};
-use subc_core::{
+use subc_daemon::{
     read_frame, test_support::TestTempDir, write_frame, Frame, ModuleSpec, RestartPolicy,
     SupervisedModule, Supervisor, SupervisorHandle, SupervisorProcessLiveness,
 };

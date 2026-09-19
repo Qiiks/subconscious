@@ -30,7 +30,7 @@ use std::{
 
 use serde_json::{json, Value};
 use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse};
-use subc_core::{read_frame, write_frame, Frame};
+use subc_daemon::{read_frame, write_frame, Frame};
 use subc_protocol::{
     manifest::ProviderRole, BindIdentity, Flags, FrameType, Priority, RouteTarget,
 };

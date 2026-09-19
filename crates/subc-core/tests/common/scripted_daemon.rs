@@ -1,7 +1,7 @@
 use std::{future::pending, process, time::Duration};
 
 use subc_control::{ClientControlRequest, ClientControlResponse};
-use subc_core::{read_frame, test_support::TestTempDir, write_frame, Frame};
+use subc_daemon::{read_frame, test_support::TestTempDir, write_frame, Frame};
 use subc_protocol::{FrameType, PROTOCOL_VERSION};
 use subc_transport::{
     authenticate_server, generate_daemon_id, generate_key, write_atomic, ConnectionInfo, Endpoint,

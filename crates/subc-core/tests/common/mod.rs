@@ -11,7 +11,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use subc_core::{
+use subc_daemon::{
     serve_listener, test_support::TestTempDir, ConnectedClients, ControlHandler, ForwardingTable,
     ModuleProcessLiveness, Registry, Router, ServerAuth, SupervisorHandle,
 };
@@ -61,7 +61,7 @@ pub struct TestDaemon {
     pub forwarding: Arc<ForwardingTable>,
     pub connection_file_path: PathBuf,
     pub temp_dir: TestTempDir,
-    pub task: JoinHandle<Result<(), subc_core::ServerError>>,
+    pub task: JoinHandle<Result<(), subc_daemon::ServerError>>,
 }
 
 impl TestDaemon {

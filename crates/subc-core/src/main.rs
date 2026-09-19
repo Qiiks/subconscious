@@ -68,7 +68,7 @@ async fn main() {
         process::exit(1);
     }
 
-    if let Err(err) = subc_core::bootstrap::run().await {
+    if let Err(err) = subc_daemon::bootstrap::run().await {
         tracing::error!(error = %err, "subc-core failed");
         eprintln!("subc-core: {err}");
         process::exit(1);
@@ -81,7 +81,7 @@ async fn main() {
 }
 
 fn init_tracing() -> Result<(), cortexkit_log::InitError> {
-    let config_path = subc_core::daemon_config::default_config_path();
+    let config_path = subc_daemon::daemon_config::default_config_path();
     // THIS eprintln! MUST STAY ON STDERR. It is the daemon's only pre-subscriber
     // channel: a failure to read logging config happens BEFORE the file sink exists,
     // so a message about it cannot go to the file sink. Everything else the daemon
@@ -90,7 +90,7 @@ fn init_tracing() -> Result<(), cortexkit_log::InitError> {
     // logging itself is broken. A consumer's hermetic test lane keeps the daemon's
     // piped stderr as post-mortem text in failure messages for exactly this line;
     // folding it into the file sink would silence the one report that cannot use it.
-    let logging = subc_core::daemon_config::load_logging(&config_path)
+    let logging = subc_daemon::daemon_config::load_logging(&config_path)
         .map_err(|error| {
             eprintln!(
                 "ck-subc: could not read daemon logging config from {}: {error}; using defaults",
@@ -99,20 +99,20 @@ fn init_tracing() -> Result<(), cortexkit_log::InitError> {
         })
         .ok()
         .flatten();
-    let logs_dir = subc_core::daemon_config::daemon_run_dir().join("logs");
+    let logs_dir = subc_daemon::daemon_config::daemon_run_dir().join("logs");
     install_tracing(daemon_logger_config(logs_dir, logging.as_ref()))
 }
 
 fn daemon_logger_config(
     logs_dir: PathBuf,
-    logging: Option<&subc_core::daemon_config::LoggingConfig>,
+    logging: Option<&subc_daemon::daemon_config::LoggingConfig>,
 ) -> Config {
     let path = logs_dir.join("subc.log");
     Config {
         module_id: "subc".to_string(),
         logs_dir,
         lane: Lane::Custom(path),
-        spec: logging.map(subc_core::daemon_config::LoggingConfig::filter_spec),
+        spec: logging.map(subc_daemon::daemon_config::LoggingConfig::filter_spec),
         retention: logging.map_or_else(Retention::default, |config| config.retention),
         redactor: None,
         clock: None,

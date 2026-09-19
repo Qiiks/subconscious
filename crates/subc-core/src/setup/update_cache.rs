@@ -166,7 +166,7 @@ mod tests {
     use std::{collections::BTreeMap, fs};
 
     use super::*;
-    use subc_core::test_support::TestTempDir;
+    use subc_daemon::test_support::TestTempDir;
 
     fn metadata(checked_at_unix_secs: u64) -> UpdateMetadata {
         UpdateMetadata {

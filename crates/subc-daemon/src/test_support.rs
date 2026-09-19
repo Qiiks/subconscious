@@ -2,7 +2,7 @@
 //! integration tests.
 //!
 //! The module is compiled into the library only when the `test-support` feature
-//! is enabled (integration tests, via the self dev-dependency) or under
+//! is enabled (consumers' integration tests) or under
 //! `#[cfg(test)]` (the crate's own unit tests). It is never part of a
 //! production build.
 

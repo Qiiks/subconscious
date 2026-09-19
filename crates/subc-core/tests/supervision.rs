@@ -1,7 +1,7 @@
 use std::{ops::Deref, path::PathBuf, sync::Arc, time::Duration};
 
 use subc_control::TerminalDisposition;
-use subc_core::{
+use subc_daemon::{
     stderr_tail::{CaptureState, StderrTailSnapshot, TailEntry},
     test_support::TestTempDir,
     ModuleSpec, ModuleState, ModuleStatus, Registry, RestartPolicy, SuperviseError,
@@ -768,7 +768,7 @@ async fn wait_for_registration(
     registry: &Registry,
     module_id: &str,
     wait: Duration,
-) -> subc_core::ModuleRegistration {
+) -> subc_daemon::ModuleRegistration {
     let deadline = Instant::now() + wait;
     loop {
         if let Some(registration) = registry.get_module(module_id).unwrap() {

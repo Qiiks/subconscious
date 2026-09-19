@@ -1552,7 +1552,7 @@ impl ControlHandler {
     fn observe_route_open_refusal(&self, ctx: &RouteCtx, module_id: &str, code: &'static str) {
         self.counters.increment_route_open_refused(code);
         info!(
-            target: "subc_core::control",
+            target: "subc_daemon::control",
             code,
             module_id = ?module_id,
             connection_id = ctx.connection_id.get(),
@@ -1607,7 +1607,7 @@ impl ControlHandler {
     fn observe_route_open_accept(&self, ctx: &RouteCtx, module_id: &str, principal: &str) {
         self.counters.increment_route_open_accepted(principal);
         info!(
-            target: "subc_core::control",
+            target: "subc_daemon::control",
             principal,
             module_id,
             connection_id = ctx.connection_id.get(),
@@ -1625,7 +1625,7 @@ impl ControlHandler {
     ) -> Result<Frame, RouterError> {
         self.counters.increment_route_open_refused(code);
         info!(
-            target: "subc_core::control",
+            target: "subc_daemon::control",
             code,
             module_id = ?module_id,
             connection_id = ctx.connection_id.get(),
@@ -2027,7 +2027,7 @@ impl ControlHandler {
                 self.counters
                     .increment_route_open_refused("module_rejected");
                 info!(
-                    target: "subc_core::control",
+                    target: "subc_daemon::control",
                     code = "module_rejected",
                     module_code = ?body.code,
                     module_id = ?target_module_id,
@@ -6815,7 +6815,7 @@ mod tests {
             .events()
             .into_iter()
             .find(|event| {
-                event.target == "subc_core::control"
+                event.target == "subc_daemon::control"
                     && event.fields.get("code") == Some(&"\"module_warming\"".to_string())
             })
             .expect("route.open refusal event");
@@ -6858,7 +6858,7 @@ mod tests {
             .events()
             .into_iter()
             .find(|event| {
-                event.target == "subc_core::control"
+                event.target == "subc_daemon::control"
                     && event.fields.get("code") == Some(&"\"unknown_module\"".to_string())
             })
             .expect("route.open unknown-module refusal event");
@@ -6925,7 +6925,7 @@ mod tests {
             .events()
             .into_iter()
             .find(|event| {
-                event.target == "subc_core::control"
+                event.target == "subc_daemon::control"
                     && event.fields.get("code") == Some(&"\"module_rejected\"".to_string())
             })
             .expect("route.open module-rejection refusal event");

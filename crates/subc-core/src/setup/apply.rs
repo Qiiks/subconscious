@@ -73,7 +73,7 @@ impl SetupBackend {
             paths: SetupPaths {
                 data_dir: data_dir.clone(),
                 binary_home,
-                config_path: subc_core::daemon_config::default_config_path(),
+                config_path: subc_daemon::daemon_config::default_config_path(),
                 // One default is retained and reused for bootstrap and generated
                 // module environment so the vault never receives mismatched keys.
                 claustrum_key_path: if cfg!(target_os = "macos") {
@@ -927,7 +927,7 @@ mod tests {
 mod adoption_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
-    use subc_core::test_support::TestTempDir;
+    use subc_daemon::test_support::TestTempDir;
 
     /// Rollback after a later refusal must delete only what this run wrote.
     /// An adopted binary existed before the run (and may be the image a

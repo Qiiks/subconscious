@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use subc_core::bench_harness::{
+use subc_daemon::bench_harness::{
     bench_client_forward_op, build_bench_forwarding_setup, BenchClientRoute,
 };
 use tokio::runtime::Builder;

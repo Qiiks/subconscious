@@ -1,7 +1,7 @@
 use std::{collections::VecDeque, ops::Deref, path::Path, time::Duration};
 
 use subc_control::{ClientControlRequest, ClientControlResponse};
-use subc_core::{
+use subc_daemon::{
     read_frame, test_support::TestTempDir, write_frame, ForwardingTable, Frame, Registry,
 };
 use subc_protocol::{

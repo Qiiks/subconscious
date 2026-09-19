@@ -1,7 +1,7 @@
 use std::{collections::VecDeque, ops::Deref, path::Path, time::Duration};
 
 use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse};
-use subc_core::{read_frame, test_support::TestTempDir, write_frame, Frame};
+use subc_daemon::{read_frame, test_support::TestTempDir, write_frame, Frame};
 use subc_protocol::{
     manifest::{
         Concurrency, ExecutionMode, IdentityScope, ManifestProvenance, ModuleManifest,
