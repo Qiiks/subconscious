@@ -178,6 +178,26 @@ impl PolicyModuleHandler {
         self.calls.load(Ordering::SeqCst)
     }
 
+    /// The call count once it reaches `expected`, or whatever it is at the
+    /// deadline. The counter increments when a request ARRIVES at this fake,
+    /// which is a hop behind the resolver's own timeout: a resolve that faults
+    /// at 200 ms against a stalling script has often not yet been counted when
+    /// the caller reads `calls()`, and on a loaded runner "often" became
+    /// "always" (Windows CI, 2026-09-19: read 1, expected 2). Waiting keeps
+    /// the mutation fence intact -- a branch that never sends leaves the count
+    /// short forever and the deadline reds -- without asserting on arrival
+    /// latency the test does not control.
+    async fn calls_reaching(&self, expected: u64, deadline: Duration) -> u64 {
+        let started = Instant::now();
+        loop {
+            let calls = self.calls();
+            if calls >= expected || started.elapsed() >= deadline {
+                return calls;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     fn send_bump(&self, revision: u64) {
         self.bump_tx
             .lock()
@@ -2682,7 +2702,13 @@ async fn policy_resolver_hard_timeout_is_a_fault_before_the_provider_stall_finis
         elapsed < stall,
         "resolve took {elapsed:?}, stall was {stall:?}"
     );
-    assert_eq!(harness.handler.calls(), 1);
+    assert_eq!(
+        harness
+            .handler
+            .calls_reaching(1, Duration::from_secs(5))
+            .await,
+        1
+    );
 
     drop(resolver);
     harness.stop().await;
@@ -2729,7 +2755,13 @@ async fn policy_resolver_keeps_denied_decisions_distinct_from_faults() {
         "expected a fault, got {fault:?}"
     );
     // Mutation fence: both branches reached the fake; neither is a local default.
-    assert_eq!(harness.handler.calls(), 2);
+    assert_eq!(
+        harness
+            .handler
+            .calls_reaching(2, Duration::from_secs(5))
+            .await,
+        2
+    );
 
     drop(resolver);
     harness.stop().await;
