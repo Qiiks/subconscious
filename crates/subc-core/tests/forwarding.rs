@@ -209,7 +209,35 @@ async fn health_prober_restarts_unresponsive_module_and_recovers_ok() {
     let supervisor =
         supervisor(&server, 2, Duration::from_millis(10)).with_health_config(health_config(
             Duration::from_millis(20),
-            Duration::from_millis(200),
+            // DEADLINE SIZED FOR A RESPAWN, NOT FOR THE INDUCED FAILURE.
+            //
+            // This was 200ms and went red on a Windows runner (2026-09-19),
+            // first failure in eight runs, on a commit that touched an
+            // unrelated path. The mechanism is not flakiness in the usual
+            // sense: after the restart this test induces, the module must
+            // spawn, connect, HELLO and register before it can answer
+            // anything -- and a probe against a module with no forwarding
+            // connection returns `lane_dead`, THE MOST SEVERE CLASSIFICATION
+            // THERE IS. So with cadence 20ms, deadline 200ms and threshold 2,
+            // the respawned process had 440ms to come all the way up before
+            // the prober restarted it AGAIN, and the assertion below saw
+            // restart_count 2.
+            //
+            // 2s gives a respawn on a loaded runner room to register. It also
+            // makes the FIRST restart take ~4s, which is the honest cost: the
+            // induced failure is detected by waiting out two deadlines, so
+            // sizing the deadline for the slowest leg necessarily slows the
+            // fastest one.
+            //
+            // THE PRODUCTION SHAPE BEHIND THIS IS NOT A TEST BUG and is
+            // recorded rather than fixed here: `schedule_next` re-arms the
+            // first post-restart probe at the ordinary cadence with NO GRACE
+            // for spawn and registration, while the daemon already has a
+            // `module_warming` concept for exactly that window -- it is used
+            // on the route.open path and not on the probe path. Production
+            // cadences are seconds rather than 20ms so the margin is wide,
+            // but the asymmetry is real.
+            Duration::from_secs(2),
             2,
             HealthAction::Report,
             HealthAction::Report,
@@ -232,8 +260,17 @@ async fn health_prober_restarts_unresponsive_module_and_recovers_ok() {
     )
     .await;
 
+    // PREDICATE AND ASSERTION MUST DEMAND THE SAME THING. This waited for
+    // `>= 1` and then asserted `== 1`, so the wait ACCEPTED a state the
+    // assertion rejects: any snapshot taken after a second restart satisfies
+    // the predicate and fails the assert. A mismatch like that turns a timing
+    // difference into an assertion failure, which reads like a broken
+    // invariant rather than a slow machine.
+    //
+    // Now both say exactly one. If a second restart ever happens the test
+    // times out instead -- slower, and honest about which thing went wrong.
     let status = wait_for_status(&module, SETUP_TIMEOUT, |status| {
-        status.restart_count >= 1
+        status.restart_count == 1
             && status.health.status == SupervisorHealthStatus::Ok
             && status.live
     })
