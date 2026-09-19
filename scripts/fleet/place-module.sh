@@ -74,7 +74,32 @@ done
 
 [ -n "$MODULE" ] || { echo "REFUSED: --module is required" >&2; exit 2; }
 [ -n "$STAGED" ] || { echo "REFUSED: --staged is required" >&2; exit 2; }
-[ -n "$MARKER" ] || { echo "REFUSED: --marker is required (a discriminator that separates this build from the running one)" >&2; exit 2; }
+[ -n "$MARKER" ] || { echo "REFUSED: --marker is required (a discriminator that separates this build from the running one); pass --marker none for a change that adds no literal" >&2; exit 2; }
+
+# `--marker none` IS FOR A CHANGE THAT ADDS NO STRING, and it is honest rather
+# than a bypass. A deletion-only fix, a removed call, a private fn that inlines
+# away, or a type-level refactor leaves every literal identical: `strings` is
+# then correct to report no difference, and demanding a marker would force the
+# operator to invent one.
+#
+# IDENTITY STILL HOLDS WITHOUT IT, because the marker was never the only link:
+#
+#   staged sidecar verifies        the staged file is the digest the owner published
+#   placed sha == staged sha       what landed is what was gated
+#   running inode == disk inode    the kernel mapped that file
+#
+# That chain is complete on its own. What the marker adds is a second, WEAKER
+# statement -- that an expected literal is compiled in -- which never proved the
+# branch was reachable anyway. So its absence costs less than it appears to.
+#
+# What IS lost is the cross-check that the staged bytes differ from the running
+# ones in the way the card claims, so the gate substitutes the strongest
+# available: LC_UUID must differ. A rebuild always moves it, and two files with
+# the same UUID are the same build.
+#
+# Raised by ENGRAM (2026-09-19) on a fix that deletes one call and adds a
+# comment. They stated "no markers by strings" on the card rather than reaching
+# for a literal that would have read 1/1 and looked like a passing arm.
 DEST="${DEST:-$BIN_DIR/ck-$MODULE}"
 [ -f "$STAGED" ] || { echo "REFUSED: staged artifact not found: $STAGED" >&2; exit 2; }
 [ -f "$DEST" ] || { echo "REFUSED: destination does not exist, so this is an install rather than a placement: $DEST" >&2; exit 2; }
@@ -212,6 +237,19 @@ count_in() {  # count_in <table> <file> <needle>
 # Collect every discriminating table, then prefer one whose control reads on both
 # images. Refusing only when NO such table exists keeps the arm as strict as it
 # was without failing valid cards (PLEX, 190406a, first card to hit it).
+if [ "$MARKER" = "none" ]; then
+  # No literal to compare. Substitute the strongest available discriminator:
+  # a rebuild always moves LC_UUID, and two files sharing one are the same build.
+  staged_uuid=$(dwarfdump --uuid "$STAGED" 2>/dev/null | awk '{print $2}')
+  live_uuid=$(dwarfdump --uuid "$DEST" 2>/dev/null | awk '{print $2}')
+  say "marker: NONE DECLARED -- this change adds no string literal"
+  [ -n "$staged_uuid" ] && [ -n "$live_uuid" ] \
+    || refuse "--marker none needs LC_UUID from both images and one is unreadable (not a Mach-O?); nothing has been placed"
+  [ "$staged_uuid" != "$live_uuid" ] \
+    || refuse "--marker none but LC_UUID is IDENTICAL ($staged_uuid): the staged artifact is the same build as the running one; nothing has been placed"
+  say "identity: LC_UUID differs (staged $staged_uuid, live $live_uuid)"
+  say "IDENTITY RESTS ON sidecar + placed==staged + inode; BEHAVIOUR IS UNPROVEN BY THIS GATE"
+else
 marker_tables=""
 for t in strings nm; do
   ms=$(count_in "$t" "$STAGED" "$MARKER")
@@ -235,6 +273,7 @@ else
   marker_table="${marker_tables## }"; marker_table="${marker_table%% *}"
 fi
 say "marker discriminates in the $marker_table table"
+fi
 if [ -n "$CONTROL" ]; then
   c_staged=$(count_in "$marker_table" "$STAGED" "$CONTROL")
   c_live=$(count_in "$marker_table" "$DEST" "$CONTROL")
