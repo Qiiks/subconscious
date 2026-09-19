@@ -21,6 +21,11 @@ pub(crate) const CK_LOG_ENV: &str = "CK_LOG";
 pub(crate) const CAPTURE_MAX_FILE_MB_ENV: &str = "__SUBC_CAPTURE_LOG_MAX_FILE_MB";
 pub(crate) const CAPTURE_KEEP_ENV: &str = "__SUBC_CAPTURE_LOG_KEEP";
 pub(crate) const CAPTURE_MAX_AGE_DAYS_ENV: &str = "__SUBC_CAPTURE_LOG_MAX_AGE_DAYS";
+/// The child's own segment retention, read by `cortexkit_log::Config::from_env`.
+/// Unlike the `__SUBC_CAPTURE_*` names above these are a real child-process
+/// contract and are spawned into the environment.
+pub(crate) const CHILD_LOG_MAX_AGE_DAYS_ENV: &str = "CK_LOG_MAX_AGE_DAYS";
+pub(crate) const CHILD_LOG_ALARM_SEGMENT_MB_ENV: &str = "CK_LOG_ALARM_SEGMENT_MB";
 
 /// Top-level daemon config sections that rescan cannot apply. The daemon
 /// snapshots these sections at start and reports later rescan changes as
@@ -76,24 +81,49 @@ const RESTART_WINDOW_ZERO_MESSAGE: &str = "restart.window_secs must be greater t
 
 /// Logging policy parsed from `subc.jsonc`.
 ///
-/// Retention is kept as the shared crate's type so the daemon's own file and
-/// captured child files cannot drift from the fleet policy.
+/// `retention` is the rename-rotating policy for the daemon's per-child
+/// stderr CAPTURE file (single writer). The daemon's own log and every module's
+/// log are date segments under fleet-logging r2, which never rotate; for those
+/// only `retention.max_age_days` applies, plus `alarm_segment_mb`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoggingConfig {
     pub level: String,
+    /// Per-logger levels. Keys are logger names; a key with no dot is taken
+    /// as a COMPONENT of the module it is configured on (`perf` on synapse is
+    /// `synapse.perf`), so an operator's `subc.jsonc` reads naturally. See
+    /// [`LoggingConfig::filter_spec`].
     pub tags: BTreeMap<String, String>,
     pub retention: Retention,
+    /// Segment size at which the writer alarms (never truncates).
+    pub alarm_segment_mb: u32,
 }
 
 impl LoggingConfig {
-    pub fn filter_spec(&self) -> String {
+    /// The `CK_LOG` value for `module_id`. Logger names in `CK_LOG` are
+    /// absolute (`synapse.perf=info`), while the config block is written per
+    /// module, so a dotless key is prefixed with the module id here. A key
+    /// that already starts with `<module_id>.` or contains a dot is passed
+    /// verbatim; a key equal to the module id is the root and is also
+    /// verbatim. Without this a config `tags: { perf: debug }` would emit
+    /// `perf=debug`, which matches no logger on the r2 hierarchy and silently
+    /// does nothing.
+    pub fn filter_spec(&self, module_id: &str) -> String {
         let mut directives = vec![self.level.clone()];
-        directives.extend(
-            self.tags
-                .iter()
-                .map(|(tag, level)| format!("{tag}={level}")),
-        );
+        directives.extend(self.tags.iter().map(|(logger, level)| {
+            if logger == module_id || logger.contains('.') {
+                format!("{logger}={level}")
+            } else {
+                format!("{module_id}.{logger}={level}")
+            }
+        }));
         directives.join(",")
+    }
+
+    pub fn segment_retention(&self) -> cortexkit_log::SegmentRetention {
+        cortexkit_log::SegmentRetention {
+            max_age_days: self.retention.max_age_days,
+            alarm_segment_mb: self.alarm_segment_mb,
+        }
     }
 }
 
@@ -243,11 +273,21 @@ impl ConfiguredModule {
                     && key != CAPTURE_KEEP_ENV
                     && key != CAPTURE_MAX_AGE_DAYS_ENV
             });
-            env.push((CK_LOG_ENV.to_string(), log.filter_spec()));
-            // cortexkit-log does not yet define retention environment names.
-            // These private entries are supervisor metadata and are removed
-            // before spawn; they let capture retention follow config changes at
-            // the next spawn without inventing a child-process env contract.
+            env.retain(|(key, _)| {
+                key != CHILD_LOG_MAX_AGE_DAYS_ENV && key != CHILD_LOG_ALARM_SEGMENT_MB_ENV
+            });
+            env.push((CK_LOG_ENV.to_string(), log.filter_spec(&self.module_id)));
+            env.push((
+                CHILD_LOG_MAX_AGE_DAYS_ENV.to_string(),
+                log.retention.max_age_days.to_string(),
+            ));
+            env.push((
+                CHILD_LOG_ALARM_SEGMENT_MB_ENV.to_string(),
+                log.alarm_segment_mb.to_string(),
+            ));
+            // The capture file's own rotation policy. These private entries are
+            // supervisor metadata and are removed before spawn: the child never
+            // sees them, and the capture sink reads them back at spawn time.
             env.push((
                 CAPTURE_MAX_FILE_MB_ENV.to_string(),
                 log.retention.max_file_mb.to_string(),
@@ -358,6 +398,8 @@ struct RawLoggingConfig {
     level: Option<String>,
     #[serde(default)]
     tags: BTreeMap<String, String>,
+    #[serde(default)]
+    alarm_segment_mb: Option<u32>,
     #[serde(default)]
     max_file_mb: Option<u32>,
     #[serde(default)]
@@ -686,14 +728,22 @@ fn parse_logging_config(
         });
     }
     for (tag, tag_level) in &raw.tags {
-        if tag.is_empty()
-            || tag
-                .chars()
-                .any(|character| character.is_whitespace() || character == ',' || character == '=')
-        {
+        // A logger name is dotted segments of [a-z][a-z0-9-]*: the same
+        // grammar cortexkit-log renders and filters on. Anything else would
+        // pass through CK_LOG and be refused there, one process away from the
+        // config that caused it.
+        let well_formed = !tag.is_empty()
+            && tag.split('.').all(|segment| {
+                let mut chars = segment.chars();
+                matches!(chars.next(), Some('a'..='z'))
+                    && chars.all(|c| matches!(c, 'a'..='z' | '0'..='9' | '-'))
+            });
+        if !well_formed {
             return Err(DaemonConfigError::InvalidValue {
                 path: path.to_path_buf(),
-                message: format!("{owner}.tags contains an invalid tag name {tag:?}"),
+                message: format!(
+                    "{owner}.tags key {tag:?} is not a logger name (dotted segments of [a-z][a-z0-9-]*)"
+                ),
             });
         }
         if !valid_level(tag_level) {
@@ -719,10 +769,21 @@ fn parse_logging_config(
         });
     }
 
+    let alarm_segment_mb = raw
+        .alarm_segment_mb
+        .unwrap_or(cortexkit_log::SegmentRetention::default().alarm_segment_mb);
+    if alarm_segment_mb == 0 {
+        return Err(DaemonConfigError::InvalidValue {
+            path: path.to_path_buf(),
+            message: format!("{owner}.alarm_segment_mb must be greater than 0"),
+        });
+    }
+
     Ok(LoggingConfig {
         level,
         tags: raw.tags,
         retention,
+        alarm_segment_mb,
     })
 }
 
@@ -1462,6 +1523,68 @@ mod tests {
         // No per-module value: the daemon-wide default flows in at parse time.
         assert_eq!(by_id("inherits"), Some(30_000));
         assert_eq!(config.route_bind_relay_timeout_ms, Some(30_000));
+    }
+
+    #[test]
+    fn log_tag_keys_must_be_logger_names_and_the_error_names_the_key() {
+        let path = Path::new("/tmp/subc.jsonc");
+        for bad in ["Perf", "a b", "perf.", ".perf", "gc..walk", "a=b"] {
+            let doc = format!(
+                r#"{{ "version": 1, "modules": {{ "m": {{ "program": "m", "log": {{ "tags": {{ "{bad}": "debug" }} }} }} }} }}"#
+            );
+            let err = parse_doc(&doc, path).expect_err(bad);
+            let text = format!("{err}");
+            assert!(
+                text.contains(&format!("{bad:?}")),
+                "must name the key: {text}"
+            );
+            assert!(
+                text.contains("logger name"),
+                "must say what a key is: {text}"
+            );
+        }
+        // Control: dotted, hyphenated, root-equal keys are all fine.
+        let ok = parse_doc(
+            r#"{ "version": 1, "modules": { "m": { "program": "m", "log": { "tags": { "perf": "debug", "gc.walk": "trace", "m": "error", "a-b": "info" } } } } }"#,
+            path,
+        );
+        assert!(ok.is_ok(), "{ok:?}");
+    }
+
+    #[test]
+    fn log_filter_spec_prefixes_bare_keys_with_the_module_and_passes_absolute_ones() {
+        let path = Path::new("/tmp/subc.jsonc");
+        let config = parse_doc(
+            r#"{ "version": 1, "modules": { "synapse": { "program": "s", "log": { "level": "warn", "tags": { "perf": "debug", "gc.walk": "trace", "synapse": "error", "other.x": "info" } } } } }"#,
+            path,
+        )
+        .unwrap();
+        let log = config.modules[0].log.as_ref().unwrap();
+        // BTreeMap order: gc.walk, other.x, perf, synapse.
+        assert_eq!(
+            log.filter_spec("synapse"),
+            "warn,gc.walk=trace,other.x=info,synapse.perf=debug,synapse=error"
+        );
+    }
+
+    #[test]
+    fn log_alarm_segment_mb_defaults_to_the_crate_default_and_refuses_zero() {
+        let path = Path::new("/tmp/subc.jsonc");
+        let config = parse_doc(
+            r#"{ "version": 1, "modules": { "m": { "program": "m", "log": { "level": "info" } } } }"#,
+            path,
+        )
+        .unwrap();
+        assert_eq!(
+            config.modules[0].log.as_ref().unwrap().alarm_segment_mb,
+            cortexkit_log::SegmentRetention::default().alarm_segment_mb
+        );
+        let err = parse_doc(
+            r#"{ "version": 1, "modules": { "m": { "program": "m", "log": { "alarm_segment_mb": 0 } } } }"#,
+            path,
+        )
+        .expect_err("zero alarm must refuse");
+        assert!(format!("{err}").contains("alarm_segment_mb"));
     }
 
     #[test]

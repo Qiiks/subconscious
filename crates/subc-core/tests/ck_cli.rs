@@ -1738,16 +1738,18 @@ async fn module_logs_merges_sources_by_timestamp_and_reports_real_filter_counts(
     let run_logs = data_home.join("cortexkit").join("run").join("logs");
     fs::create_dir_all(&module_logs).unwrap();
     fs::create_dir_all(&run_logs).unwrap();
+    // Fleet-logging r2 layout: ONE dated segment per module carries every lane
+    // (the module process and each harness plugin), told apart by the
+    // `harness=` bound field on the line rather than by file name. The
+    // daemon's own log is `subc.<date>.log` in the run directory. The stderr
+    // capture is raw child bytes and is deliberately not in the fleet format.
     fs::write(
-        module_logs.join(format!("{module_id}.log")),
+        module_logs.join(format!("{module_id}.2026-09-05.log")),
         format!(
-            "2026-09-05T10:00:00.000Z DEBUG {module_id} hidden debug\n2026-09-05T10:00:03.000Z INFO  {module_id} module line\n"
+            "2026-09-05T10:00:00.000Z DEBUG {module_id}: hidden debug\n\
+             2026-09-05T10:00:01.000Z INFO  {module_id}: [harness=opencode] plugin line\n\
+             2026-09-05T10:00:03.000Z INFO  {module_id}.perf: module line ms=7\n"
         ),
-    )
-    .unwrap();
-    fs::write(
-        module_logs.join(format!("{module_id}.opencode.log")),
-        format!("2026-09-05T10:00:01.000Z INFO  {module_id} plugin line\n"),
     )
     .unwrap();
     fs::write(
@@ -1756,9 +1758,10 @@ async fn module_logs_merges_sources_by_timestamp_and_reports_real_filter_counts(
     )
     .unwrap();
     fs::write(
-        run_logs.join("subc.log"),
+        run_logs.join("subc.2026-09-05.log"),
         format!(
-            "2026-09-05T10:00:02.000Z WARN  subc daemon line module_id={module_id}\n2026-09-05T10:00:05.000Z INFO  subc unrelated module_id=other\n"
+            "2026-09-05T10:00:02.000Z WARN  subc: daemon line module_id={module_id}\n\
+             2026-09-05T10:00:05.000Z INFO  subc: unrelated module_id=other\n"
         ),
     )
     .unwrap();
@@ -1786,15 +1789,17 @@ async fn module_logs_merges_sources_by_timestamp_and_reports_real_filter_counts(
     assert_eq!(
         text(&output.stdout),
         concat!(
-            "opencode     2026-09-05T10:00:01.000Z INFO  merged-logs plugin line\n",
-            "daemon       2026-09-05T10:00:02.000Z WARN  subc daemon line module_id=merged-logs\n",
-            "mod          2026-09-05T10:00:03.000Z INFO  merged-logs module line\n",
+            "mod          2026-09-05T10:00:01.000Z INFO  merged-logs: [harness=opencode] plugin line\n",
+            "daemon       2026-09-05T10:00:02.000Z WARN  subc: daemon line module_id=merged-logs\n",
+            "mod          2026-09-05T10:00:03.000Z INFO  merged-logs.perf: module line ms=7\n",
             "stderr       2026-09-05T10:00:04.000Z ERROR merged-logs captured line\n"
         )
     );
     assert_eq!(
         text(&output.stderr),
-        "showing 4 of 6 lines (1 below requested level, 1 daemon lines hidden)\n"
+        // The stderr capture line is raw child bytes, not fleet format, and the
+        // summary says so rather than counting it as if it had parsed.
+        "showing 4 of 6 lines (1 below requested level, 1 daemon lines hidden, 1 unparsed lines shown)\n"
     );
 }
 

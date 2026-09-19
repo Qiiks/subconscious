@@ -22,7 +22,7 @@ use std::{
 };
 
 use cortexkit_log::{
-    parse_line as parse_log_line, Config as FleetLogConfig, Lane as FleetLane, ParsedLevel,
+    parse_line as parse_log_line, segment_day, Config as FleetLogConfig, ParsedLevel,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1461,9 +1461,15 @@ async fn module_logs(
 
     let sources = discover_log_sources(module_id, true)?;
     let (mut entries, counts) = collect_log_entries(module_id, &sources, options)?;
+    // Undated lines (the stderr capture is raw child bytes and need not carry a
+    // fleet timestamp) sort AFTER every dated line: `Option`'s natural order
+    // puts `None` first, which would render a module's crash stderr above
+    // yesterday's daemon lines. Within the undated tail, source order holds.
     entries.sort_by(|left, right| {
         left.timestamp
-            .cmp(&right.timestamp)
+            .is_none()
+            .cmp(&right.timestamp.is_none())
+            .then_with(|| left.timestamp.cmp(&right.timestamp))
             .then_with(|| left.lane.cmp(&right.lane))
             .then_with(|| left.source_order.cmp(&right.source_order))
     });
@@ -1538,7 +1544,7 @@ fn last_log_timestamp(path: &Path) -> String {
 }
 
 fn discover_log_sources(module_id: &str, include_rotated: bool) -> Result<Vec<LogSource>, CkError> {
-    let module_logs = FleetLogConfig::for_module(module_id, FleetLane::Module).logs_dir;
+    let module_logs = FleetLogConfig::for_module(module_id).logs_dir;
     let run_logs = subc_daemon::daemon_config::daemon_run_dir().join("logs");
     let mut sources = Vec::new();
     collect_sources_in_dir(
@@ -1596,27 +1602,37 @@ fn collect_sources_in_dir(
         } else {
             name.rsplit_once('.').map_or(name, |(base, _)| base)
         };
-        let (lane, daemon) = if daemon_directory && base == "subc.log" {
-            ("daemon".to_string(), true)
-        } else if daemon_directory && base == format!("{module_id}.stderr.log") {
-            ("stderr".to_string(), false)
-        } else if !daemon_directory && base == format!("{module_id}.log") {
-            ("mod".to_string(), false)
-        } else if !daemon_directory {
-            let prefix = format!("{module_id}.");
-            let Some(harness) = base
-                .strip_prefix(&prefix)
-                .and_then(|value| value.strip_suffix(".log"))
-            else {
+        // Under fleet-logging r2 a module's log is `<id>.<YYYY-MM-DD>.log` and
+        // every lane (module process, each harness plugin) writes the same
+        // segment, distinguished by the `harness=` bound field on the line, so
+        // a segment is lane "mod" regardless of who wrote it. The daemon's own
+        // log is `subc.<date>.log` in the run directory. The r1 shapes
+        // (`<id>.log`, `<id>.<harness>.log`, `subc.log`) stay readable so a
+        // host mid-migration does not lose its history from this verb.
+        let (lane, daemon) =
+            if daemon_directory && (base == "subc.log" || segment_day("subc", base).is_some()) {
+                ("daemon".to_string(), true)
+            } else if daemon_directory && base == format!("{module_id}.stderr.log") {
+                ("stderr".to_string(), false)
+            } else if !daemon_directory
+                && (base == format!("{module_id}.log") || segment_day(module_id, base).is_some())
+            {
+                ("mod".to_string(), false)
+            } else if !daemon_directory {
+                let prefix = format!("{module_id}.");
+                let Some(harness) = base
+                    .strip_prefix(&prefix)
+                    .and_then(|value| value.strip_suffix(".log"))
+                else {
+                    continue;
+                };
+                if harness.is_empty() {
+                    continue;
+                }
+                (harness.to_string(), false)
+            } else {
                 continue;
             };
-            if harness.is_empty() {
-                continue;
-            }
-            (harness.to_string(), false)
-        } else {
-            continue;
-        };
         output.push(LogSource { lane, path, daemon });
     }
     Ok(())
@@ -1693,10 +1709,14 @@ fn collect_log_text(
                 counts.below_level += 1;
                 continue;
             }
+            // `--tag` predates the logger hierarchy and is kept as the operator
+            // surface: under r2 it names a COMPONENT, i.e. the logger with the
+            // module root stripped (`synapse.perf` -> `perf`), matched as a
+            // dotted prefix so `--tag gc` also shows `gc.walk`.
             if options
                 .tag
                 .as_deref()
-                .is_some_and(|tag| parsed.tag != Some(tag))
+                .is_some_and(|tag| !logger_component_matches(parsed.logger, tag))
             {
                 counts.wrong_tag += 1;
                 continue;
@@ -1713,10 +1733,29 @@ fn collect_log_text(
             line: line.to_string(),
             timestamp: parsed.as_ref().map(|parsed| parsed.timestamp),
             level: parsed.as_ref().map(|parsed| parsed.level),
-            tag: parsed.and_then(|parsed| parsed.tag.map(str::to_string)),
+            tag: parsed.and_then(|parsed| logger_component(parsed.logger).map(str::to_string)),
             source_order: *source_order,
         });
         *source_order += 1;
+    }
+}
+
+/// The logger name with its module root removed: `synapse.perf` -> `Some("perf")`,
+/// `synapse` -> `None`. This is what the JSON `tag` field carries under r2 so a
+/// reader that keyed on r1's `tag=perf` sees the same value for the same intent.
+fn logger_component(logger: &str) -> Option<&str> {
+    logger.split_once('.').map(|(_, component)| component)
+}
+
+fn logger_component_matches(logger: &str, requested: &str) -> bool {
+    match logger_component(logger) {
+        Some(component) => {
+            component == requested
+                || component
+                    .strip_prefix(requested)
+                    .is_some_and(|rest| rest.starts_with('.'))
+        }
+        None => false,
     }
 }
 

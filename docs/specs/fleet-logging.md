@@ -58,9 +58,9 @@ sentence in a spec.
 ```
 
 ```
-2026-09-19T04:46:29.432Z INFO  magic-context.historian: [harness=pi session=01a0b7fc-bba1-7f60-aa2b-27c2df4481ab] trigger fired reason=force_band usage=93.9%
-2026-09-19T04:46:29.449Z INFO  magic-context.transform: [harness=opencode session=ses_0758f6ce7ffeJ0A9sV8Qvema7d] transform completed ms=24.3 messages=25 targets=23
-2026-09-19T04:46:29.209Z DEBUG magic-context.perf: [harness=pi session=01a0b7fc-bba1-7f60-aa2b-27c2df4481ab] transform stage stage=stickyReplayDecisions ms=0.0
+2026-09-19T04:46:29.432Z INFO  magic-context.historian: [harness=pi session=pi:01a0b7fc-bba1-7f60-aa2b-27c2df4481ab] trigger fired reason=force_band usage=93.9%
+2026-09-19T04:46:29.449Z INFO  magic-context.transform: [harness=opencode session=opencode:ses_0758f6ce7ffeJ0A9sV8Qvema7d] transform completed ms=24.3 messages=25 targets=23
+2026-09-19T04:46:29.209Z DEBUG magic-context.perf: [harness=pi session=pi:01a0b7fc-bba1-7f60-aa2b-27c2df4481ab] transform stage stage=stickyReplayDecisions ms=0.0
 2026-09-19T07:59:01.882Z ERROR engram.scheduler: capture halted after 3 consecutive failures gen=192 class=dedup_map_unreadable
 2026-09-19T07:59:03.501Z DEBUG synapse.perf: job done model=qwen3-0.6b lane=decode tokens=12 ms=118
 2026-09-19T07:58:59.004Z WARN  aft.index: [root=/Work/CortexKit/prefrontal] build fell back to full projection reason=journal_gap ms=4288

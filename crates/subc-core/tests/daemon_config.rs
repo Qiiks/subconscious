@@ -116,7 +116,7 @@ async fn configured_ck_log_is_present_in_the_spawned_child_and_unconfigured_is_a
                 "configured-log": {
                     "program": program,
                     "env": { "LOG_CHILD_ENV_PATH": configured_env },
-                    "log": { "level": "warn", "tags": { "perf": "debug" } }
+                    "log": { "level": "warn", "tags": { "perf": "debug", "gc.walk": "trace", "configured-log": "error" }, "max_age_days": 3, "alarm_segment_mb": 64 }
                 },
                 "absent-log": {
                     "program": program,
@@ -142,11 +142,20 @@ async fn configured_ck_log_is_present_in_the_spawned_child_and_unconfigured_is_a
     while (!configured_env.exists() || !absent_env.exists()) && Instant::now() < deadline {
         sleep(Duration::from_millis(10)).await;
     }
+    // A dotless key is a component of THIS module (`perf` -> `configured-log.perf`);
+    // a dotted key and the module's own id pass through verbatim. BTreeMap
+    // order: "configured-log" < "gc.walk" < "perf".
     assert_eq!(
         fs::read_to_string(configured_env).unwrap(),
-        "present:warn,perf=debug"
+        "present:warn,configured-log=error,gc.walk=trace,configured-log.perf=debug\n\
+         present:3\n\
+         present:64"
     );
-    assert_eq!(fs::read_to_string(absent_env).unwrap(), "absent");
+    // No log block: nothing is injected, not defaults -- absence must mean absence.
+    assert_eq!(
+        fs::read_to_string(absent_env).unwrap(),
+        "absent\nabsent\nabsent"
+    );
     drop(modules);
 }
 

@@ -39,9 +39,17 @@ fn main() {
     }
 
     if let Some(path) = env::var_os("LOG_CHILD_ENV_PATH").map(PathBuf::from) {
-        let ck_log = env::var("CK_LOG").ok();
-        let observation =
-            ck_log.map_or_else(|| "absent".to_string(), |value| format!("present:{value}"));
+        // One line per knob the daemon owes the child, so a test can assert each
+        // by name and an absent one reads as "absent" rather than as nothing.
+        let knob = |name: &str| {
+            env::var(name).map_or_else(|_| "absent".to_string(), |value| format!("present:{value}"))
+        };
+        let observation = format!(
+            "{}\n{}\n{}",
+            knob("CK_LOG"),
+            knob("CK_LOG_MAX_AGE_DAYS"),
+            knob("CK_LOG_ALARM_SEGMENT_MB")
+        );
 
         // WRITE-THEN-RENAME, so a reader sees either NO FILE or the COMPLETE
         // one. `fs::write` creates the file and then fills it, and a reader

@@ -2,7 +2,7 @@
 
 use std::{path::PathBuf, process};
 
-use cortexkit_log::{Config, Lane, Retention};
+use cortexkit_log::{Config, SegmentRetention};
 
 #[tokio::main]
 async fn main() {
@@ -103,17 +103,24 @@ fn init_tracing() -> Result<(), cortexkit_log::InitError> {
     install_tracing(daemon_logger_config(logs_dir, logging.as_ref()))
 }
 
+// The daemon logs as module `subc` into `run/logs/subc.<YYYY-MM-DD>.log`, the
+// same r2 segment shape every module writes, so `ck module logs` and any
+// tail-by-date reader treat it like the rest of the fleet. `run/logs/` is not
+// a module data directory, which is why the path is assembled here rather than
+// through `Config::for_module`.
 fn daemon_logger_config(
     logs_dir: PathBuf,
     logging: Option<&subc_daemon::daemon_config::LoggingConfig>,
 ) -> Config {
-    let path = logs_dir.join("subc.log");
     Config {
         module_id: "subc".to_string(),
         logs_dir,
-        lane: Lane::Custom(path),
-        spec: logging.map(subc_daemon::daemon_config::LoggingConfig::filter_spec),
-        retention: logging.map_or_else(Retention::default, |config| config.retention),
+        bound: Vec::new(),
+        spec: logging.map(|config| config.filter_spec("subc")),
+        retention: logging.map_or_else(
+            SegmentRetention::default,
+            subc_daemon::daemon_config::LoggingConfig::segment_retention,
+        ),
         redactor: None,
         clock: None,
     }
@@ -121,8 +128,8 @@ fn daemon_logger_config(
 
 fn install_tracing(config: Config) -> Result<(), cortexkit_log::InitError> {
     // cortexkit-log owns one process-global file sink and does not expose a
-    // cheap tee layer. The daemon therefore writes directly to subc.log only;
-    // stdout is intentionally not a second logging destination.
+    // cheap tee layer. The daemon therefore writes directly to its dated
+    // segment only; stdout is intentionally not a second logging destination.
     cortexkit_log::init(config).map(|_| ())
 }
 
@@ -158,14 +165,15 @@ mod tests {
             arrived = 2_u64,
             "poll changed"
         );
-        let line = fs::read_to_string(logs_dir.join("subc.log")).unwrap();
+        // The clock is pinned to 2026-09-05, so the segment is that day's.
+        let line = fs::read_to_string(logs_dir.join("fusiform.2026-09-05.log")).unwrap();
         let fixture: serde_json::Value =
             serde_json::from_str(include_str!("../tests/fixtures/log_format_golden.json")).unwrap();
         let expected = fixture["cases"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|case| case["name"] == "plain-info-no-session")
+            .find(|case| case["name"] == "plain-info-no-bound")
             .unwrap()["line"]
             .as_str()
             .unwrap();
