@@ -76,6 +76,8 @@ jobs:
       # Mint an app token so commenting and draft conversion work on fork PRs.
       # The default GITHUB_TOKEN on fork pull_request runs was read-only;
       # pull_request_target grants access to repo secrets so we mint an app token.
+      #
+      # The app token does NOT publish the check run: see the gate step below.
       - name: Mint gate token
         id: app_token
         uses: actions/create-github-app-token@v1
@@ -83,11 +85,23 @@ jobs:
           app-id: ${{ secrets.CK_CI_APP_ID }}
           private-key: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
 
+      # Two tokens, split by what must not fail. Publishing the `design-gate`
+      # check run is the gate's output as branch protection reads it, so it
+      # runs on this job's own GITHUB_TOKEN with the `checks: write` granted
+      # above: a token this file grants and every caller can see. Routing it
+      # through the app token instead would make blocking depend on the app
+      # installation carrying `checks: write` in every adopting repository —
+      # a precondition outside the workflow, and one that needs the app's own
+      # JWT to read back, so nobody here could tell whether it held.
+      #
+      # The app token keeps the comment and the draft conversion, which is
+      # what it was minted for.
       - name: Evaluate the design gate
         uses: cortexkit/subconscious/.github/actions/design-gate@master
         with:
           mode: pull-request
           github-token: ${{ steps.app_token.outputs.token }}
+          check-token: ${{ secrets.GITHUB_TOKEN }}
 
   # Marking a pull request ready with GITHUB_TOKEN does not start another
   # workflow run, so this job re-runs the gate logic itself and publishes the
@@ -103,8 +117,11 @@ jobs:
       pull-requests: write # mark waiting drafts ready for review
       checks: write # publish the design-gate check run on the PR head
     steps:
+      # This arm runs on an `issues` event, where GITHUB_TOKEN can already do
+      # everything the gate needs, so both tokens are the same one here.
       - name: Release pull requests waiting on this issue
         uses: cortexkit/subconscious/.github/actions/design-gate@master
         with:
           mode: issue-labeled
           github-token: ${{ secrets.GITHUB_TOKEN }}
+          check-token: ${{ secrets.GITHUB_TOKEN }}

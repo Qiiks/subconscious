@@ -10,7 +10,11 @@
  *
  * Parsing and decision logic live in this script rather than inline in the
  * workflow so they can be unit tested with no network (design-gate.test.mjs).
- * The workflow only supplies the event payload and a token.
+ * The workflow only supplies the event payload and the tokens.
+ *
+ * Two tokens, and which call uses which is the point: the `design-gate` check
+ * run goes out on the workflow's own GITHUB_TOKEN (CHECK_TOKEN), everything
+ * else on the app token (GITHUB_TOKEN). See `runPullRequestGate`.
  *
  * Usage:
  *   node scripts/design-gate.mjs pull-request   # decide, comment, exit 0/1
@@ -264,9 +268,19 @@ async function syncComment({ api, pullRequest, decision, draftConverted = false 
  * caller's job id into the branch-protection contract. A sha that never
  * receives this check run is blocked with nothing in the run list to explain
  * it, so a refused publish has to be loud.
+ *
+ * That is why the check run goes out on `checkApi` and nothing else does.
+ * `checkApi` is built from the workflow's own token, which the calling job
+ * grants `checks: write` in a file anyone can read; `api` is built from an
+ * app token, whose installation permissions can only be read back with the
+ * app's own credentials. The step that decides whether a pull request is
+ * blocked must not depend on a permission nobody running the gate can check.
+ * Both clients are passed in rather than chosen here, so this function stays
+ * free of tokens: the split lives at the edge, in `main`.
  */
 export async function runPullRequestGate({
   api,
+  checkApi,
   repoFullName,
   pullRequest,
   action = "opened",
@@ -288,7 +302,7 @@ export async function runPullRequestGate({
   // reads in the gate comment on the pull request. A check run that concluded
   // differently from the comment would tell the contributor the gate passed
   // while the comment told them it blocked, which is worse than no check run.
-  await api.createCheckRun({
+  await checkApi.createCheckRun({
     headSha: pullRequest.headSha,
     conclusion: decision.conclusion,
     title: decision.title,
@@ -313,8 +327,13 @@ export async function runPullRequestGate({
  * Marking a PR ready with GITHUB_TOKEN does not start another workflow run, so
  * this arm also publishes the `design-gate` check run itself. Without that the
  * required check would stay red until the author pushed a commit.
+ *
+ * The check run goes out on `checkApi` here too, for the same reason it does
+ * in `runPullRequestGate`: one rule for where the required check comes from,
+ * rather than one per arm. On this arm both clients happen to carry the same
+ * token, because an `issues` event needs no app token at all.
  */
-export async function runIssueLabeled({ api, repoFullName, issue, log = console }) {
+export async function runIssueLabeled({ api, checkApi, repoFullName, issue, log = console }) {
   const search = api.searchOpenPullRequests
     ? (number) => api.searchOpenPullRequests(number)
     : (number) => api.searchDraftPullRequests(number);
@@ -341,7 +360,7 @@ export async function runIssueLabeled({ api, repoFullName, issue, log = console 
       await api.markPullRequestReadyForReview(pullRequest.nodeId);
       released.push(number);
     }
-    await api.createCheckRun({
+    await checkApi.createCheckRun({
       headSha: pullRequest.headSha,
       conclusion: "success",
       title: decision.title,
@@ -507,12 +526,22 @@ async function main(argv) {
   const mode = argv[0];
   const repoFullName = requireEnv("GITHUB_REPOSITORY");
   const event = JSON.parse(readFileSync(requireEnv("GITHUB_EVENT_PATH"), "utf8"));
+  // One client per token, built here and nowhere else, so the rest of the
+  // script never sees a token. `api` carries the app token: the comment, the
+  // draft conversion and the ready-for-review go out on it. `checkApi`
+  // carries the calling job's own GITHUB_TOKEN and publishes the check run
+  // branch protection reads, so that the blocking path needs no permission
+  // from outside the workflow. Both are required: a missing one throws here,
+  // before any decision is made, rather than quietly sending the check run
+  // out on whichever token happened to be set.
   const api = createGitHubApi({ token: requireEnv("GITHUB_TOKEN"), repoFullName });
+  const checkApi = createGitHubApi({ token: requireEnv("CHECK_TOKEN"), repoFullName });
 
   if (mode === "pull-request") {
     const pullRequest = normalizePullRequest(event.pull_request);
     const result = await runPullRequestGate({
       api,
+      checkApi,
       repoFullName,
       pullRequest,
       action: event.action,
@@ -530,7 +559,12 @@ async function main(argv) {
 
   if (mode === "issue-labeled") {
     const issue = normalizeIssue(event.issue);
-    const { released, updated = [] } = await runIssueLabeled({ api, repoFullName, issue });
+    const { released, updated = [] } = await runIssueLabeled({
+      api,
+      checkApi,
+      repoFullName,
+      issue,
+    });
     const parts = [];
     if (released.length) {
       parts.push(

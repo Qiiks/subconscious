@@ -49,6 +49,13 @@ function pullRequest(overrides = {}) {
  * In-memory stand-in for the REST + GraphQL calls the gate makes. `refuse`
  * names methods that should throw, which is how a fork pull request's
  * read-only token behaves.
+ *
+ * Two clients come back, because the gate is handed two: `api` stands for the
+ * app token, which posts the comment and converts to draft, and `checkApi`
+ * for the calling job's own GITHUB_TOKEN, which publishes the required check
+ * run. They share one state, and every recorded check run carries a `via`
+ * naming the client that published it, so an arm can assert which token the
+ * check went out on rather than only that some check was published.
  */
 function createFixtureApi({ issues = [], pullRequests = [], comments = [], refuse = [] } = {}) {
   const state = {
@@ -112,12 +119,21 @@ function createFixtureApi({ issues = [], pullRequests = [], comments = [], refus
     },
     async createCheckRun(run) {
       guard("createCheckRun");
-      state.checkRuns.push(run);
+      state.checkRuns.push({ ...run, via: "app" });
       return run;
     },
   };
 
-  return { api, state };
+  const checkApi = {
+    ...api,
+    async createCheckRun(run) {
+      guard("createCheckRun");
+      state.checkRuns.push({ ...run, via: "check" });
+      return run;
+    },
+  };
+
+  return { api, checkApi, state };
 }
 
 const silentLog = { warn() {}, log() {} };
@@ -331,11 +347,12 @@ describe("contributor-facing text", () => {
 
 describe("runPullRequestGate", () => {
   test("comments once and edits that same comment on later runs", async () => {
-    const { api, state } = createFixtureApi();
+    const { api, checkApi, state } = createFixtureApi();
     const pr = pullRequest({ body: "No issue here" });
 
     const first = await runPullRequestGate({
       api,
+      checkApi,
       repoFullName: REPO,
       pullRequest: pr,
       log: silentLog,
@@ -354,6 +371,7 @@ describe("runPullRequestGate", () => {
     // edits the comment it already has rather than opening a second one.
     const second = await runPullRequestGate({
       api,
+      checkApi,
       repoFullName: REPO,
       pullRequest: pr,
       action: "synchronize",
@@ -366,6 +384,7 @@ describe("runPullRequestGate", () => {
 
     const third = await runPullRequestGate({
       api,
+      checkApi,
       repoFullName: REPO,
       pullRequest: pr,
       action: "synchronize",
@@ -378,13 +397,14 @@ describe("runPullRequestGate", () => {
 
   test("ready_for_review on a blocked PR converts it back to draft and says so", async () => {
     const pr = pullRequest({ body: "Closes #42" });
-    const { api, state } = createFixtureApi({
+    const { api, checkApi, state } = createFixtureApi({
       issues: [{ number: 42, state: "open", labels: [] }],
       pullRequests: [pr],
     });
 
     const result = await runPullRequestGate({
       api,
+      checkApi,
       repoFullName: REPO,
       pullRequest: pr,
       action: "ready_for_review",
@@ -403,13 +423,14 @@ describe("runPullRequestGate", () => {
 
   test("a refused draft conversion still fails the gate", async () => {
     const pr = pullRequest({ body: "" });
-    const { api, state } = createFixtureApi({
+    const { api, checkApi, state } = createFixtureApi({
       pullRequests: [pr],
       refuse: ["convertPullRequestToDraft", "listComments", "createComment"],
     });
 
     const result = await runPullRequestGate({
       api,
+      checkApi,
       repoFullName: REPO,
       pullRequest: pr,
       action: "ready_for_review",
@@ -430,10 +451,11 @@ describe("runPullRequestGate", () => {
   // through.
   test("publishes the required check run as a failure when the gate blocks", async () => {
     const pr = pullRequest({ body: "No issue here" });
-    const { api, state } = createFixtureApi({ pullRequests: [pr] });
+    const { api, checkApi, state } = createFixtureApi({ pullRequests: [pr] });
 
     const result = await runPullRequestGate({
       api,
+      checkApi,
       repoFullName: REPO,
       pullRequest: pr,
       log: silentLog,
@@ -448,13 +470,14 @@ describe("runPullRequestGate", () => {
 
   test("publishes the required check run as a success when the gate passes", async () => {
     const pr = pullRequest({ body: "Closes #42" });
-    const { api, state } = createFixtureApi({
+    const { api, checkApi, state } = createFixtureApi({
       issues: [{ number: 42, state: "open", labels: ["design-approved"] }],
       pullRequests: [pr],
     });
 
     const result = await runPullRequestGate({
       api,
+      checkApi,
       repoFullName: REPO,
       pullRequest: pr,
       log: silentLog,
@@ -464,6 +487,33 @@ describe("runPullRequestGate", () => {
     assert.equal(state.checkRuns.length, 1);
     assert.equal(state.checkRuns[0].conclusion, "success");
     assert.equal(state.checkRuns[0].headSha, pr.headSha);
+  });
+
+  // Which token publishes the check run is the difference between a gate that
+  // blocks on its own and one that blocks only while an App installation
+  // happens to carry `checks: write` in this repository. Nothing in a run can
+  // read an App's permissions back — that needs the App's own credentials —
+  // so a fail-closed path must not rest on one. The required check therefore
+  // goes out on the check client, built from the calling job's GITHUB_TOKEN,
+  // and the App client is left with the comment and the draft conversion.
+  test("publishes the required check run on the check client, not the App client", async () => {
+    const pr = pullRequest({ body: "No issue here" });
+    const { api, checkApi, state } = createFixtureApi({ pullRequests: [pr] });
+
+    const result = await runPullRequestGate({
+      api,
+      checkApi,
+      repoFullName: REPO,
+      pullRequest: pr,
+      log: silentLog,
+    });
+
+    assert.equal(result.conclusion, "failure");
+    assert.deepEqual(
+      state.checkRuns.map((run) => run.via),
+      ["check"],
+      "the design-gate check run must be published with the check token",
+    );
   });
 
   // The name is the contract with branch protection, and it has to come from
@@ -502,11 +552,12 @@ describe("runPullRequestGate", () => {
   });
 
   test("passing gate leaves a clean PR without a comment", async () => {
-    const { api, state } = createFixtureApi({
+    const { api, checkApi, state } = createFixtureApi({
       issues: [{ number: 42, state: "open", labels: ["design-approved"] }],
     });
     const result = await runPullRequestGate({
       api,
+      checkApi,
       repoFullName: REPO,
       pullRequest: pullRequest({ body: "Closes #42" }),
       log: silentLog,
@@ -516,12 +567,13 @@ describe("runPullRequestGate", () => {
   });
 
   test("passing gate closes out an existing blocking comment", async () => {
-    const { api, state } = createFixtureApi({
+    const { api, checkApi, state } = createFixtureApi({
       issues: [{ number: 42, state: "open", labels: ["design-approved"] }],
       comments: [{ id: 7, issueNumber: 100, body: `${COMMENT_MARKER}\n\n${GATE_MESSAGE}` }],
     });
     const result = await runPullRequestGate({
       api,
+      checkApi,
       repoFullName: REPO,
       pullRequest: pullRequest({ body: "Closes #42" }),
       log: silentLog,
@@ -533,9 +585,10 @@ describe("runPullRequestGate", () => {
   });
 
   test("maintainer train branches skip without any API call", async () => {
-    const { api, state } = createFixtureApi();
+    const { api, checkApi, state } = createFixtureApi();
     const result = await runPullRequestGate({
       api,
+      checkApi,
       repoFullName: REPO,
       pullRequest: pullRequest({ headRepoFullName: REPO, headRef: "train/v0.56", body: "" }),
       log: silentLog,
@@ -557,7 +610,7 @@ describe("runIssueLabeled", () => {
       body: "Closes #42",
       headSha: "b".repeat(40),
     });
-    const { api, state } = createFixtureApi({
+    const { api, checkApi, state } = createFixtureApi({
       issues: [labelled],
       pullRequests: [waiting],
       comments: [{ id: 3, issueNumber: 101, body: `${COMMENT_MARKER}\n\n${GATE_MESSAGE}` }],
@@ -565,6 +618,7 @@ describe("runIssueLabeled", () => {
 
     const { released } = await runIssueLabeled({
       api,
+      checkApi,
       repoFullName: REPO,
       issue: labelled,
       log: silentLog,
@@ -586,10 +640,11 @@ describe("runIssueLabeled", () => {
       isDraft: true,
       body: "Follows the discussion in #42 but closes nothing",
     });
-    const { api, state } = createFixtureApi({ issues: [labelled], pullRequests: [mention] });
+    const { api, checkApi, state } = createFixtureApi({ issues: [labelled], pullRequests: [mention] });
 
     const { released } = await runIssueLabeled({
       api,
+      checkApi,
       repoFullName: REPO,
       issue: labelled,
       log: silentLog,
@@ -609,10 +664,11 @@ describe("runIssueLabeled", () => {
       // though the closing keyword points elsewhere.
       body: "Closes #7, part of the same effort as #42",
     });
-    const { api, state } = createFixtureApi({ issues: [labelled], pullRequests: [other] });
+    const { api, checkApi, state } = createFixtureApi({ issues: [labelled], pullRequests: [other] });
 
     const { released } = await runIssueLabeled({
       api,
+      checkApi,
       repoFullName: REPO,
       issue: labelled,
       log: silentLog,
@@ -630,7 +686,7 @@ describe("runIssueLabeled", () => {
       body: "Closes #42",
       headSha: "c".repeat(40),
     });
-    const { api, state } = createFixtureApi({
+    const { api, checkApi, state } = createFixtureApi({
       issues: [labelled],
       pullRequests: [ready],
       comments: [{ id: 5, issueNumber: 104, body: `${COMMENT_MARKER}\n\n${GATE_MESSAGE}` }],
@@ -638,6 +694,7 @@ describe("runIssueLabeled", () => {
 
     const { released, updated } = await runIssueLabeled({
       api,
+      checkApi,
       repoFullName: REPO,
       issue: labelled,
       log: silentLog,
@@ -660,10 +717,11 @@ describe("runIssueLabeled", () => {
       isDraft: false,
       body: "Closes #42",
     });
-    const { api, state } = createFixtureApi({ issues: [labelled], pullRequests: [closed] });
+    const { api, checkApi, state } = createFixtureApi({ issues: [labelled], pullRequests: [closed] });
 
     const { released, updated } = await runIssueLabeled({
       api,
+      checkApi,
       repoFullName: REPO,
       issue: labelled,
       log: silentLog,
@@ -885,7 +943,14 @@ describe("workflow security properties", () => {
     assert.equal(invokesGit("cd /tmp && git checkout $REF"), true);
   });
 
-  test("pull-request job uses the App token step output instead of secrets.GITHUB_TOKEN", () => {
+  // This arm used to read "the gate step must not mention secrets.GITHUB_TOKEN
+  // at all", which was the right claim while the step took one token. It now
+  // takes two, and the whole point of the second one is that it IS
+  // secrets.GITHUB_TOKEN, so the claim is made per input instead: the app
+  // token still does the writes that need it, and the required check run is
+  // published with the calling job's own token so that blocking a pull
+  // request depends on nothing outside this workflow.
+  test("pull-request job gives the App token to github-token and GITHUB_TOKEN to check-token", () => {
     const workflowYaml = gateFileYaml(GATE_FILES[0]);
 
     // Isolate the pull-request job (design-gate)
@@ -915,15 +980,51 @@ describe("workflow security properties", () => {
       `pull-request job must run the gate in pull-request mode (found: ${gateStep})`,
     );
 
+    const githubTokenValue = gateStep.match(/github-token:\s*(.+)/)?.[1] ?? "";
+    const checkTokenValue = gateStep.match(/check-token:\s*(.+)/)?.[1] ?? "";
+
     assert.ok(
-      !gateStep.includes("secrets.GITHUB_TOKEN"),
-      "pull-request job must not use secrets.GITHUB_TOKEN",
+      !githubTokenValue.includes("secrets.GITHUB_TOKEN"),
+      `the comment and draft conversion must run on the App token (found: ${githubTokenValue})`,
     );
 
     const expectedOutput = `steps.${appTokenId}.outputs.token`;
     assert.ok(
-      gateStep.includes(expectedOutput),
-      `pull-request job token must reference ${expectedOutput} (found: ${gateStep})`,
+      githubTokenValue.includes(expectedOutput),
+      `github-token must reference ${expectedOutput} (found: ${githubTokenValue})`,
+    );
+
+    assert.ok(
+      checkTokenValue.includes("secrets.GITHUB_TOKEN"),
+      `the check run must be published with the job's own GITHUB_TOKEN (found: ${checkTokenValue})`,
+    );
+  });
+
+  // The workflow can hand over the right token and the action can still drop
+  // it. This pins the other half of the wiring: the input exists, is required
+  // so a caller cannot leave it out, and reaches the script as CHECK_TOKEN.
+  test("the composite action requires check-token and passes it to the script", () => {
+    const actionYaml = gateFileYaml(GATE_FILES[1]);
+
+    const checkTokenInput = actionYaml.match(
+      /\n  check-token:\n([\s\S]*?)(?=\n  [a-zA-Z0-9-]+:\n|\nruns:)/,
+    );
+    assert.ok(checkTokenInput, "the gate action must declare a check-token input");
+    assert.match(
+      checkTokenInput[1],
+      /required:\s*true/,
+      "check-token must be required, or a caller can omit the token the check run needs",
+    );
+
+    assert.match(
+      actionYaml,
+      /CHECK_TOKEN:\s*\$\{\{\s*inputs\.check-token\s*\}\}/,
+      "the gate step must receive check-token as CHECK_TOKEN",
+    );
+    assert.match(
+      actionYaml,
+      /GITHUB_TOKEN:\s*\$\{\{\s*inputs\.github-token\s*\}\}/,
+      "the gate step must still receive github-token as GITHUB_TOKEN",
     );
   });
 });

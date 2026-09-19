@@ -26,8 +26,13 @@ when the head branch is in the repository itself, so a fork cannot buy a bypass
 by naming its branch after a maintainer one. They are path prefixes rather than
 substrings: a branch simply named `train` is an ordinary branch.
 
-It runs on `pull_request_target` with a CK CI App token, so it works on fork
-pull requests, where the default token is read-only.
+It runs on `pull_request_target`, so it has the base repository's context and
+its secrets. Two tokens do the work. A CK CI App token posts the comment and
+converts the pull request back to draft, which is what makes those writes work
+on a fork pull request. The `design-gate` check run — the one output branch
+protection actually reads — is published with the calling job's own
+`GITHUB_TOKEN`, so the path that decides whether a pull request is blocked
+depends on nothing but the workflow itself.
 
 ## What a repository adds
 
@@ -46,6 +51,11 @@ on:
 
 jobs:
   design-gate:
+    permissions:
+      contents: read # fetch the gate action
+      issues: read # read the linked issue's labels
+      pull-requests: write # gate comment, draft conversion, ready for review
+      checks: write # publish the design-gate check run
     uses: cortexkit/subconscious/.github/workflows/design-gate.yml@master
     secrets:
       CK_CI_APP_ID: ${{ secrets.CK_CI_APP_ID }}
@@ -57,6 +67,16 @@ Both trigger blocks are required: `pull_request_target` evaluates pull
 requests, and `issues: labeled` is what releases the drafts waiting on an issue
 when a maintainer approves it. A caller that declares only the first gets a
 gate that blocks and never unblocks.
+
+The `permissions:` block is an obligation rather than a knob, and `checks:
+write` is the half worth understanding. The gate publishes the `design-gate`
+check run with the calling job's own `GITHUB_TOKEN`, so that the blocking path
+needs no permission from outside the workflow — but a called workflow can only
+narrow the scopes its caller grants, never widen them, and a repository whose
+default workflow permissions are read-only grants none of them by default.
+Withhold `checks: write` and the publish is refused; the gate fails closed, so
+every pull request stays blocked. Copy all four lines: naming any permission
+sets every unnamed one to `none`.
 
 Nothing else is configurable, and that is deliberate. The decision of which
 event arm runs lives inside the reusable workflow rather than in an `if:` in
@@ -75,8 +95,14 @@ that forgets one fails when the workflow is parsed rather than part-way through
 the run at the token mint step. That is why the template passes them explicitly
 instead of using `secrets: inherit`.
 
-The app needs issue read, pull request write, and checks write on the adopting
-repository.
+The app needs issue read and pull request write on the adopting repository. It
+does not need checks write: the check run is published with the caller's own
+`GITHUB_TOKEN`, not with the app token. That split is deliberate. A run can
+read the permissions a workflow grants — they are in the file above — but
+nothing in a run can read an app installation's permissions back, because that
+query needs the app's own credentials. Leaving the fail-closed publish on the
+app token would have made every pull request's mergeability depend on a
+setting nobody at the keyboard could check.
 
 ### 3. The two labels
 
@@ -168,8 +194,8 @@ against both files that actually run the gate.
 node --test scripts/design-gate.test.mjs
 ```
 
-**The suite is 85 arms.** That number is pinned here on purpose: a lift that
-reports anything other than `# tests 85` has a setup defect before it has a
+**The suite is 87 arms.** That number is pinned here on purpose: a lift that
+reports anything other than `# tests 87` has a setup defect before it has a
 gate. The security arms read the workflow and the action from disk, and a
 missing file reports as a named failure — `workflow file missing at <path>` —
 rather than as arms that quietly fail to register.

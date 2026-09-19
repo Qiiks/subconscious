@@ -32,7 +32,18 @@ inputs:
   github-token:
     description: >-
       Token the gate reads the linked issue with, and posts the gate comment,
-      draft conversion, ready-for-review and check run with.
+      the draft conversion and the ready-for-review with. The pull-request
+      caller mints an app token for this, so those writes work on fork pull
+      requests.
+    required: true
+  check-token:
+    description: >-
+      Token the `design-gate` check run is published with. Pass the calling
+      job's own `GITHUB_TOKEN`, from a job that grants `checks: write`.
+      Publishing the check is the one step that must not fail, because branch
+      protection reads it, so it runs on the token the workflow can see and
+      grant rather than on an app installation whose permissions nothing in
+      the run can read back.
     required: true
 
 runs:
@@ -50,3 +61,4 @@ runs:
       env:
         DESIGN_GATE_MODE: ${{ inputs.mode }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
+        CHECK_TOKEN: ${{ inputs.check-token }}
