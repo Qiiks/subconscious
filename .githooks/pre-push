@@ -181,9 +181,36 @@ if command -v gh >/dev/null 2>&1; then
   #
   # ALSO REPORTS "no scheduled runs at all", because a cron that never fires
   # produces exactly the same silence as one that passes.
-  sched=$(gh run list --event schedule --limit 1 \
+  # GRADE THE NEWEST NON-CANCELLED SAMPLE, NEVER JUST THE NEWEST.
+  #
+  # This read `--limit 1`. With a ref-scoped concurrency group, a master push
+  # that overlaps the ~10:30Z cron CANCELS it -- four of my own six "scheduled
+  # reds" turned out to be exactly that. So the newest row is cancelled roughly
+  # a third of the mornings I am busy, and a `cancelled` top row correctly
+  # declines to be a verdict and THEN PRINTS NOTHING, hiding yesterday's real
+  # failure behind it. BROCA proved it on that exact two-row input.
+  #
+  #   A VALUE CORRECTLY CLASSIFIED AS "NOT A VERDICT" IS NOT A STOPPING POINT.
+  #   Skipping it is the whole job; stopping at it inherits its silence.
+  #
+  # And the hiding is anti-correlated with attention: the busier the push day,
+  # the likelier the cancel, so a red survives unseen precisely when a lock wave
+  # is most likely to have landed.
+  sched=$(gh run list --event schedule --limit 10 \
       --json conclusion,createdAt,headSha \
-      --jq '.[] | "\(.conclusion) \(.createdAt[0:16]) \(.headSha[0:8])"' 2>/dev/null || true)
+      --jq '[.[] | select(.conclusion != "cancelled" and .conclusion != "")][0]
+            | "\(.conclusion) \(.createdAt[0:16]) \(.headSha[0:8])"' 2>/dev/null || true)
+  if [ -z "${sched:-}" ]; then
+    # Distinguish "every sample was cancelled" from "the cron never fires": both
+    # produce an empty grade, and only the second is a broken schedule.
+    sched_any=$(gh run list --event schedule --limit 10 --json conclusion \
+        --jq 'length' 2>/dev/null || echo 0)
+    if [ "${sched_any:-0}" -gt 0 ] 2>/dev/null; then
+      echo "" >&2
+      echo "pre-push NOTICE: all ${sched_any} recent SCHEDULED runs were cancelled --" >&2
+      echo "  the samples were never taken. Your pushes are landing in the cron window." >&2
+    fi
+  fi
   # A CRON THAT STOPPED FIRING LEAVES A GREEN LAST RUN, so conclusion alone is
   # not enough: a schedule that ran for months, went green, and then stopped
   # (workflow renamed, default branch moved, repo activity-disabled after 60
@@ -193,6 +220,9 @@ if command -v gh >/dev/null 2>&1; then
   # measured a `17 4 * * *` cron landing at ~09:00Z, five hours behind, on all
   # twelve of their runs. A 24h bound would fire on a healthy queue delay, and
   # an alarm that fires on healthy work gets muted.
+  # Age uses the newest run of ANY conclusion, deliberately: a cancelled run is
+  # still evidence the scheduler FIRED, which is what this arm measures. Grading
+  # and liveness are different questions and want different populations.
   sched_age_h=$(gh run list --event schedule --limit 1 --json createdAt \
       --jq '.[0].createdAt' 2>/dev/null \
     | { read -r ts; [ -n "$ts" ] && python3 -c "
