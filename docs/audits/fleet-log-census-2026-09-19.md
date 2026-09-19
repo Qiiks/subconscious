@@ -54,7 +54,24 @@ Sorted by conformance. `X` = spec violation.
 | astrocyte | `[ck-astrocyte] fusiform history boundary discovered at 1786529249396` | **none** | **none** | `ck-` prefix `X` |
 | engram | `engram scheduler: capture=HALTED after 3 consecutive failures` | **none** | **none** | bare `X` |
 | fusiform | `fusiform: poll Changed { new_version: 1789803498549 }, 33 eras` | **none** | **none** | bare + Rust Debug `X` |
-| broca | `  authority: https://docs.claude.com/en/docs/build-with-claude/context-windows` | **none** | **none** | **none** `X` |
+| broca | `broca: catalog override anthropic/claude-sonnet-4-5 limit.context — upstream 1000000, serving 200000` | **none** | **none** | `broca:` prefix `X` |
+
+*Broca's row was first published as "no id either" from a `tail -1` that landed
+on the SECOND line of a two-line record. BROCA corrected it and found the real
+defect underneath: their prefix rule was satisfied per record while every reader
+is per line, so 8 of 29 captured lines were unattributable continuations. Fixed
+at broca 73891e6b. A census reading a line-oriented file inherits every
+multi-line record as a phantom producer.*
+| thalamus | `thalamus attach epoch value-skew (transform ENABLED): profile_epoch mine=2 theirs=3` | **none** | **none** | bare, no delimiter `X` |
+
+*Two producers were added after first publication, both by seats reading the
+census and finding themselves absent (ASTRO, THALAMUS). The count is a floor.*
+
+THALAMUS's id shape is worth singling out because **it is the hardest to parse
+while looking like the simplest**: a bare `thalamus ` prefix with no delimiter at
+all — not `[thalamus]` like plexus/insula, not `thalamus:` like engram/fusiform.
+A parser keyed on `[` or `:` extracts nothing; the lines are separable only by
+knowing the string in advance.
 
 Seven producers emit lines with **no timestamp of any kind**. Nine have no
 level. Six distinct id conventions: bare, bracketed, `ck-` prefixed, Rust crate

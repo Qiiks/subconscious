@@ -100,6 +100,18 @@ Field by field, each with the reason it is where it is:
   they vary from zero to eighty characters per line and a terminal wrap should
   cut them, not the message.
 
+**One line per event, always.** The crate escapes `\n` and `\r` inside the
+message and inside every value, so a record can never span two lines. This is
+not a formatting preference: `tail`, `grep`, a merge-by-time and every doctor
+read the file **per line**, and a record that is correct and complete across
+two lines is two lines to all of them. BROCA measured it in their own capture
+the day r2 was approved — a prefix rule satisfied per record left 8 of 29 lines
+unattributable, and the fleet census read the continuation as a producer with
+no id. Multi-line payloads (backtraces) are emitted as one line per source
+line, each carrying the full prefix and a `logger` of `<module>.panic`; the
+crate installs a panic hook that does this so a module's last words land in
+its own file, not only the daemon's ring.
+
 Nothing marks where the message ends and event fields begin. A message that
 contains a literal `key=value` is ambiguous to a field parser. This is the same
 trade `tracing`'s fmt layer and zerolog's console writer make, and it is
