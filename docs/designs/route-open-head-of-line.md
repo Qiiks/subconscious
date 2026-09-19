@@ -121,10 +121,22 @@ currently gets from awaiting dispatch inside its `select`.
 **Stage 1 — non-structural, zero ordering risk, no SDK change.** Ship first,
 because it addresses the measured incident on its own.
 
-The bind budget is 12s. The client deadline measured in the incident is 10s.
-**A budget that cannot produce an answer before the caller has given up is pure
-head-of-line cost** — every one of those 268 twelve-second stalls was time
-nobody was still waiting for.
+The bind budget is 12s. **Correction to the consult's framing, which I had
+repeated:** 10s is not a client-SDK default. Both SDKs default to 30s
+(`DEFAULT_REQUEST_TIMEOUT_MS`, `DEFAULT_CALL_TIMEOUT`), and the 10s figure in
+the incident was one caller's own per-call deadline — my board calls. So "the
+budget exceeds the client deadline" is true of a 10s caller and false of a
+default one, and stating it as a universal would have put a wrong premise in
+the argument for the fix.
+
+The defensible form is narrower and still decisive: **callers choose their own
+deadlines and the daemon cannot see them, so a budget that any common caller
+undercuts is spent holding a reader for an answer nobody will read.** The cost
+is asymmetric — a bind that would have succeeded at 11s is rare, while 268
+measured stalls at the ceiling each blocked every later frame on their
+connection. Size the budget against the shortest deadline in practice, not
+against the SDK default, and let per-module config raise it for a module that
+genuinely needs longer.
 
 - Cap the bind budget below the shortest client deadline. It is already
   per-module overridable, so this is reachable by config before it is reachable
