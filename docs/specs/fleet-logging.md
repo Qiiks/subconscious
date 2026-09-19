@@ -212,9 +212,26 @@ undeclared name), which is one of the three doors the operator confirmed.
   its own log, and the backtrace is the line worth having) and
   `run/logs/<id>.stderr.log`, the daemon-owned capture of anything a module
   still emits on stderr/stdout. **A module on the crate writes nothing there,
-  so that file being non-empty for an adopted module is a defect, and
-  `fleet-pulse` reports it.** The capture keeps its r1 rename-based rotation
-  because it has exactly one writer.
+  so an adopted module's capture containing a line THAT BUILD COULD EMIT is a
+  defect, and `fleet-pulse` reports it.**
+
+  NOT "non-empty" — that check flags every adopted module forever, because
+  NOTHING TRUNCATES THESE FILES: the pre-adoption history stays on disk and the
+  file keeps its last-minutes-before-the-bounce growth across the placement
+  itself. PLEX measured exactly that (2026-09-19): their capture GREW 28,243 ->
+  28,478 across adoption and contained zero lines the new build was capable of
+  producing. A FILE THAT GREW IS NOT A FILE BEING WRITTEN.
+
+  The discriminating question is what SHAPE the lines are. After r2 the cheap
+  form is "capture contains an r2-shaped line" (timestamp, level, `module[.component]:`),
+  which reads 0 for an adopted module whose history is r1. Where a seat retired
+  a hand-rolled prefix, the absence of that literal from the new image makes the
+  old lines structurally unproducible, which is a stronger discriminator still —
+  and a grep for the retired literal is the control that proves the search works
+  rather than that the file is empty.
+
+  The capture keeps its r1 rename-based rotation because it has exactly one
+  writer.
 
 ## Retention
 
