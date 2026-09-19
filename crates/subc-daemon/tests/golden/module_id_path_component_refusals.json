@@ -1,23 +1,32 @@
 {
-  "authority": "crates/subc-core/src/registry.rs module_id_path_hazard -- module_id is one literal component in the existing store-path derivation; this fixture pins the shared Rust and TypeScript refusal boundary in UTF-8 bytes",
+  "authority": "crates/subc-daemon/src/registry.rs module_id_path_hazard -- module_id is one literal component in the existing store-path derivation; this fixture pins the shared Rust and TypeScript refusal boundary in UTF-8 bytes",
   "vectors": [
     {
       "name": "ascii_255_bytes_accepted",
-      "module_id": { "unit": "a", "repeat": 255 },
+      "module_id": {
+        "unit": "a",
+        "repeat": 255
+      },
       "utf8_bytes": 255,
       "utf16_code_units": 255,
       "expect_reason": null
     },
     {
       "name": "ascii_256_bytes_refused",
-      "module_id": { "unit": "a", "repeat": 256 },
+      "module_id": {
+        "unit": "a",
+        "repeat": 256
+      },
       "utf8_bytes": 256,
       "utf16_code_units": 256,
       "expect_reason": "is longer than 255 bytes"
     },
     {
       "name": "emoji_256_utf8_bytes_refused_despite_128_utf16_code_units",
-      "module_id": { "unit": "😀", "repeat": 64 },
+      "module_id": {
+        "unit": "\ud83d\ude00",
+        "repeat": 64
+      },
       "utf8_bytes": 256,
       "utf16_code_units": 128,
       "expect_reason": "is longer than 255 bytes"
