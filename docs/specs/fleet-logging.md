@@ -297,6 +297,31 @@ backstop, not the policy.
 
 ## Adoption
 
+### Readers, not just producers
+
+**Any change to this format carries a READERS line beside its producer roster,
+or it is not ready to post.** The r2 adoption call ([#520]) named producers and
+no readers, because an adoption call names who must ACT — and the consumers of a
+format do nothing until the day they break, which makes them invisible in
+exactly the notice that would have warned them (MC's framing, 2026-09-19, after
+their drift detector caught a re-vendor that would have shipped a broken
+parser).
+
+Known readers of this format, to be named in any future change:
+
+- `aft` — CLI doctor, extracts errors into GitHub issues
+- `magic-context` — CLI doctor (`packages/cli/src/lib/log-lines.ts`) AND the
+  desktop dashboard's Rust twin
+- `ck module logs` — reads r1 and r2 both, deliberately
+- anyone grepping, tailing or regexing `<module>.<date>.log`
+
+**r1 and r2 lines coexist on disk in the same directory for the whole adoption
+window, so a reader needs both arms rather than a cutover.** The cheapest
+discriminator is the colon: r2 renders `fusiform: poll changed`, r1 renders
+`fusiform poll changed`. A reader taking both arms must be tested against a
+MIXED file, since a per-grammar test passes while one arm quietly consumes the
+other grammar's lines.
+
 **Mandatory, fleet-wide.** Every module and every plugin lane, as each seat has
 time; a seat that cannot adopt names the blocker on the record. The census
 question posted 2026-09-19 ([#512] in `#fleet-notices`) collects each seat's
