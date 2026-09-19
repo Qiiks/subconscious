@@ -115,6 +115,33 @@ There is no capture-flush step to order, for the reason given above: nothing is
 held, so nothing can be flushed. The third loss is not addressed by this handler
 and the document no longer claims it is.
 
+## The wire: reuse the existing lanes, with reason `Restart`
+
+Both notices already exist and the module-restart path already sends both
+(`supervise.rs:4399` module.draining to the provider, `:4404` route.closing to
+consumers). Use them unchanged.
+
+**Do not add a `Shutdown` variant to `RouteCloseReason`**, and the reason is
+behavioural rather than a compatibility preference. Both SDKs classify the
+reason, and both map an unrecognised one to the strictest disposition
+(`clients/subc-client/src/client.ts:437` — "Unknown close reasons take the
+strictest action and must not trigger a reopen"). So a new variant reaches every
+consumer built before it as **never reopen this route** — exactly wrong for a
+daemon shutdown, which is the case where the route should come back once the
+daemon does. A more accurate noun bought at the cost of correct behaviour on
+every un-updated consumer is not a trade worth making.
+
+`Restart` classifies as `may_reopen`, which produces the right behaviour on both
+sides: a consumer expects the route back, a provider stops admitting work.
+
+The daemon-cut distinction lives in the **journal marker** instead. That is the
+right allocation rather than a compromise: the wire field steers live behaviour,
+the journal records history, and the question "was this a daemon cut or a module
+restart" is asked after the fact by an operator reading `ck module terminals`.
+
+Also do not invent a provider-side `route.closing`. It is not an existing module
+command, and adding one breaks decoders fleet-wide for no behavioural gain.
+
 ## Escalation
 
 A second SIGTERM **escalates**, never restarts: cut the wait, go straight to
