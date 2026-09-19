@@ -1,6 +1,6 @@
 [package]
 name = "subc-core"
-version = "0.18.10"
+version = "0.18.11"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -68,7 +68,7 @@ subc-jsonc = { path = "../subc-jsonc" }
 terminal_size = "0.4"
 subc-protocol = { path = "../subc-protocol" }
 subc-transport = { path = "../subc-transport" }
-tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "io-util", "sync", "time", "process"] }
+tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "io-util", "sync", "time", "process", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

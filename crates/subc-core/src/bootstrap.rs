@@ -483,6 +483,11 @@ async fn serve_bound_daemon(
     capture_logs_dir: Option<PathBuf>,
     terminal_journal_path: Option<PathBuf>,
 ) -> Result<(), BootstrapError> {
+    #[cfg(unix)]
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(BootstrapError::Signal)?;
+    // Windows has no SIGTERM. Ctrl-C is a different event, not an equivalent
+    // service-stop contract, so this shutdown handler is intentionally Unix-only.
     raise_nofile_limit();
 
     info!(
@@ -624,6 +629,31 @@ async fn serve_bound_daemon(
     control.refresh_capability_requirements();
     Arc::clone(&control).spawn_capability_deadline_loop();
 
+    #[cfg(unix)]
+    {
+        tokio::select! {
+            result = serve_task.join() => {
+                return result.map_err(BootstrapError::ServeJoin)?.map_err(BootstrapError::Serve);
+            }
+            _ = terminate.recv() => {}
+        }
+        // Stamp before allowing a second signal to cut the bounded wait short.
+        supervisor.stamp_shutdown();
+        // Dropping the listener stops new accepts, not established connections:
+        // their detached tasks must remain live throughout notice and drain.
+        drop(serve_task);
+        tokio::select! {
+            biased;
+            _ = terminate.recv() => info!("second SIGTERM: abandoning daemon shutdown wait"),
+            result = supervisor.drain_for_daemon_shutdown() => {
+                if let Err(error) = result {
+                    warn!(%error, "daemon shutdown drain failed; exiting anyway");
+                }
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
     serve_task
         .join()
         .await
@@ -940,6 +970,8 @@ fn non_empty_os_var(key: &str) -> Option<OsString> {
 /// ordinary daemon-discovery races or stale filesystem state.
 #[derive(Debug)]
 pub enum BootstrapError {
+    #[cfg(unix)]
+    Signal(io::Error),
     InvalidPort {
         raw: String,
         source: std::num::ParseIntError,
@@ -982,6 +1014,8 @@ pub enum BootstrapError {
 impl fmt::Display for BootstrapError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            #[cfg(unix)]
+            Self::Signal(error) => write!(f, "failed to register SIGTERM handler: {error}"),
             Self::InvalidPort { raw, source } => {
                 write!(f, "invalid {SUBC_PORT_ENV} value '{raw}': {source}")
             }
@@ -1037,6 +1071,8 @@ impl fmt::Display for BootstrapError {
 impl Error for BootstrapError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            #[cfg(unix)]
+            Self::Signal(source) => Some(source),
             Self::InvalidPort { source, .. } => Some(source),
             Self::ConnectionFileRead { source, .. }
             | Self::ConnectionFileWrite { source, .. }

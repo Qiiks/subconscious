@@ -1080,6 +1080,114 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
+    #[cfg(unix)]
+    pub(crate) fn stamp_shutdown(&self) {
+        if let Some(journal) = &self.terminal_journal {
+            journal.stamp_shutdown();
+        }
+    }
+
+    /// Announce a cut while established connections can still carry replies.
+    /// These budgets promise notice and a bounded wait, not child completion;
+    /// they are local policy, not an estimate of launchd's unknown kill ceiling.
+    #[cfg(unix)]
+    pub(crate) async fn drain_for_daemon_shutdown(&self) -> Result<(), SuperviseError> {
+        const NOTICE_BUDGET: Duration = Duration::from_millis(500);
+        const DRAIN_BUDGET: Duration = Duration::from_secs(2);
+        let Some(forwarding) = &self.forwarding else {
+            return Ok(());
+        };
+        let module_ids = forwarding
+            .begin_daemon_drain()
+            .map_err(SuperviseError::Forwarding)?;
+        let deadline_ms =
+            unix_ms_now().saturating_add((NOTICE_BUDGET + DRAIN_BUDGET).as_millis() as u64);
+        let mut notices = tokio::task::JoinSet::new();
+        let mut drains = Vec::new();
+        for module_id in module_ids {
+            let Some(target) = forwarding
+                .begin_module_drain(&module_id, RouteCloseReason::Restart)
+                .map_err(SuperviseError::Forwarding)?
+            else {
+                continue;
+            };
+            let routes = forwarding
+                .endpoint_routes(target.endpoint)
+                .map_err(SuperviseError::Forwarding)?;
+            // Restart allows deployed consumers to reopen after the new daemon
+            // appears. The terminal journal's daemon_shutdown marker distinguishes
+            // a daemon cut from a module restart without changing wire reasons.
+            let command = serde_json::to_vec(&ModuleControlCommand::Draining {
+                reason: RouteCloseReason::Restart,
+                deadline_ms,
+            })
+            .expect("module draining serializes");
+            let closing = serde_json::to_vec(&ClientControlPush::RouteClosing {
+                module_id: module_id.clone(),
+                reason: RouteCloseReason::Restart,
+            })
+            .expect("route closing serializes");
+            let mut recipients = vec![(target.sink.clone(), target.negotiated_ver, command)];
+            let mut seen = std::collections::HashSet::new();
+            for route in routes {
+                let client = route.goodbye_target;
+                if seen.insert(client.connection_id) {
+                    recipients.push((client.sink, client.negotiated_ver, closing.clone()));
+                }
+            }
+            for (sink, version, body) in recipients {
+                notices.spawn(async move {
+                    let frame = Frame::build_with_version(
+                        version,
+                        FrameType::Push,
+                        control_flags(),
+                        0,
+                        0,
+                        0,
+                        body,
+                    )
+                    .expect("bounded lifecycle notice frame builds");
+                    sink.send_flushed(frame).await
+                });
+            }
+            let gauges = declared_busy_gauges(&self.registry, &module_id)?;
+            drains.push((module_id, target.endpoint, gauges));
+        }
+        // A quiet forwarding table is not proof that queued notices reached the
+        // socket. Wait for writer flush acknowledgements before testing quiescence.
+        let notice_deadline = Instant::now() + NOTICE_BUDGET;
+        while let Ok(Some(result)) = timeout_at(notice_deadline, notices.join_next()).await {
+            if !matches!(result, Ok(Ok(()))) {
+                warn!(?result, "daemon shutdown notice delivery failed");
+            }
+        }
+        notices.abort_all();
+        let deadline = Instant::now() + DRAIN_BUDGET;
+        let mut waits = tokio::task::JoinSet::new();
+        for (module_id, endpoint, gauges) in drains {
+            let forwarding = Arc::clone(forwarding);
+            let mut runtime = self.runtime_config();
+            runtime.health.cadence = Duration::from_millis(100);
+            waits.spawn(async move {
+                wait_for_forwarding_quiescence(
+                    &forwarding,
+                    &module_id,
+                    &runtime,
+                    endpoint,
+                    deadline,
+                    &gauges,
+                )
+                .await
+            });
+        }
+        while let Ok(Some(result)) = timeout_at(deadline, waits.join_next()).await {
+            if !matches!(result, Ok(Ok(true))) {
+                warn!(?result, "daemon shutdown drain did not reach quiescence");
+            }
+        }
+        Ok(())
+    }
+
     pub fn new(registry: Arc<Registry>, restart_policy: RestartPolicy) -> Self {
         Self {
             registry,
@@ -2172,7 +2280,7 @@ async fn run_health_probe_cycle(
     child: &mut Option<SupervisedChild>,
 ) {
     let now_ms = unix_ms_now();
-    match probe_module_health(spec, runtime, None).await {
+    match probe_module_health(&spec.module_id, runtime, None).await {
         Ok(report) => {
             handle_health_report(
                 spec,
@@ -2203,7 +2311,7 @@ async fn run_health_probe_cycle(
 }
 
 async fn probe_module_health(
-    spec: &ModuleSpec,
+    module_id: &str,
     runtime: &SupervisorRuntimeConfig,
     drain_deadline: Option<Instant>,
 ) -> Result<HealthReport, HealthProbeError> {
@@ -2219,14 +2327,14 @@ async fn probe_module_health(
     }
     let pending = if drain_deadline.is_some() {
         forwarding.begin_drain_health_probe_rpc_for(
-            &spec.module_id,
+            module_id,
             MODULE_CONTROL_OP_HEALTH_CHECK,
             probe_started_at,
             deadline,
         )
     } else {
         forwarding.begin_health_probe_rpc_for(
-            &spec.module_id,
+            module_id,
             MODULE_CONTROL_OP_HEALTH_CHECK,
             probe_started_at,
             deadline,
@@ -4061,7 +4169,7 @@ fn declared_busy_gauges(
 
 async fn wait_for_forwarding_quiescence(
     forwarding: &ForwardingTable,
-    spec: &ModuleSpec,
+    module_id: &str,
     runtime: &SupervisorRuntimeConfig,
     endpoint: crate::ModuleEndpointId,
     deadline: Instant,
@@ -4074,7 +4182,7 @@ async fn wait_for_forwarding_quiescence(
     loop {
         let now = Instant::now();
         if !busy_gauges.is_empty() && now >= next_probe_at && now < deadline {
-            gauges_quiescent = match probe_module_health(spec, runtime, Some(deadline)).await {
+            gauges_quiescent = match probe_module_health(module_id, runtime, Some(deadline)).await {
                 Ok(report) => match busy_gauge_observation(report.metrics.as_ref(), busy_gauges) {
                     BusyGaugeObservation::Quiescent => true,
                     BusyGaugeObservation::Busy => false,
@@ -4090,7 +4198,7 @@ async fn wait_for_forwarding_quiescence(
                 },
                 Err(err) => {
                     warn!(
-                        module_id = %spec.module_id,
+                        module_id,
                         error = %err,
                         "drain health.check did not produce declared busy gauges; treating module as busy"
                     );
@@ -4418,7 +4526,7 @@ async fn begin_forwarding_drain_with(
         // `closing` carries no timeout of its own.
         let wait_result = wait_for_forwarding_quiescence(
             forwarding,
-            spec,
+            &spec.module_id,
             runtime,
             target.endpoint,
             drain_deadline,
@@ -6126,7 +6234,7 @@ mod health_tombstone_tests {
     ) -> ModuleControlRpcCompletion {
         assert!(stall > harness.runtime.health.deadline);
         let deadline = harness.runtime.health.deadline;
-        let probe = probe_module_health(&harness.spec, &harness.runtime, None);
+        let probe = probe_module_health(&harness.spec.module_id, &harness.runtime, None);
         let answer = async {
             let frame = harness.module_rx.recv().await.expect("health.check frame");
             tokio::time::advance(deadline).await;
@@ -6154,7 +6262,7 @@ mod health_tombstone_tests {
 
     async fn time_out_without_answer(harness: &mut ProbeHarness) {
         let deadline = harness.runtime.health.deadline;
-        let probe = probe_module_health(&harness.spec, &harness.runtime, None);
+        let probe = probe_module_health(&harness.spec.module_id, &harness.runtime, None);
         let exhaust_deadline = async {
             let _frame = harness.module_rx.recv().await.expect("health.check frame");
             tokio::time::advance(deadline).await;

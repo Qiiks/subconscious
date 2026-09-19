@@ -499,9 +499,47 @@ where
             write_ms = write_started.elapsed().as_millis() as u64,
             "slow control reply write"
         );
-        return result;
+        result?;
+    } else {
+        write_frame(writer, &frame).await?;
     }
-    write_frame(writer, &frame).await
+    if let Some(flushed) = outbound.flushed {
+        writer.flush().await.map_err(FrameIoError::Io)?;
+        let _ = flushed.send(());
+    }
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+#[tokio::test]
+async fn shutdown_notice_ack_waits_for_socket_flush() {
+    let (socket, mut peer) = tokio::io::duplex(1);
+    let (tx, rx) = mpsc::channel(1);
+    let sink = FrameSink::new(tx);
+    let writer = tokio::spawn(drain_writer(socket, rx));
+    let frame = crate::Frame::build(
+        subc_protocol::FrameType::Push,
+        subc_protocol::Flags::new(false, subc_protocol::Priority::Interactive, false),
+        0,
+        0,
+        0,
+        b"notice".to_vec(),
+    )
+    .unwrap();
+    let send = sink.send_flushed(frame);
+    tokio::pin!(send);
+    assert!(
+        timeout(Duration::from_millis(20), &mut send).await.is_err(),
+        "queueing bytes is not a socket flush acknowledgement"
+    );
+    let (sent, received) = timeout(Duration::from_secs(1), async {
+        tokio::join!(&mut send, read_frame(&mut peer))
+    })
+    .await
+    .unwrap();
+    sent.unwrap();
+    assert_eq!(received.unwrap().unwrap().body, b"notice");
+    writer.abort();
 }
 
 #[derive(Debug)]
@@ -623,6 +661,7 @@ mod tests {
         tx.send(crate::router::OutboundFrame {
             frame: reply,
             enqueued_at: std::time::Instant::now() - Duration::from_millis(1500),
+            flushed: None,
         })
         .await
         .expect("queued");
@@ -674,6 +713,7 @@ mod tests {
         tx.send(crate::router::OutboundFrame {
             frame: control,
             enqueued_at: std::time::Instant::now(),
+            flushed: None,
         })
         .await
         .expect("queued");
@@ -695,6 +735,7 @@ mod tests {
         tx.send(crate::router::OutboundFrame {
             frame: data,
             enqueued_at: std::time::Instant::now() - Duration::from_millis(5000),
+            flushed: None,
         })
         .await
         .expect("queued");
