@@ -541,6 +541,22 @@ fi
 if [ "$RESTART" -eq 1 ]; then
   say "=== restart"
   ck module restart "$MODULE" 2>&1 | tail -1
-  say "$(date -u +%FT%TZ) restart initiated -- verify on a lane opened AFTER this point:"
-  say "  ck module status $MODULE   # then inode proc-vs-disk, which is the only proof it runs these bytes"
+    say "$(date -u +%FT%TZ) restart initiated -- verify on a lane opened AFTER this point:"
+    # THE PID COMES FROM PROVENANCE, NOT FROM `pgrep` AND NOT FROM `module status`.
+    #
+    #   ck module status -> SupervisorEntry, 17 fields, NO pid. It answers
+    #       supervision state (enabled, live, restart budget, drain policy).
+    #       A pid is an OBSERVED PROCESS FACT, which is what the provenance
+    #       surface holds, beside spawned_from and running_image. Reading
+    #       `.module.pid` there returns null -- and a nonexistent key and a
+    #       null value are the same bytes, so it reads as "no process".
+    #
+    #   pgrep -> on macOS EXCLUDES THE CALLER'S ANCESTORS by default, so from
+    #       a shell this daemon supervises it structurally cannot return the
+    #       daemon. That produced a false inode MISMATCH on the 0.18.14 cut.
+    #
+    # Printed here rather than remembered, because both wrong answers look
+    # like findings about the module.
+    say "  ck --json provenance $MODULE | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"modules\"][0][\"daemon_observed\"][\"pid\"])'"
+    say "  then inode proc-vs-disk on that pid, which is the only proof it runs these bytes"
 fi
