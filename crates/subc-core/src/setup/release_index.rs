@@ -695,7 +695,7 @@ mod tests {
         thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accept");
             // Hold the connection open, answering nothing, until released.
-            let _ = release_rx.recv_timeout(Duration::from_secs(90));
+            let _ = release_rx.recv_timeout(Duration::from_secs(300));
             drop(stream);
         });
         let key = test_signing_key();
@@ -713,16 +713,33 @@ mod tests {
             matches!(error, IndexRefusal::Unreachable { .. }),
             "a hang is unreachable, never a signature or parse verdict: {error}"
         );
-        // Discriminating margin, not a latency claim: a transport that ignores
-        // its deadline cannot return before the 90 s hold. One that honors it
-        // is back in about a second on unix; on Windows the bound starts only
-        // after powershell.exe itself has started, which on a loaded hosted
-        // runner has been measured at 22 s. The bound sits far above that and
-        // far below the hold so neither a slow start nor a fast hang can be
-        // misread.
+        // DISCRIMINATING MARGIN, NOT A LATENCY CLAIM, and the margin is wide
+        // because `elapsed` MEASURES TWO THINGS AND CAN ONLY BOUND THEIR SUM.
+        //
+        // On Windows the transport is `powershell.exe`, so elapsed is
+        // (process start) + (deadline honored). The deadline half is 800 ms.
+        // The start half is the hosted runner's, and the measurements keep
+        // moving: 10 s when this test was written, 22 s on 2026-09-11 (bound
+        // widened 20 -> 45), 67.4 s on 2026-09-19. Nothing in this repo
+        // changed between any of those; the runner did.
+        //
+        // So the bound cannot be tight, because A TIGHT BOUND HERE ASSERTS
+        // SOMETHING ABOUT GITHUB'S SCHEDULER RATHER THAN ABOUT THE TRANSPORT.
+        // What the test actually proves is the only thing that separates the
+        // two failure modes: a transport that ignores its deadline CANNOT
+        // return before the hold releases. Hold 300 s, bound 120 s, so a start
+        // would have to take four times its worst measured value before a slow
+        // start could be misread as an honored deadline, and an ignored
+        // deadline lands at start + 300 s which no start time can undercut.
+        //
+        // The honest limit, stated rather than papered over: this assertion
+        // cannot attribute a large elapsed between a slow start and a slow
+        // transport. Only the child-gone check below distinguishes the case
+        // that matters operationally.
         assert!(
-            elapsed < Duration::from_secs(45),
-            "transport ignored its deadline: {elapsed:?}"
+            elapsed < Duration::from_secs(120),
+            "transport ignored its deadline: {elapsed:?} (includes process start; \
+             the hold is 300s, so an ignored deadline lands above it)"
         );
     }
 
