@@ -974,8 +974,29 @@ fn dispatch_external(domain: &str, tail: &[OsString]) -> Result<(), CkError> {
             module_id: module_id.clone(),
         });
     }
+    // REACHING HERE MEANS THE BINARY EXISTS AND DECLINED THE HANDSHAKE, which is
+    // the opposite of "unknown command" -- and that was the message until an
+    // operator hit it: `ck-account` ran fine by name while `ck account` said the
+    // command did not exist, sending them to look for a typo in a name that was
+    // correct. We are holding `candidate.path` at this point, so the refusal knows
+    // more than it was saying.
+    //
+    // Both facts belong in it: the binary is there, and it has not opted in. The
+    // opt-in is deliberate -- an arbitrary `ck-*` on PATH must not receive
+    // operator input on the strength of its filename -- so this is a message to
+    // the BINARY'S AUTHOR delivered through the operator, and it names the exact
+    // contract rather than asking them to find it.
     Err(CkError::Message(format!(
-        "unknown command '{domain}'. Run ck --help."
+        "'{domain}' is not a ck command, but {} exists on PATH.\n\
+         It did not complete the domain handshake, so ck will not hand it your arguments.\n\
+         To opt in, its author makes `{} --ck-domain` exit 0 with a single headline line\n\
+         within 2 seconds. Until then, run it directly by name.",
+        candidate.path.display(),
+        candidate
+            .path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy(),
     )))
 }
 
