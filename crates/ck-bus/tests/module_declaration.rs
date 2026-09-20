@@ -24,6 +24,22 @@ async fn module_declaration_and_registration_names_every_observable() {
     let operator_before = data_home::fingerprint(operator_dir.as_deref());
     let binary = Path::new(env!("CARGO_BIN_EXE_ck-bus"));
     let run = AcceptanceRun::start(binary).await;
+    // The operator fingerprint above is evidence ONLY while the directory it names lies
+    // outside this run's fixture tree. `operator_module_dir` resolves through
+    // XDG_DATA_HOME, which this test overrides on the CHILD command rather than on
+    // itself -- correct today, and silently vacuous the day any helper sets that
+    // variable on the test process, because both fingerprints would then describe the
+    // fixture and agree for the wrong reason. Assert the separation rather than trusting
+    // the ordering to hold.
+    if let Some(dir) = operator_dir.as_deref() {
+        assert!(
+            !dir.starts_with(run.root.path()),
+            "observable operator data home {} must lie outside the fixture tree {}, else \
+             the unchanged-fingerprint assertion proves nothing",
+            dir.display(),
+            run.root.path().display()
+        );
+    }
 
     let list_entry = wait_for_live_supervisor_entry(&run).await;
     assert_eq!(
