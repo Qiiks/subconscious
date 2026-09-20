@@ -79,6 +79,10 @@ const STDERR_PUMP_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 
 struct SupervisedChild {
     child: Child,
+    #[cfg(target_os = "linux")]
+    module_id: String,
+    #[cfg(target_os = "linux")]
+    cgroup_placement: Option<subc_cgroup::Placement>,
     stdout_pump: Option<JoinHandle<()>>,
     stderr_pump: Option<JoinHandle<()>>,
     stderr_ring: Arc<Mutex<StderrRing>>,
@@ -99,7 +103,14 @@ impl SupervisedChild {
     }
 
     async fn wait(&mut self) -> io::Result<ExitStatus> {
-        self.child.wait().await
+        let result = self.child.wait().await;
+        #[cfg(target_os = "linux")]
+        if result.is_ok() {
+            if let Some(placement) = self.cgroup_placement.take() {
+                remove_module_cgroup(&placement, &self.module_id);
+            }
+        }
+        result
     }
 
     fn start_kill(&mut self) -> io::Result<()> {
@@ -4084,7 +4095,12 @@ fn spawn_child(
     let cgroup_path: Option<PathBuf> = None;
     #[cfg(target_os = "linux")]
     if let Some(path) = &cgroup_path {
-        apply_cgroup_placement(&mut command, spec, path)?;
+        if let Err(error) = apply_cgroup_placement(&mut command, spec, path) {
+            if let Some(placement) = cgroup_placement {
+                remove_module_cgroup(placement, &spec.module_id);
+            }
+            return Err(error);
+        }
     }
 
     let output_sink = if let Some(logs_dir) = capture_logs_dir {
@@ -4108,11 +4124,20 @@ fn spawn_child(
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     command.kill_on_drop(true);
-    let mut child = command.spawn().map_err(|source| SuperviseError::Spawn {
-        program: spec.program.clone(),
-        source,
-        cgroup_path,
-    })?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(source) => {
+            #[cfg(target_os = "linux")]
+            if let Some(placement) = cgroup_placement {
+                remove_module_cgroup(placement, &spec.module_id);
+            }
+            return Err(SuperviseError::Spawn {
+                program: spec.program.clone(),
+                source,
+                cgroup_path,
+            });
+        }
+    };
     let spawned_at_ms = unix_ms_now();
     let spawned_from = spec.program.clone();
     let spawned_file_identity = spawned_file_identity(&spawned_from);
@@ -4160,6 +4185,10 @@ fn spawn_child(
 
     Ok(SupervisedChild {
         child,
+        #[cfg(target_os = "linux")]
+        module_id: spec.module_id.clone(),
+        #[cfg(target_os = "linux")]
+        cgroup_placement: cgroup_placement.cloned(),
         stdout_pump,
         stderr_pump,
         stderr_ring: Arc::clone(ring),
@@ -4169,6 +4198,18 @@ fn spawn_child(
         process_start_time,
         process_identity,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn remove_module_cgroup(placement: &subc_cgroup::Placement, module_id: &str) {
+    match placement.remove_module(module_id) {
+        Ok(()) => debug!(module_id, "removed module cgroup after process exit"),
+        Err(error) => warn!(
+            module_id,
+            error = %error,
+            "could not remove module cgroup after process exit; continuing teardown"
+        ),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -6808,10 +6849,18 @@ mod jitter_tests {
 
 #[cfg(all(test, target_os = "linux"))]
 mod cgroup_placement_tests {
-    use super::{apply_cgroup_placement, ModuleProtocol, ModuleSpec, SuperviseError};
+    use super::{
+        apply_cgroup_placement, remove_module_cgroup, ModuleProtocol, ModuleSpec, SuperviseError,
+        SupervisedChild,
+    };
+    use crate::{
+        stderr_tail::{StderrRing, StderrTailConfig},
+        test_support::TestTempDir,
+    };
     use std::{
-        io,
+        fs, io,
         path::{Path, PathBuf},
+        sync::{Arc, Mutex},
     };
     use tokio::process::Command;
 
@@ -6842,6 +6891,70 @@ mod cgroup_placement_tests {
         assert!(
             reason.contains("/definitely-missing-subc-cgroup/cgroup.procs"),
             "parent cgroup open failure must name cgroup.procs: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reaping_a_child_removes_its_empty_module_cgroup() {
+        let root = TestTempDir::new("supervisor-reap-cgroup");
+        fs::write(root.join("cgroup.procs"), b"").expect("write scratch cgroup marker");
+        let placement = subc_cgroup::prepare_at(&root)
+            .expect("prepare scratch cgroup root")
+            .expect("scratch root has a cgroup.procs marker");
+        let module_id = "reaped-module";
+        let module = placement
+            .module_path(module_id)
+            .expect("create scratch module cgroup");
+        let child = Command::new("true")
+            .spawn()
+            .expect("spawn short-lived child");
+        let mut child = SupervisedChild {
+            child,
+            module_id: module_id.to_string(),
+            cgroup_placement: Some(placement),
+            stdout_pump: None,
+            stderr_pump: None,
+            stderr_ring: Arc::new(Mutex::new(StderrRing::new(StderrTailConfig::default()))),
+            spawned_at_ms: 0,
+            spawned_from: PathBuf::from("true"),
+            spawned_file_identity: None,
+            process_start_time: None,
+            process_identity: None,
+        };
+
+        child.wait().await.expect("reap short-lived child");
+
+        assert!(
+            !module.exists(),
+            "reaping the supervised child must remove its empty cgroup"
+        );
+    }
+
+    #[test]
+    fn non_empty_cgroup_removal_is_reported_without_blocking_teardown() {
+        let root = TestTempDir::new("supervisor-non-empty-cgroup");
+        fs::write(root.join("cgroup.procs"), b"").expect("write scratch cgroup marker");
+        let placement = subc_cgroup::prepare_at(&root)
+            .expect("prepare scratch cgroup root")
+            .expect("scratch root has a cgroup.procs marker");
+        let module = placement
+            .module_path("surviving-module")
+            .expect("create scratch module cgroup");
+        fs::write(module.join("surviving-process"), b"still present")
+            .expect("make scratch cgroup non-empty");
+        let (logs, _guard) = crate::router::test_log::log_capture(tracing::Level::WARN);
+
+        remove_module_cgroup(&placement, "surviving-module");
+
+        let logs = crate::router::test_log::captured_logs(&logs);
+        assert!(
+            module.exists(),
+            "failed removal must leave the cgroup intact"
+        );
+        assert!(
+            logs.contains("could not remove module cgroup after process exit; continuing teardown")
+                && logs.contains("surviving-module"),
+            "best-effort removal must report the failure without returning it: {logs}"
         );
     }
 

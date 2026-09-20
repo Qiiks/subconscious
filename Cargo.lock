@@ -1226,7 +1226,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "subc-cgroup"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "tokio",
 ]
@@ -1257,7 +1257,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.20.1"
+version = "0.20.2"
 dependencies = [
  "base64",
  "cortexkit-log",
@@ -1283,7 +1283,7 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.20.1"
+version = "0.20.2"
 dependencies = [
  "cortexkit-log",
  "cortexkit-paths",

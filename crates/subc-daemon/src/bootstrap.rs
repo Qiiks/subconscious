@@ -79,6 +79,19 @@ struct AdmissionFactsConfig {
     targets: Option<Vec<String>>,
 }
 
+/// Controls where module cgroups are prepared.
+///
+/// In-process daemons default to [`Self::Disabled`] so they never derive a
+/// production location from the host process. The shipped daemon explicitly uses
+/// [`Self::Current`]. Tests that exercise placement can own an [`Self::Root`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum CgroupPlacementConfig {
+    #[default]
+    Disabled,
+    Current,
+    Root(PathBuf),
+}
+
 #[derive(Debug, Clone)]
 pub struct BootstrapConfig {
     pub connection_file_path: PathBuf,
@@ -96,12 +109,12 @@ pub struct BootstrapConfig {
     reserved_capabilities: BTreeMap<String, String>,
     watchdog_config: DaemonSelfWatchdogConfig,
     connection_file_source: ConnectionFileSource,
+    /// Where module cgroups are prepared. Disabled unless a caller explicitly
+    /// opts in, because `Current` derives a host location from `/proc/self/cgroup`.
+    cgroup_placement: CgroupPlacementConfig,
     /// Directory the supervisor writes per-module stdout/stderr capture files
-    /// into. `None` resolves to the real run directory, which is what a shipped
-    /// daemon wants and what an IN-PROCESS TEST DAEMON MUST NOT USE: the path
-    /// is derived from the environment at spawn time, so a test that leaves it
-    /// unset writes `<module_id>.stderr.log` into the operator's live data home
-    /// under its fixture module ids.
+    /// into. `None` disables capture; the shipped binary supplies its real run
+    /// directory explicitly.
     capture_logs_dir: Option<PathBuf>,
     terminal_journal_path: Option<PathBuf>,
 }
@@ -121,9 +134,16 @@ impl BootstrapConfig {
             reserved_capabilities: BTreeMap::new(),
             watchdog_config: DaemonSelfWatchdogConfig::default(),
             connection_file_source: ConnectionFileSource::Explicit,
+            cgroup_placement: CgroupPlacementConfig::default(),
             capture_logs_dir: None,
             terminal_journal_path: None,
         }
+    }
+
+    /// Selects module cgroup placement. The default is disabled.
+    pub fn with_cgroup_placement(mut self, placement: CgroupPlacementConfig) -> Self {
+        self.cgroup_placement = placement;
+        self
     }
 
     /// Redirects per-module stdout/stderr capture files out of the real run
@@ -366,10 +386,13 @@ fn connection_file_path_with_source(
 /// existing connection file, this returns `Ok(())` after logging and the caller
 /// exits with status 0.
 pub async fn run() -> Result<(), BootstrapError> {
-    // `run` IS THE BINARY'S ENTRY POINT, so it is the one caller that captures
-    // child output into the operator's real run directory. Every other caller
-    // reaches `run_with_config` directly and gets no capture unless it asks.
-    run_with_config(BootstrapConfig::from_env_for_daemon_binary()?).await
+    // `run` is a binary entry point, so it opts into the production cgroup and
+    // child-log locations. In-process callers keep both features disabled by default.
+    run_with_config(
+        BootstrapConfig::from_env_for_daemon_binary()?
+            .with_cgroup_placement(CgroupPlacementConfig::Current),
+    )
+    .await
 }
 
 /// Serve a daemon from an explicit config. This is the entry point the twelve
@@ -404,6 +427,7 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
     let route_bind_relay_default_ms = config.route_bind_relay_default_ms;
     let reserved_capabilities = config.reserved_capabilities.clone();
     let watchdog_config = config.watchdog_config.clone();
+    let cgroup_placement_config = config.cgroup_placement.clone();
     let capture_logs_dir = config.capture_logs_dir.clone();
     let terminal_journal_path = config.terminal_journal_path.clone();
     match ensure_singleton_with_config(config).await? {
@@ -413,22 +437,9 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
         }
         Outcome::Bound(bound) => {
             #[cfg(target_os = "linux")]
-            let cgroup_placement = match subc_cgroup::prepare_current() {
-                Ok(Some(placement)) => Some(placement),
-                Ok(None) => {
-                    warn!(
-                        "module cgroup placement is disabled: daemon cgroup is not delegated; set Delegate=yes"
-                    );
-                    None
-                }
-                Err(error) => {
-                    warn!(
-                        error = %error,
-                        "module cgroup placement is disabled by an unexpected cgroup probe error"
-                    );
-                    None
-                }
-            };
+            let cgroup_placement = prepare_cgroup_placement(&cgroup_placement_config);
+            #[cfg(not(target_os = "linux"))]
+            let _ = cgroup_placement_config;
             serve_bound_daemon(
                 bound,
                 configured_modules,
@@ -445,6 +456,34 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
                 cgroup_placement,
             )
             .await
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_cgroup_placement(config: &CgroupPlacementConfig) -> Option<subc_cgroup::Placement> {
+    let result = match config {
+        CgroupPlacementConfig::Disabled => return None,
+        CgroupPlacementConfig::Current => subc_cgroup::prepare_current(),
+        CgroupPlacementConfig::Root(root) => subc_cgroup::prepare_at(root),
+    };
+
+    match result {
+        Ok(Some(placement)) => Some(placement),
+        Ok(None) => {
+            warn!(
+                placement = ?config,
+                "module cgroup placement is disabled: configured cgroup root is not delegated"
+            );
+            None
+        }
+        Err(error) => {
+            warn!(
+                placement = ?config,
+                error = %error,
+                "module cgroup placement is disabled by an unexpected cgroup probe error"
+            );
+            None
         }
     }
 }
@@ -1179,7 +1218,11 @@ mod tests {
     use super::*;
     use crate::server::ServerAuth;
     use crate::test_support::TestTempDir;
+    #[cfg(target_os = "linux")]
+    use std::collections::BTreeSet;
     use std::sync::Mutex;
+    #[cfg(target_os = "linux")]
+    use subc_control::ModuleProtocol;
     use subc_transport::MIN_KEY_LEN;
     use tokio::io::AsyncReadExt;
     use tokio::task::JoinHandle;
@@ -1198,6 +1241,125 @@ mod tests {
     fn normalized_build_provenance_omits_unavailable_and_empty_values() {
         assert_eq!(normalized_build_provenance("unavailable"), None);
         assert_eq!(normalized_build_provenance(""), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn current_cgroup_path_for_test() -> io::Result<PathBuf> {
+        let cgroups = fs::read_to_string("/proc/self/cgroup")?;
+        let relative = cgroups
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::Unsupported, "cgroup v2 is unavailable")
+            })?;
+        Ok(Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/')))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn module_cgroup_directories() -> io::Result<BTreeSet<OsString>> {
+        let modules = current_cgroup_path_for_test()?.join("subc-modules");
+        let entries = match fs::read_dir(modules) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+            Err(error) => return Err(error),
+        };
+        let mut directories = BTreeSet::new();
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                directories.insert(entry.file_name());
+            }
+        }
+        Ok(directories)
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_path(path: &Path, task: &JoinHandle<Result<(), BootstrapError>>) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !path.exists() && tokio::time::Instant::now() < deadline {
+            assert!(
+                !task.is_finished(),
+                "daemon exited before creating {}",
+                path.display()
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert!(path.exists(), "daemon did not create {}", path.display());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_with_config_does_not_reconcile_the_ambient_cgroup_by_default() {
+        let temp = unique_temp_dir("bootstrap-cgroup-default-disabled");
+        let module_id = format!("cgroup-isolation-probe-{}", process::id());
+        let before = module_cgroup_directories().expect("read ambient module cgroups before boot");
+        assert!(
+            !before.contains(&OsString::from(&module_id)),
+            "isolation probe cgroup already exists before this daemon starts"
+        );
+        let capture = temp.join("logs").join(format!("{module_id}.stderr.log"));
+        let module = ConfiguredModule {
+            module_id,
+            program: PathBuf::from("sh"),
+            args: vec!["-c".to_string(), "sleep 30".to_string()],
+            env: Vec::new(),
+            log: None,
+            enabled: true,
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::None,
+            health: HealthConfig::default(),
+            drain_timeout_ms: None,
+            route_bind_relay_timeout_ms: None,
+            restart: RestartPolicy::default(),
+        };
+        let config = BootstrapConfig::new(temp.join("connection.json"), 0)
+            .with_configured_modules([module])
+            .with_capture_logs_dir(temp.join("logs"))
+            .with_terminal_journal_path(temp.join("terminals.jsonl"));
+        let task = tokio::spawn(run_with_config(config));
+
+        wait_for_path(&capture, &task).await;
+        let after = module_cgroup_directories().expect("read ambient module cgroups after boot");
+
+        task.abort();
+        assert!(task
+            .await
+            .expect_err("aborted daemon task must cancel")
+            .is_cancelled());
+        assert_eq!(
+            before, after,
+            "an in-process daemon must not create or reconcile ambient module cgroups"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn explicit_cgroup_root_is_prepared_inside_the_fixture_tree() {
+        let temp = unique_temp_dir("bootstrap-cgroup-explicit-root");
+        let cgroup_root = temp.join("cgroup");
+        fs::create_dir(&cgroup_root).expect("create scratch cgroup root");
+        fs::write(cgroup_root.join("cgroup.procs"), b"").expect("write scratch cgroup marker");
+        let modules = cgroup_root.join("subc-modules");
+        let config = BootstrapConfig::new(temp.join("connection.json"), 0)
+            .with_cgroup_placement(CgroupPlacementConfig::Root(cgroup_root))
+            .with_terminal_journal_path(temp.join("terminals.jsonl"));
+        let task = tokio::spawn(run_with_config(config));
+
+        wait_for_path(&modules, &task).await;
+
+        task.abort();
+        assert!(task
+            .await
+            .expect_err("aborted daemon task must cancel")
+            .is_cancelled());
+        assert!(
+            fs::read_dir(&modules)
+                .expect("read prepared modules directory")
+                .next()
+                .is_none(),
+            "the delegation probe must clean up after itself"
+        );
     }
 
     struct EnvGuard {

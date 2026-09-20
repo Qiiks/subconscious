@@ -1,6 +1,6 @@
 [package]
 name = "subc-core"
-version = "0.20.1"
+version = "0.20.2"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -43,7 +43,7 @@ harness = false
 required-features = ["bench-harness"]
 
 [dependencies]
-subc-daemon = { path = "../subc-daemon", version = "0.20.1" }
+subc-daemon = { path = "../subc-daemon", version = "0.20.2" }
 cortexkit-log = { version = "0.3.1", git = "https://github.com/cortexkit/commons.git", rev = "b13e7fcee60b42accc256e9c05284ad044b9f8f6" }
 cortexkit-paths = "0.1.1"
 base64 = "0.22"
@@ -69,7 +69,7 @@ rustix = { version = "1", default-features = false, features = ["process"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
-subc-daemon = { path = "../subc-daemon", version = "0.20.1", features = ["test-support"] }
+subc-daemon = { path = "../subc-daemon", version = "0.20.2", features = ["test-support"] }
 # Keep required-feature CLI fixture targets enabled for integration tests.
 subc-core = { path = ".", features = ["test-support"] }
 

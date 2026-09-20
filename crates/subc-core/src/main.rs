@@ -68,7 +68,12 @@ async fn main() {
         process::exit(1);
     }
 
-    if let Err(err) = subc_daemon::bootstrap::run().await {
+    let daemon = async {
+        let config = subc_daemon::bootstrap::BootstrapConfig::from_env_for_daemon_binary()?
+            .with_cgroup_placement(subc_daemon::bootstrap::CgroupPlacementConfig::Current);
+        subc_daemon::bootstrap::run_with_config(config).await
+    };
+    if let Err(err) = daemon.await {
         tracing::error!(error = %err, "subc-core failed");
         eprintln!("subc-core: {err}");
         process::exit(1);

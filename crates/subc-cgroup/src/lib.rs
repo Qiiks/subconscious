@@ -31,11 +31,26 @@ impl Placement {
             Err(error) => Err(error),
         }
     }
+
+    /// Remove this module's cgroup after its child has been reaped.
+    ///
+    /// The kernel refuses to remove a cgroup that still contains a process. The
+    /// caller must report that error rather than treating the module as cleaned up.
+    pub fn remove_module(&self, module_id: &str) -> io::Result<()> {
+        fs::remove_dir(self.modules.join(module_directory_name(module_id)))
+    }
 }
 
-/// Prepare a cgroup subtree for this daemon, or report that it was not delegated.
+/// Prepare the current process's cgroup subtree, or report that it was not delegated.
 pub fn prepare_current() -> io::Result<Option<Placement>> {
-    let cgroup = current_cgroup_path()?;
+    prepare_at(&current_cgroup_path()?)
+}
+
+/// Prepare a cgroup subtree beneath an explicit root.
+///
+/// Explicit roots let tests and embedded daemons own the location they reconcile
+/// instead of deriving a production location from the calling process.
+pub fn prepare_at(cgroup: &Path) -> io::Result<Option<Placement>> {
     if !cgroup.join("cgroup.procs").is_file() {
         return Ok(None);
     }
