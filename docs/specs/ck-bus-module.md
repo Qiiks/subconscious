@@ -20,6 +20,39 @@ against this text, one at a time, reviewed and merged individually. The adversar
 review the pipeline exists to provide has already happened; what remained was minting,
 and minting is a thing I can do by hand.
 
+> **CORRECTION, 2026-09-20, normative over anything below.** The gate
+> `paths-crate-function-absent` is DELETED and the store root is derived by
+> `cortexkit_store_types::module_data_dir("ckbus")`. The spec named the wrong crate:
+> `cortexkit-paths` 0.1.1 exports `ProjectRootId` and `IdentityError` only — it is the
+> project-root canonicalization crate, which subc-daemon depends on for identity and
+> never for storage paths. `cortexkit-store-types` 0.2.2 in the same commons repository
+> is the fleet's single authority for data homes (`resolve_data_home`,
+> `module_data_dir`, `module_store_path`, `resolve_config_home`), pinned by a golden
+> fixture authored in this repository with a byte-identical TypeScript twin. It is
+> added in the same `{ version, git, rev }` form as the bus crates.
+>
+> Six adversarial review rounds did not catch this, and could not: every reviewer read
+> an evidence package containing the spec and not the crate. A CITATION TO A
+> DEPENDENCY'S BEHAVIOUR CANNOT BE REVIEWED FROM INSIDE THE DOCUMENT THAT MAKES IT —
+> only a fire-time read falsifies it, and slice 0's worker did exactly that rather than
+> implementing the refusal the false premise demanded.
+
+> **AMENDMENT, 2026-09-20 (R11), normative.** `stub-reply-shape-unrecorded` is a named
+> fire-time condition, recordable by any row, naming the op it stopped on: the harness
+> stub for `claustrum` or `callosum` has no recorded reply body for that op, so the row
+> cannot gate on a served reply. This is R10 working as designed rather than an
+> exception to it — R10 makes the stub a fixture of SHAPE that MAY refuse, and a stub
+> refusing every op is a correct stub with an empty shape table. Registration, route
+> resolution and principal assertions stay fully exercisable; only rows needing a
+> served BODY record the condition. The shape table is data with one registration seam
+> (op name -> recorded reply body), so filling it is adding rows rather than editing
+> control flow. Claustrum's served op names, read from the checkout at 260b131:
+> `credential.get`, `credential.get_scoped`, `credential.sign`, `credential.public_key`,
+> `credential.list_scoped`, `credential.status`, `credential.report_auth_failure`.
+> Callosum's `callosum.hub_read` is named from the foundation's A5 row rather than from
+> callosum's source, which is a weaker citation and is marked as one. The reply bodies
+> are owed by SUBC, recorded with their source commits.
+
 Foundation: prefrontal `docs/specs/nats-message-plane-foundation.md`. Bus primitives
 are consumed from cortexkit/commons at `4f09c7c7c7f86394d21abde6ed3f97b582ee4d28`
 (`cortexkit-bus-trait`, `-inmemory`, `-naming`, `-nats`).
@@ -43,7 +76,7 @@ Completion, stated once here so a fixture-backed pass is never reported as the r
 | `health-class-carrier-unpinned` | the round trip, not a field: the module writes the byte-exact class string at `metrics.class` in its `health.check` answer and a `supervisor.health_probe` for `ckbus` in the same run returns that byte-exact string at that path. Both legs carry an open `metrics` value at 6844bbb5b7f9, so presence decides nothing | subconscious seat; if a leg cannot carry the string, a SUBC daemon change outside this campaign | the health and sentinel rows |
 | `health-down-escalation-unpinned` | slice 0 citing the fire-time daemon path that classifies an answered unhealthy probe as non-escalating; if that read shows escalation, a SUBC daemon change outside this campaign discharges it | subconscious, owner SUBC | nothing; the slice records the skip and names the read |
 | `naming-constructor-absent` | `cortexkit-bus-naming` constructing every name this campaign introduces at the pinned commons sha; a slice that hits it files the commons change as a branch for SUBC to merge and re-pins, and the gate flips on the new pin | cortexkit/commons; ALF authors, SUBC merges; commons master 4f09c7c7 is the pin; no campaign | the rows that emit the missing name; an absent owner blocks deletion |
-| `paths-crate-function-absent` | `cortexkit-paths` exposing a data-home or module-data-dir entry point at the pinned version, by the same branch-and-re-pin path | cortexkit/commons; ALF authors, SUBC merges; no campaign | every row, since the module refuses to start when it fires; an absent owner blocks deletion |
+| ~~`paths-crate-function-absent`~~ (DELETED, see correction above) | `cortexkit-paths` exposing a data-home or module-data-dir entry point at the pinned version, by the same branch-and-re-pin path | cortexkit/commons; ALF authors, SUBC merges; no campaign | every row, since the module refuses to start when it fires; an absent owner blocks deletion |
 
 This is the only such list; the constraints define each gate and the acceptance ladder says which rows carry it, and neither states a shorter completion test. Two gates on the list are anchored to no ladder row — `ckcred-audit-read-unlanded` and `ckcred-admission-limit-unlanded`, because no arm here reads the audit log or drives `credential.sign` to `Clamped`; their state is read from the served vocabulary at fire time, and whether an F-PROV row needs them at all is settled when `foundation-disposition-table-unquoted` is discharged.
 
@@ -70,7 +103,7 @@ Three rulings from SUBC bind every slice, verbatim. (1) `protocol: "none"` is TH
 - Choosing the leaf-signing shape. Phase 1 is box-local; the link arm runs labelled.
 - Relocating the bus crates again, or building the hosted hub. The crates now live in commons; the hosted hub is a later phase, not a slice.
 - Any daemon change. No slice in this campaign edits the daemon: the campaign consumes the spawn stream and `protocol: "none"` as delivered, and the supervisor holds no credential and writes nothing to the census. Two gates name a daemon change as a discharge path — `health-class-carrier-unpinned` if either gated leg has no field for the class, and `health-down-escalation-unpinned` if the fire-time read shows an answered unhealthy probe escalating. That change is SUBC's work outside this campaign and is never a slice here; if either read fires, the affected rows stay skipped and this campaign lands nothing on the daemon to clear them.
-- Authoring commons changes as slices. Where `naming-constructor-absent` or `paths-crate-function-absent` fires, the slice files the commons change as a branch for SUBC to merge and re-pins; carrying the change itself is not work in this campaign.
+- Authoring commons changes as slices. Where `naming-constructor-absent` fires, the slice files the commons change as a branch for SUBC to merge and re-pins; carrying the change itself is not work in this campaign.
 - Windows support. The campaign's unix scope covers Linux and macOS; non-unix behaviour is asserted by no arm and recorded as `a1-signal-unix-only`.
 
 ## Constraints
@@ -146,7 +179,7 @@ Gates, named so a slice cannot pass by fixture where the real thing is owed. Eac
 - CKCRED's four vault ops gate everything past F-PROV: mint of a signing record under a caller-supplied name and account field, durable delete of a signing record whose repeat on an absent record reports confirmed absence, an audit-log read returning record name and caller principal, and a box-wide admission limiter on `credential.sign` reporting `Clamped` with a retry-after. As read from the claustrum checkout at 7118e35 on 2026-09-20 none of the four has landed. Discharge is CKCRED announcing the op names in #fleet-notices; the fire-time served-vocabulary re-read every slice performs and records is the observable an arm gates on, so an announcement without the op in the served vocabulary does not let an arm run and the row records the skip. This campaign's evidence package is subconscious-only and cannot settle that read-out. Mint and delete are consumed by arms and carry the row skips `ckcred-mint-unlanded` and `ckcred-delete-unlanded`; every arm that needs an authenticated bus client — the dead-letter arm and the reconciliation arms included — carries `ckcred-mint-unlanded` and never gates by borrowing an F-PROV-supplied credential or a stub-issued one. The audit-log read and the admission limiter are consumed by no arm: `ckcred-audit-read-unlanded` and `ckcred-admission-limit-unlanded` are anchored to no row, no row may record them, and whether an F-PROV row needs them is resolved when `foundation-disposition-table-unquoted` is discharged. CKCRED is the named owner in the claustrum repository and has no campaign id yet; that absence blocks only the rows that need the ops.
 - Spawn stream: `spawn-stream-unlanded`, conditional as stated above — recorded only when the fire-time `server.describe` read lacks either op name.
 - Health carrier and escalation: `health-class-carrier-unpinned` where the module-side `health.check` body has no field the class can be written into, or the `supervisor.health_probe` round trip does not return the byte-exact class string at `metrics.class`; any row that reads the class may record it, naming the leg and quoting the observed reply. `SupervisorHealthEntry` is a slice-0 record obligation only. `health-down-escalation-unpinned` stands until a slice cites the fire-time daemon path classifying an answered unhealthy probe, and needs a SUBC daemon change if that path escalates; it blocks no deletion. No slice in this campaign makes either daemon change.
-- Paths crate: `paths-crate-function-absent` where `cortexkit-paths` 0.1.1 exposes no data-home or module-data-dir entry point at fire time. It is evaluated once per run at module start; when it fires the module refuses to start and every row of that run records it.
+- Paths crate: ~~`paths-crate-function-absent`~~ DELETED (see correction above); formerly where `cortexkit-paths` 0.1.1 exposes no data-home or module-data-dir entry point at fire time. It is evaluated once per run at module start; when it fires the module refuses to start and every row of that run records it.
 - Ladder completeness: `foundation-disposition-table-unquoted` until slice 0 quotes the foundation's disposition table from the vendored copy and maps every F-PROV row onto an acceptance row or a named exclusion in its report. It suppresses the completion claim only; no row records it and no row is stopped from gating by it.
 - Naming constructors: `naming-constructor-absent` for any name this campaign introduces that the pinned `cortexkit-bus-naming` does not construct; any row may record it, naming the constructor it stopped on.
 - Platform: `a1-signal-unix-only`, the campaign's single platform skip, recorded on a non-unix host (Windows) where the A1 rows assert nothing. It records a declared out-of-scope platform rather than an unlanded dependency, so it does not appear on `intent`'s completion list.
@@ -199,7 +232,7 @@ Gating is per row, and the row is the unit of skip. Where one part of an asserti
 
 Three fire-time conditions are universal: any row may record them without listing them, and a row that records one names what it observed.
 
-- `paths-crate-function-absent` (C) is evaluated once per run, at module start, when `cortexkit-paths` at the pinned version exposes no data-home or module-data-dir entry point. The module then refuses to start, so every row of the run is skipped and every row records this name.
+- ~~`paths-crate-function-absent`~~ (DELETED, see correction above) formerly (C) is evaluated once per run, at module start, when `cortexkit-paths` at the pinned version exposes no data-home or module-data-dir entry point. The module then refuses to start, so every row of the run is skipped and every row records this name.
 - `naming-constructor-absent` (C), naming the constructor the row stopped on, because the root record names, the participant grammar and the census key grammar are needed by every minting row rather than by a listed few.
 - `health-class-carrier-unpinned` (C), recordable by any row that reads the class, naming the leg and quoting the observed reply.
 
