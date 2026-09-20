@@ -203,12 +203,19 @@ pub struct ModuleSpec {
     pub reserved_prefixes: Vec<String>,
     /// The wire protocol this module speaks, as DECLARED in daemon config.
     ///
-    /// [`ModuleProtocol::None`] changes three things and nothing else: health
-    /// probing is suppressed, teardown sends SIGTERM before waiting, and
-    /// `route.open` is refused. Spawn is identical -- the launch nonce and
-    /// `SUBC_MODULE_ID` still go into the child environment, because they are
-    /// harmless to a process that ignores them and a second spawn path would be
-    /// a second thing to keep correct.
+    /// [`ModuleProtocol::None`] changes four things and nothing else: health
+    /// probing is suppressed, teardown sends SIGTERM before waiting,
+    /// `route.open` is refused, and the spawn passes NO `--subc <path>` argument
+    /// and NO launch nonce. `SUBC_MODULE_ID` still goes into the environment,
+    /// because a process ignores an environment variable it does not read.
+    ///
+    /// The argument is the part that cannot be "harmless to a process that
+    /// ignores it": a stock binary exits on an unknown flag before it listens
+    /// (`nats-server`: "flag provided but not defined: -subc"), which is how the
+    /// first conformance run against this mode found it. The nonce is withheld
+    /// because a process that will never present it gains nothing from holding
+    /// it, and a secret in the environment of a process that does not need it is
+    /// a leak surface for no benefit.
     pub protocol: ModuleProtocol,
 }
 
@@ -1182,6 +1189,16 @@ impl SupervisorHandle {
         for prefix in prefixes {
             owners.insert(prefix.clone(), owner_module_id.to_string());
         }
+    }
+
+    /// The launch nonce most recently minted for a module's spawn, if any.
+    #[cfg(test)]
+    pub(crate) fn spawn_nonce(&self, module_id: &str) -> Option<String> {
+        self.spawn_nonces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(module_id)
+            .cloned()
     }
 
     fn apply_identity_configuration(&self, spec: &ModuleSpec) {
@@ -4406,6 +4423,38 @@ fn untrack_if_registration_released(
 /// Separated from `spawn_child` only so it can be asserted without spawning a
 /// process — a duplicate of this logic in a test would pass while the real one
 /// drifted, which is the defect class this function exists to avoid.
+/// The subc-wire half of a spawn: `--subc <connection file>` and the launch
+/// nonce. A `protocol: "none"` module gets neither, because it cannot use
+/// either and the argument would stop a stock binary from starting at all.
+/// `SUBC_MODULE_ID` is set on every path since an unread variable is inert.
+fn apply_wire_spawn_args(
+    command: &mut Command,
+    spec: &ModuleSpec,
+    connection_file_path: Option<&std::path::Path>,
+    handle: Option<&SupervisorHandle>,
+) -> Result<(), SuperviseError> {
+    command.env(SUBC_MODULE_ID_ENV, &spec.module_id);
+    if spec.protocol == ModuleProtocol::None {
+        return Ok(());
+    }
+    if let Some(connection_file_path) = connection_file_path {
+        command.arg(SUBC_ARG).arg(connection_file_path);
+    }
+
+    // Every subc-wire spawn receives a fresh one-time launch nonce for consumer
+    // route.open attestation. Reserved modules additionally use the same nonce
+    // for HELLO id-squatting protection. A respawn rotates both records.
+    let nonce = generate_launch_nonce()?;
+    if let Some(handle) = handle {
+        handle.set_spawn_nonce(&spec.module_id, nonce.clone());
+        if spec.reserved {
+            handle.set_reserved_nonce(&spec.module_id, nonce.clone());
+        }
+    }
+    command.env(SUBC_LAUNCH_NONCE_ENV, nonce);
+    Ok(())
+}
+
 fn apply_child_env(command: &mut Command, spec: &ModuleSpec) {
     command.env_remove(CK_LOG_ENV);
     for (key, value) in &spec.env {
@@ -4462,22 +4511,7 @@ fn spawn_child(
     // resolved CK_LOG into `spec.env`, which is applied below and therefore
     // wins over anything ambient.
     apply_child_env(&mut command, spec);
-    if let Some(connection_file_path) = connection_file_path {
-        command.arg(SUBC_ARG).arg(connection_file_path);
-    }
-    command.env(SUBC_MODULE_ID_ENV, &spec.module_id);
-
-    // Every supervised spawn receives a fresh one-time launch nonce for consumer
-    // route.open attestation. Reserved modules additionally use the same nonce for
-    // HELLO id-squatting protection. A respawn rotates both records.
-    let nonce = generate_launch_nonce()?;
-    if let Some(handle) = handle {
-        handle.set_spawn_nonce(&spec.module_id, nonce.clone());
-        if spec.reserved {
-            handle.set_reserved_nonce(&spec.module_id, nonce.clone());
-        }
-    }
-    command.env(SUBC_LAUNCH_NONCE_ENV, nonce);
+    apply_wire_spawn_args(&mut command, spec, connection_file_path, handle)?;
 
     #[cfg(target_os = "linux")]
     let cgroup_path = cgroup_placement
@@ -7099,7 +7133,10 @@ mod health_tombstone_tests {
 
 #[cfg(test)]
 mod child_env_tests {
-    use super::{apply_child_env, ModuleProtocol, ModuleSpec};
+    use super::{
+        apply_child_env, apply_wire_spawn_args, ModuleProtocol, ModuleSpec, SupervisorHandle,
+        SUBC_ARG, SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV,
+    };
     use std::{ffi::OsStr, path::PathBuf};
     use tokio::process::Command;
 
@@ -7157,6 +7194,79 @@ mod child_env_tests {
             Some(Some("debug".to_string())),
             "a module's configured CK_LOG must survive the ambient removal"
         );
+    }
+
+    /// A `protocol: "none"` spawn carries NO `--subc` argument and NO launch
+    /// nonce; a subc-wire spawn carries both. Asserted on the command plan for
+    /// the same reason as the CK_LOG test above.
+    ///
+    /// The argument is the load-bearing half: a stock binary exits on an
+    /// unknown flag before it listens, so with `--subc` appended the mode
+    /// could not supervise the one process it exists for. Found by the first
+    /// conformance run (nats-server: `flag provided but not defined: -subc`).
+    #[test]
+    fn protocol_none_spawn_carries_no_subc_argument_and_no_nonce() {
+        let connection_file = std::path::Path::new("/run/subc-connection.json");
+        let handle = SupervisorHandle::new();
+
+        let mut none_spec = spec(Vec::new());
+        none_spec.protocol = ModuleProtocol::None;
+        let mut none = Command::new("/nonexistent");
+        apply_wire_spawn_args(&mut none, &none_spec, Some(connection_file), Some(&handle))
+            .expect("protocol-none spawn args apply");
+        let none_args: Vec<String> = none
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !none_args.iter().any(|a| a == SUBC_ARG),
+            "protocol:none argv must not carry --subc; got {none_args:?}"
+        );
+        let none_has_nonce = none
+            .as_std()
+            .get_envs()
+            .any(|(key, value)| key == OsStr::new(SUBC_LAUNCH_NONCE_ENV) && value.is_some());
+        assert!(
+            !none_has_nonce,
+            "protocol:none spawn must not receive a launch nonce"
+        );
+        let none_has_module_id = none
+            .as_std()
+            .get_envs()
+            .any(|(key, value)| key == OsStr::new(SUBC_MODULE_ID_ENV) && value.is_some());
+        assert!(
+            none_has_module_id,
+            "SUBC_MODULE_ID is inert and stays on every path"
+        );
+        assert!(
+            handle.spawn_nonce(&none_spec.module_id).is_none(),
+            "no nonce record for a process that will never present one"
+        );
+
+        // Control: the subc-wire path is unchanged by the branch above.
+        let wire_spec = spec(Vec::new());
+        let mut wire = Command::new("/nonexistent");
+        apply_wire_spawn_args(&mut wire, &wire_spec, Some(connection_file), Some(&handle))
+            .expect("subc-wire spawn args apply");
+        let wire_args: Vec<String> = wire
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            wire_args,
+            vec![
+                SUBC_ARG.to_string(),
+                connection_file.to_string_lossy().into_owned()
+            ],
+            "a subc-wire spawn still carries --subc <path>"
+        );
+        assert!(wire
+            .as_std()
+            .get_envs()
+            .any(|(key, value)| key == OsStr::new(SUBC_LAUNCH_NONCE_ENV) && value.is_some()));
+        assert!(handle.spawn_nonce(&wire_spec.module_id).is_some());
     }
 
     /// Daemon-private capture retention keys never reach the child.

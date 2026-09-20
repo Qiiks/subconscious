@@ -586,6 +586,15 @@ async fn a_protocol_none_module_is_never_probed_while_its_subc_twin_is_restarted
         ],
     );
     silent_none_spec.protocol = ModuleProtocol::None;
+    // A protocol-none spawn carries no `--subc` (a stock binary would exit on
+    // the unknown flag). This twin is deliberately a subc-wire stub DECLARED
+    // none, so it must be handed the connection file itself to register at all;
+    // the arm proves the declaration governs probing even for a process that
+    // does speak the wire.
+    silent_none_spec.args = vec![
+        "--subc".to_string(),
+        server.connection_file_path.to_string_lossy().into_owned(),
+    ];
     let registers_but_silent_none = supervisor.spawn(silent_none_spec).unwrap();
 
     // The control first: it is the only arm that can fail by waiting, and it
