@@ -18,10 +18,36 @@ on:
     # identical `0 6 * * *` declarations: subconscious n=14 mean +4h19m (range
     # +3h40m..+5h02m), fusiform n=13 mean +4h31m (+3h50m..+5h19m). A stable
     # ~4.5h SHIFT with ~40m of jitter on top, not the load jitter GitHub
-    # documents. This repo is the moving arm of a two-repo experiment; fusiform
-    # stays at `0 6` as the control, so the difference between the two series
-    # after a week separates "everything from 06:00 is delayed" from "this
-    # queue is delayed". Re-measure with:
+    # documents.
+    #
+    # THE MINUTE QUESTION IS CLOSED and this line no longer tests it. CEREB's
+    # `17 4` (n=14, mean +4h54m, +4h22m..+5h36m) lands between the two `0 6`
+    # series, and their 04:17 declaration delivers ~1h20m EARLIER than the
+    # 06:00 ones -- so delivery tracks the declared time and the delay does not
+    # key on the popular `0` minute.
+    #
+    # Two models now fit every series and predict this line's delivery to
+    # within two minutes of each other:
+    #     constant offset   declared + ~4.5h
+    #     timezone          declared read as US Eastern (UTC-4) + 20-55m jitter
+    # Agreement is evidence only if the instruments could have disagreed, and
+    # these cannot -- so this declaration is kept as a fourth data point, not as
+    # a test. The discriminator is the 2026-11-01 US Eastern DST boundary
+    # (UTC-4 -> UTC-5, checked against the tz database): under the timezone
+    # model the UTC delivery shifts an hour, under a true offset it does not.
+    # fusiform is held at `0 6` through that boundary as the control, so a repo
+    # that changed NOTHING separates a scheduler change from a timezone change.
+    #
+    # The immediate reading is a PAIR, not an absolute (CEREB's instrument):
+    # this repo's `17 3` sits exactly one hour before cerebellum's `17 4`, so
+    # on any given morning the GAP between the two deliveries measures the
+    # slope with the day's congestion cancelled as common-mode. A stable 60m
+    # gap means delivery tracks declaration 1:1 and kills every "partly tracks"
+    # story; FUSI's three-point estimate could only bound the slope at ~0.78
+    # with a spread that also admits 1.0. The gap is degenerate across the two
+    # live models above -- both predict 60m -- so it sharpens, it does not
+    # discriminate.
+    # Re-measure with:
     #   gh run list --workflow CI --event schedule --limit 20 \
     #     --json createdAt --jq '.[].createdAt'
     # Until that resolves: anything asking "did the nightly fire?" must size its
