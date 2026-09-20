@@ -2547,7 +2547,7 @@ async fn catalog_report(
                     .module_version
                     .clone()
                     .unwrap_or_else(|| "-".to_string()),
-                entry.ready.to_string(),
+                if entry.ready { "ready" } else { "not ready" }.to_string(),
                 entry.roles.len().to_string(),
             ]);
         }
