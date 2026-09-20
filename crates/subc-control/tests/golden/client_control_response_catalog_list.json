@@ -22,6 +22,7 @@
       ],
       "module_id": "aft-tools",
       "module_version": "0.9.3",
+      "ready": true,
       "roles": [
         {
           "concurrency": "module_managed",

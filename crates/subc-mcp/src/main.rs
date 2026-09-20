@@ -5515,6 +5515,7 @@ mod tests {
         fn provider(module_id: &str, tool_names: &[&str]) -> CatalogEntry {
             CatalogEntry {
                 module_id: module_id.to_string(),
+                ready: true,
                 module_version: None,
                 roles: vec![ProviderRole::ToolProvider {
                     tools: tool_names

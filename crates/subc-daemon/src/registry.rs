@@ -37,6 +37,7 @@ pub enum ChannelState {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModuleRegistration {
     pub manifest: ModuleManifest,
+    pub ready: bool,
     pub negotiated_ver: u8,
     pub state: ChannelState,
     pub connection_id: ConnectionId,
@@ -78,8 +79,10 @@ impl Registry {
             return Err(RegistryError::DuplicateModuleId { module_id });
         }
 
+        let ready = manifest.ready.unwrap_or(true);
         let registration = ModuleRegistration {
             manifest,
+            ready,
             negotiated_ver,
             state: ChannelState::Active,
             connection_id,
@@ -143,6 +146,7 @@ impl Registry {
         connection_id: ConnectionId,
         provides: Vec<ProviderRole>,
         capabilities: Option<CapabilityDeclarations>,
+        ready: Option<bool>,
     ) -> Result<Option<ModuleRegistration>, RegistryError> {
         let mut inner = self.lock_inner()?;
         let Some(module_id) = inner
@@ -161,6 +165,10 @@ impl Registry {
         registration.manifest.provides = provides;
         if let Some(capabilities) = capabilities {
             registration.manifest.capabilities = Some(capabilities);
+        }
+        if let Some(ready) = ready {
+            registration.ready = ready;
+            registration.manifest.ready = Some(ready);
         }
         let updated = registration.clone();
         inner.bump_generation();

@@ -714,6 +714,7 @@ fn bind_identity() -> BindIdentity {
 fn catalog_entry() -> CatalogEntry {
     CatalogEntry {
         module_id: "aft-tools".to_string(),
+        ready: true,
         module_version: Some("0.9.3".to_string()),
         roles: provider_roles(),
         control_ops: vec!["route.bind".to_string(), "route.status".to_string()],
@@ -732,6 +733,7 @@ fn catalog_entry() -> CatalogEntry {
 fn catalog_entry_with_self_signals() -> CatalogEntry {
     CatalogEntry {
         module_id: "signal-tools".to_string(),
+        ready: true,
         module_version: Some("0.10.0".to_string()),
         roles: Vec::new(),
         control_ops: vec!["route.bind".to_string(), "route.status".to_string()],
@@ -768,6 +770,7 @@ fn catalog_entry_with_self_signals() -> CatalogEntry {
 fn catalog_entry_without_capabilities() -> CatalogEntry {
     CatalogEntry {
         module_id: "legacy-tools".to_string(),
+        ready: true,
         module_version: Some("0.8.0".to_string()),
         roles: Vec::new(),
         control_ops: vec!["route.bind".to_string(), "route.status".to_string()],
@@ -779,6 +782,7 @@ fn catalog_entry_without_capabilities() -> CatalogEntry {
 fn catalog_entry_without_operation_description() -> CatalogEntry {
     CatalogEntry {
         module_id: "legacy-management".to_string(),
+        ready: true,
         module_version: Some("0.7.0".to_string()),
         roles: vec![ProviderRole::ManagementSurface {
             operations: vec![ManagementOperation {

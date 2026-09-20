@@ -125,6 +125,7 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
         &ModuleControlRequestFromModule::CatalogUpdate {
             provides: provider_roles(),
             capabilities: None,
+            ready: None,
         },
     );
     assert_golden(
@@ -136,6 +137,7 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
                 requires: Vec::new(),
                 must_never_reach: vec!["federation-transport/v1".to_string()],
             }),
+            ready: Some(false),
         },
     );
     assert_golden(
@@ -206,6 +208,27 @@ fn manifest_without_provenance_preserves_the_existing_hello_wire_shape() {
         .expect("existing HELLO golden is JSON"),
         "an absent provenance declaration must preserve the existing HELLO bytes"
     );
+}
+
+#[test]
+fn manifest_readiness_defaults_to_ready_and_none_omits_wire_key() {
+    let without_ready: ModuleHelloBody =
+        serde_json::from_value(read_manifest_vector("module_hello_body"))
+            .expect("legacy HELLO fixture decodes");
+    assert!(without_ready.manifest.ready.unwrap_or(true));
+
+    let declared_not_ready: ModuleHelloBody =
+        serde_json::from_value(read_manifest_vector("module_hello_body_with_provenance"))
+            .expect("readiness HELLO fixture decodes");
+    assert_eq!(declared_not_ready.manifest.ready, Some(false));
+
+    let manifest = ModuleManifest::builder("ready-omission", "1.0.0").build();
+    let encoded = serde_json::to_value(&manifest).expect("manifest serializes");
+    assert!(encoded.get("ready").is_none());
+    let decoded: ModuleManifest =
+        serde_json::from_value(encoded).expect("wire manifest round-trips");
+    assert_eq!(decoded.ready, None);
+    assert!(decoded.ready.unwrap_or(true));
 }
 
 #[test]
@@ -604,6 +627,7 @@ fn module_hello_body() -> ModuleHelloBody {
 
 fn module_hello_body_with_provenance() -> ModuleHelloBody {
     let mut hello = module_hello_body();
+    hello.manifest.ready = Some(false);
     hello.manifest.provenance = Some(ManifestProvenance {
         build_git_sha: Some("0123456789abcdef0123456789abcdef01234567-dirty".to_string()),
         build_git_sha_absence_reason: None,

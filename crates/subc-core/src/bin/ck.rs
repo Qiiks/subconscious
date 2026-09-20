@@ -2547,10 +2547,11 @@ async fn catalog_report(
                     .module_version
                     .clone()
                     .unwrap_or_else(|| "-".to_string()),
+                entry.ready.to_string(),
                 entry.roles.len().to_string(),
             ]);
         }
-        print_table(&["module", "version", "roles"], rows);
+        print_table(&["module", "version", "ready", "roles"], rows);
     }
 
     // A named module that is absent exits non-zero so a harness can poll this verb

@@ -147,6 +147,12 @@ pub enum ModuleControlRequestFromModule {
         /// declaration so existing role-only catalog updates remain byte-identical.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         capabilities: Option<CapabilityDeclarations>,
+        /// Updates readiness without re-registering. `None` leaves it unchanged.
+        ///
+        /// Both directions are allowed, but repeatedly flapping readiness looks
+        /// like a restart storm to callers and is a defect in the module.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ready: Option<bool>,
     },
 }
 

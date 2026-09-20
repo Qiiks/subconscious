@@ -43,6 +43,7 @@ use crate::{
         ModuleControlRpcCompletion, ModuleControlRpcOutcome, ModuleEndpointId,
         PendingModuleControlRpc, RouteBindRelayOutcome, RoutePollSnapshot, RouteRelease,
     },
+    observability::ROUTE_OPEN_REFUSED_DECLARED_NOT_READY,
     provenance::{
         process_start_time, spawned_file_identity, ExecutableIdentityProbe, SpawnedFileIdentity,
     },
@@ -1768,7 +1769,8 @@ impl ControlHandler {
             ModuleControlRequestFromModule::CatalogUpdate {
                 provides,
                 capabilities,
-            } => self.handle_catalog_update(connection_id, frame, provides, capabilities),
+                ready,
+            } => self.handle_catalog_update(connection_id, frame, provides, capabilities, ready),
         }
     }
 
@@ -1778,6 +1780,7 @@ impl ControlHandler {
         frame: Frame,
         provides: Vec<ProviderRole>,
         capabilities: Option<CapabilityDeclarations>,
+        ready: Option<bool>,
     ) -> Result<Vec<Frame>, RouterError> {
         self.refresh_capability_requirements();
         let Some(registration) = self
@@ -1817,7 +1820,7 @@ impl ControlHandler {
 
         let updated = self
             .registry
-            .replace_catalog_for_connection(connection_id, provides, capabilities)
+            .replace_catalog_for_connection(connection_id, provides, capabilities, ready)
             .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
         if updated.is_none() {
             return Ok(vec![control_error_frame(
@@ -1917,6 +1920,7 @@ impl ControlHandler {
                 let roles = registration.manifest.provides;
                 CatalogEntry {
                     module_id: registration.manifest.module_id,
+                    ready: registration.ready,
                     module_version: Some(registration.manifest.module_version),
                     roles,
                     control_ops: registration.control_ops,
@@ -2231,6 +2235,34 @@ impl ControlHandler {
                 format!("module_id '{target_module_id}' is not registered"),
             )?]);
         };
+
+        // Best-effort only: registry readiness and forwarding reservation use
+        // different locks, so a module can flip readiness between this read and
+        // the relay. Modules must still tolerate an `on_bind` while not ready.
+        if !registration.ready {
+            self.counters
+                .increment_route_open_refused(ROUTE_OPEN_REFUSED_DECLARED_NOT_READY);
+            info!(
+                target: "control",
+                code = error_codes::MODULE_WARMING,
+                module_id = ?target_module_id,
+                connection_id = ctx.connection_id.get(),
+                reason = "declared_not_ready",
+                "route.open refused"
+            );
+            return Ok(vec![control_error_body_frame(
+                &frame,
+                ErrorBody {
+                    code: error_codes::MODULE_WARMING.to_string(),
+                    message: format!(
+                        "module_id '{target_module_id}' is registered and has declared itself not ready; retry"
+                    ),
+                    detail: Some(serde_json::json!({
+                        "reason": "declared_not_ready"
+                    })),
+                },
+            )?]);
+        }
 
         if !target_has_required_role(&target, &registration.manifest.provides) {
             return Ok(vec![self.route_open_refusal_frame(
@@ -8300,6 +8332,7 @@ mod tests {
             serde_json::to_vec(&ModuleControlRequestFromModule::CatalogUpdate {
                 provides: manifest("catalog-update-placeholder", PROTOCOL_VERSION).provides,
                 capabilities: Some(capabilities),
+                ready: None,
             })
             .expect("capability catalog.update serializes"),
         )

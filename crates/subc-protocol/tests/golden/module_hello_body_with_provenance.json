@@ -53,6 +53,7 @@
         ]
       }
     ],
+    "ready": false,
     "trust_tier": "first_party"
   },
   "protocol_ver": 2

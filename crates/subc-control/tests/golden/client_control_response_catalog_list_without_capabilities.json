@@ -8,6 +8,7 @@
       ],
       "module_id": "legacy-tools",
       "module_version": "0.8.0",
+      "ready": true,
       "roles": []
     }
   ],

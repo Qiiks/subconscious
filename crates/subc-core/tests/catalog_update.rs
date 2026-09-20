@@ -1,7 +1,17 @@
-use std::{collections::VecDeque, ops::Deref, path::Path, time::Duration};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    fmt, fs,
+    ops::Deref,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
+    time::Duration,
+};
 
 use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse};
-use subc_daemon::{read_frame, test_support::TestTempDir, write_frame, Frame};
+use subc_daemon::{
+    read_frame, test_support::TestTempDir, write_frame, Frame, ModuleSpec, RestartPolicy,
+    SupervisedModule, Supervisor, SupervisorHandle, SupervisorProcessLiveness,
+};
 use subc_protocol::{
     manifest::{
         Concurrency, ExecutionMode, IdentityScope, ManifestProvenance, ModuleManifest,
@@ -23,23 +33,59 @@ use tokio::{
     },
     sync::mpsc,
     task::JoinHandle,
-    time::{timeout, Instant},
+    time::{sleep, timeout, Instant},
 };
+use tracing::{
+    field::{Field, Visit},
+    Event, Subscriber,
+};
+use tracing_subscriber::{layer::Context, prelude::*, Layer};
 
 mod common;
-use common::{connect_authed_client, TestDaemon};
+use common::{
+    connect_authed_client, start_test_daemon_with_process_liveness_and_supervisor, TestDaemon,
+};
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct TestServer {
     daemon: TestDaemon,
+    process_liveness: Arc<SupervisorProcessLiveness>,
+    supervisor_handle: SupervisorHandle,
 }
 
 impl TestServer {
     async fn start() -> Self {
+        let _ = event_capture();
+        let process_liveness = Arc::new(SupervisorProcessLiveness::new());
+        let supervisor_handle = SupervisorHandle::new();
+        let daemon = start_test_daemon_with_process_liveness_and_supervisor(
+            "catalog-update-server",
+            process_liveness.clone(),
+            supervisor_handle.clone(),
+        )
+        .await;
         Self {
-            daemon: TestDaemon::start("catalog-update-server").await,
+            daemon,
+            process_liveness,
+            supervisor_handle,
         }
+    }
+
+    fn supervisor(&self) -> Supervisor {
+        Supervisor::new(
+            Arc::clone(&self.registry),
+            RestartPolicy::new(0, Duration::ZERO),
+        )
+        .with_process_liveness(Arc::clone(&self.process_liveness))
+        .with_forwarding(Arc::clone(&self.forwarding))
+        .with_handle(self.supervisor_handle.clone())
+        .with_drain_timeout(Duration::from_millis(25))
+        .with_connection_file_path(self.connection_file_path.clone())
+    }
+
+    fn stub_events_path(&self, label: &str) -> PathBuf {
+        self.temp_dir.join(format!("{label}-events.jsonl"))
     }
 }
 
@@ -57,6 +103,61 @@ struct RoutePair {
     client_epoch: u32,
     module_channel: u16,
     module_epoch: u32,
+}
+
+#[derive(Clone, Default)]
+struct EventCapture {
+    events: Arc<Mutex<Vec<CapturedEvent>>>,
+}
+
+#[derive(Clone, Debug)]
+struct CapturedEvent {
+    target: String,
+    fields: BTreeMap<String, String>,
+}
+
+impl EventCapture {
+    fn events(&self) -> Vec<CapturedEvent> {
+        self.events.lock().unwrap().clone()
+    }
+}
+
+impl<S> Layer<S> for EventCapture
+where
+    S: Subscriber,
+{
+    fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+        let mut visitor = EventFieldVisitor::default();
+        event.record(&mut visitor);
+        self.events.lock().unwrap().push(CapturedEvent {
+            target: event.metadata().target().to_string(),
+            fields: visitor.fields,
+        });
+    }
+}
+
+#[derive(Default)]
+struct EventFieldVisitor {
+    fields: BTreeMap<String, String>,
+}
+
+impl Visit for EventFieldVisitor {
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        self.fields
+            .insert(field.name().to_string(), format!("{value:?}"));
+    }
+}
+
+fn event_capture() -> &'static EventCapture {
+    static CAPTURE: OnceLock<EventCapture> = OnceLock::new();
+    CAPTURE.get_or_init(|| {
+        let capture = EventCapture::default();
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::registry().with(capture.clone()),
+        )
+        .expect("catalog_update test process installs one tracing subscriber");
+        capture
+    })
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -213,6 +314,153 @@ async fn catalog_update_refreshes_catalog_without_disrupting_bound_routes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn declared_not_ready_refuses_without_relay_until_catalog_update_marks_ready() {
+    let server = TestServer::start().await;
+    let supervisor = server.supervisor();
+    let module_id = "declared-not-ready-provider";
+    let update_path = server.temp_dir.join("publish-ready");
+    let (module, events_path) = spawn_ready_stub(
+        &server,
+        &supervisor,
+        module_id,
+        "declared-not-ready",
+        Some(&update_path),
+    )
+    .await;
+
+    let registration = server
+        .registry
+        .get_module(module_id)
+        .unwrap()
+        .expect("stub registered");
+    assert!(!registration.ready);
+    let (_, initial_catalog) = catalog_list(&server, Some(module_id), 710).await;
+    assert!(!initial_catalog[0].ready);
+
+    let project = TestProject::new("declared-not-ready-first-open");
+    let mut client = connect_endpoint(&server, "readiness-client").await;
+    let first = route_open_terminal(&mut client, &project, module_id, 711).await;
+    assert!(
+        !stub_events(&events_path)
+            .iter()
+            .any(|event| event["kind"] == "attach"),
+        "registered ready:false module must receive no route.bind; stub journal: {:?}",
+        stub_events(&events_path)
+    );
+    assert_eq!(first.header.ty, FrameType::Error);
+    let first_error: ErrorBody = serde_json::from_slice(&first.body).unwrap();
+    assert_eq!(first_error.code, "module_warming");
+    assert_eq!(
+        first_error.detail,
+        Some(serde_json::json!({"reason": "declared_not_ready"}))
+    );
+
+    fs::write(&update_path, b"ready").unwrap();
+    wait_for_stub_event(&events_path, |event| {
+        event["kind"] == "catalog_ready_update_sent"
+    })
+    .await;
+    wait_for_stub_event(&events_path, |event| {
+        event["kind"] == "catalog_ready_update_ack"
+    })
+    .await;
+
+    let second = route_open_terminal(&mut client, &project, module_id, 713).await;
+    assert_eq!(
+        second.header.ty,
+        FrameType::Response,
+        "catalog.update ready:true must make the next route.open bind: {}",
+        String::from_utf8_lossy(&second.body)
+    );
+    let response: ClientControlResponse = serde_json::from_slice(&second.body).unwrap();
+    assert!(matches!(response, ClientControlResponse::RouteOpen { .. }));
+    wait_for_stub_event(&events_path, |event| event["kind"] == "attach").await;
+    wait_for_registration_ready(&server, module_id, true).await;
+    let (_, updated_catalog) = catalog_list(&server, Some(module_id), 712).await;
+    assert!(updated_catalog[0].ready);
+
+    module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn declared_not_ready_and_supervised_absence_are_observably_distinct() {
+    let server = TestServer::start().await;
+    let supervisor = server.supervisor();
+    let declared_id = "declared-not-ready-discrimination";
+    let (declared, _events_path) = spawn_ready_stub(
+        &server,
+        &supervisor,
+        declared_id,
+        "declared-not-ready-discrimination",
+        None,
+    )
+    .await;
+
+    let absent_id = "supervised-not-registered-discrimination";
+    let absent_ready = server.temp_dir.join("supervised-absent-ready");
+    let absent = supervisor
+        .spawn(ModuleSpec {
+            module_id: absent_id.to_string(),
+            program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
+            args: Vec::new(),
+            env: vec![
+                ("FAKE_AFT_MODULE_ID".to_string(), absent_id.to_string()),
+                ("FAKE_AFT_NEVER_CONNECT".to_string(), "1".to_string()),
+                (
+                    "FAKE_AFT_NEVER_CONNECT_READY_PATH".to_string(),
+                    absent_ready.to_string_lossy().into_owned(),
+                ),
+            ],
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+            protocol: subc_control::ModuleProtocol::Subc,
+        })
+        .unwrap();
+    wait_for_path(&absent_ready).await;
+
+    let mut client = connect_endpoint(&server, "discrimination-client").await;
+    let declared_project = TestProject::new("declared-discrimination");
+    let declared_frame =
+        route_open_terminal(&mut client, &declared_project, declared_id, 720).await;
+    let declared_error: ErrorBody = serde_json::from_slice(&declared_frame.body).unwrap();
+    let absent_project = TestProject::new("absent-discrimination");
+    let absent_frame = route_open_terminal(&mut client, &absent_project, absent_id, 721).await;
+    let absent_error: ErrorBody = serde_json::from_slice(&absent_frame.body).unwrap();
+
+    assert_eq!(declared_error.code, "module_warming");
+    assert_eq!(absent_error.code, "module_warming");
+
+    let counters = server_describe_counters(&server, 722).await;
+    assert_eq!(
+        counters["route_open_refused_by_code"]["module_warming_declared_not_ready"],
+        1
+    );
+    assert_eq!(counters["route_open_refused_by_code"]["module_warming"], 1);
+
+    let events = event_capture().events();
+    let declared_log = refusal_event(&events, declared_id);
+    assert_eq!(
+        declared_log.fields.get("reason"),
+        Some(&"\"declared_not_ready\"".to_string())
+    );
+    assert!(!declared_log.fields.contains_key("state"));
+    let absent_log = refusal_event(&events, absent_id);
+    assert!(!absent_log.fields.contains_key("reason"));
+    assert_eq!(absent_log.fields.get("state"), Some(&"running".to_string()));
+    assert_eq!(absent_log.fields.get("enabled"), Some(&"true".to_string()));
+    assert_eq!(absent_log.fields.get("live"), Some(&"false".to_string()));
+
+    assert_eq!(
+        declared_error.detail,
+        Some(serde_json::json!({"reason": "declared_not_ready"}))
+    );
+    assert_eq!(absent_error.detail, None);
+
+    declared.stop().await.unwrap();
+    absent.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hello_self_signals_are_mirrored_and_missing_axes_are_refused() {
     let server = TestServer::start().await;
     let mut module = connect_endpoint(&server, "self-signal-module").await;
@@ -308,6 +556,7 @@ async fn hello_with_fields_absent_manifest_registers_and_serves_catalog_list() {
     assert!(manifest.trust_tier.is_none());
     assert!(manifest.consumes.is_empty());
     assert!(manifest.bindings.is_none());
+    assert!(manifest.ready.is_none());
 
     let hello_body = serde_json::to_value(&ModuleHelloBody {
         manifest: manifest.clone(),
@@ -320,14 +569,29 @@ async fn hello_with_fields_absent_manifest_registers_and_serves_catalog_list() {
     assert!(manifest_obj.get("trust_tier").is_none());
     assert!(manifest_obj.get("consumes").is_none());
     assert!(manifest_obj.get("bindings").is_none());
+    assert!(manifest_obj.get("ready").is_none());
 
     let hello_ack = register_module(&server, &mut module, manifest, 101).await;
     assert_eq!(hello_ack.negotiated_ver, PROTOCOL_VERSION);
+    assert!(
+        server
+            .registry
+            .get_module(module_id)
+            .unwrap()
+            .expect("module registered")
+            .ready,
+        "a HELLO without ready must preserve the pre-field ready behavior"
+    );
 
     let (_generation, modules) = catalog_list(&server, Some(module_id), 201).await;
     assert_eq!(modules.len(), 1);
     assert_eq!(modules[0].module_id, module_id);
+    assert!(modules[0].ready);
     assert_tool_names(&modules[0], &["test_tool"]);
+
+    let project = TestProject::new("ready-field-absent");
+    let mut client = connect_endpoint(&server, "ready-field-absent-client").await;
+    let _route = open_route(&mut client, &mut module, &project, module_id, 202).await;
 }
 
 // The premise `ck upgrade` rests on when it restarts the daemon before the
@@ -552,6 +816,7 @@ fn catalog_update_frame(corr: u64, provides: Vec<ProviderRole>) -> Frame {
     let body = serde_json::to_vec(&ModuleControlRequestFromModule::CatalogUpdate {
         provides,
         capabilities: None,
+        ready: None,
     })
     .unwrap();
     Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body).unwrap()
@@ -622,6 +887,167 @@ fn tool_provider_role(tools: &[&str], concurrency: Concurrency) -> ProviderRole 
         emits_push: true,
         sub_supervises: true,
     }
+}
+
+async fn spawn_ready_stub(
+    server: &TestServer,
+    supervisor: &Supervisor,
+    module_id: &str,
+    label: &str,
+    ready_update_path: Option<&Path>,
+) -> (SupervisedModule, PathBuf) {
+    let events_path = server.stub_events_path(label);
+    let mut env = vec![
+        ("FAKE_AFT_MODULE_ID".to_string(), module_id.to_string()),
+        ("FAKE_AFT_READY_FALSE".to_string(), "1".to_string()),
+        (
+            "FAKE_AFT_EVENTS_PATH".to_string(),
+            events_path.to_string_lossy().into_owned(),
+        ),
+    ];
+    if let Some(path) = ready_update_path {
+        env.push((
+            "FAKE_AFT_READY_UPDATE_PATH".to_string(),
+            path.to_string_lossy().into_owned(),
+        ));
+    }
+    let module = supervisor
+        .spawn(ModuleSpec {
+            module_id: module_id.to_string(),
+            program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
+            args: Vec::new(),
+            env,
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+            protocol: subc_control::ModuleProtocol::Subc,
+        })
+        .unwrap();
+    wait_for_registration_ready(server, module_id, false).await;
+    (module, events_path)
+}
+
+async fn route_open_terminal(
+    client: &mut Endpoint,
+    project: &TestProject,
+    module_id: &str,
+    corr: u64,
+) -> Frame {
+    client
+        .send(&control_request_frame(
+            corr,
+            ClientControlRequest::RouteOpen {
+                target: RouteTarget::ToolProvider {
+                    module_id: module_id.to_string(),
+                },
+                identity: BindIdentity::new(
+                    project.path().to_path_buf(),
+                    "opencode".to_string(),
+                    format!("readiness-{corr}"),
+                ),
+                consumer_identity: None,
+                consumer_capabilities: None,
+                admission_facts: None,
+            },
+        ))
+        .await;
+    client
+        .inbox
+        .wait_for(SETUP_TIMEOUT, "route.open terminal", |frame| {
+            frame.header.channel == 0
+                && frame.header.corr == corr
+                && matches!(frame.header.ty, FrameType::Response | FrameType::Error)
+        })
+        .await
+}
+
+async fn server_describe_counters(server: &TestServer, corr: u64) -> serde_json::Value {
+    let mut client = connect_endpoint(server, "server-describe-client").await;
+    client
+        .send(&control_request_frame(
+            corr,
+            ClientControlRequest::ServerDescribe {},
+        ))
+        .await;
+    let frame = client
+        .inbox
+        .wait_for(SETUP_TIMEOUT, "server.describe response", |frame| {
+            frame.header.ty == FrameType::Response
+                && frame.header.channel == 0
+                && frame.header.corr == corr
+        })
+        .await;
+    match serde_json::from_slice::<ClientControlResponse>(&frame.body).unwrap() {
+        ClientControlResponse::ServerDescribe { counters, .. } => {
+            counters.expect("server.describe counters")
+        }
+        other => panic!("unexpected server.describe response: {other:?}"),
+    }
+}
+
+fn refusal_event<'a>(events: &'a [CapturedEvent], module_id: &str) -> &'a CapturedEvent {
+    let rendered_module_id = format!("{module_id:?}");
+    events
+        .iter()
+        .find(|event| {
+            event.target == "control"
+                && event.fields.get("message") == Some(&"route.open refused".to_string())
+                && event.fields.get("module_id") == Some(&rendered_module_id)
+        })
+        .unwrap_or_else(|| panic!("no route.open refusal log for {module_id:?}: {events:?}"))
+}
+
+async fn wait_for_registration_ready(server: &TestServer, module_id: &str, ready: bool) {
+    let deadline = Instant::now() + SETUP_TIMEOUT;
+    loop {
+        if server
+            .registry
+            .get_module(module_id)
+            .unwrap()
+            .is_some_and(|registration| registration.ready == ready)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "module {module_id} did not reach ready={ready} within {SETUP_TIMEOUT:?}"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_for_path(path: &Path) {
+    let deadline = Instant::now() + SETUP_TIMEOUT;
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "{} did not appear within {SETUP_TIMEOUT:?}",
+            path.display()
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_for_stub_event(path: &Path, matches: impl Fn(&serde_json::Value) -> bool) {
+    let deadline = Instant::now() + SETUP_TIMEOUT;
+    loop {
+        if stub_events(path).iter().any(&matches) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "stub event did not appear within {SETUP_TIMEOUT:?}; events: {:?}",
+            stub_events(path)
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn stub_events(path: &Path) -> Vec<serde_json::Value> {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
 }
 
 struct Endpoint {

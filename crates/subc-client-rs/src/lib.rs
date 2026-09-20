@@ -291,6 +291,7 @@ impl ModuleHandle {
         let body = serde_json::to_vec(&ModuleControlRequestFromModule::CatalogUpdate {
             provides,
             capabilities,
+            ready: None,
         })
         .map_err(|err| {
             CatalogUpdateError::Protocol(format!(

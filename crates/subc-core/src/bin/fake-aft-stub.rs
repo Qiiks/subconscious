@@ -26,7 +26,7 @@ use subc_protocol::{
     },
     session::{
         HealthStatus, ModuleControlCommand, ModuleControlPush, ModuleControlRequest,
-        ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK,
+        ModuleControlRequestFromModule, ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK,
     },
     ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority, PROTOCOL_VERSION,
     SUBC_PROTOCOL_CRATE_VERSION,
@@ -60,6 +60,10 @@ const FAKE_AFT_FAIL_REGISTRATION_ENV: &str = "FAKE_AFT_FAIL_REGISTRATION";
 const FAKE_AFT_FAIL_REGISTRATION_AFTER_FIRST_PATH_ENV: &str =
     "FAKE_AFT_FAIL_REGISTRATION_AFTER_FIRST_PATH";
 const FAKE_AFT_EVENTS_PATH_ENV: &str = "FAKE_AFT_EVENTS_PATH";
+/// Presence makes HELLO declare `ready: false`; absence omits the field.
+const FAKE_AFT_READY_FALSE_ENV: &str = "FAKE_AFT_READY_FALSE";
+/// When this path appears, send `catalog.update { ready: true }`.
+const FAKE_AFT_READY_UPDATE_PATH_ENV: &str = "FAKE_AFT_READY_UPDATE_PATH";
 const FAKE_AFT_EMIT_AFTER_DETACH_ENV: &str = "FAKE_AFT_EMIT_AFTER_DETACH";
 const FAKE_AFT_PUSH_ON_REQUEST_ENV: &str = "FAKE_AFT_PUSH_ON_REQUEST";
 const FAKE_AFT_FANOUT_ON_REQUEST_ENV: &str = "FAKE_AFT_FANOUT_ON_REQUEST";
@@ -177,6 +181,7 @@ const FAKE_AFT_NEVER_CONNECT_READY_PATH_ENV: &str = "FAKE_AFT_NEVER_CONNECT_READ
 /// assertion passes whether or not the environment ever reached the process.
 const DEFAULT_MODULE_ID: &str = "fake-aft";
 const HELLO_CORR: u64 = 1;
+const READY_UPDATE_CORR: u64 = 2;
 const STUB_EGRESS_BUFFER: usize = 64;
 const FAKE_AFT_FIXTURE_SUFFIX: &str = ".fixture.json";
 
@@ -485,6 +490,17 @@ where
     send_hello(&writer, &config).await?;
     expect_hello_ack(read_half).await?;
 
+    if let Some(path) = config.ready_update_path.clone() {
+        let update_writer = writer.clone();
+        let update_config = config.clone();
+        tokio::spawn(async move {
+            while !path.exists() {
+                sleep(Duration::from_millis(10)).await;
+            }
+            let _ = send_ready_update(&update_writer, &update_config).await;
+        });
+    }
+
     if let Some((exit_after, exit_code)) = config
         .crash_after
         .map(|after| (after, 2))
@@ -548,6 +564,7 @@ async fn send_hello(writer: &mpsc::Sender<Frame>, config: &StubConfig) -> Result
             &config.tools,
             config.capabilities.clone(),
             &config.busy_gauges,
+            config.ready,
         ),
         protocol_ver: PROTOCOL_VERSION,
         control_ops: if config.advertise_health {
@@ -561,6 +578,39 @@ async fn send_hello(writer: &mpsc::Sender<Frame>, config: &StubConfig) -> Result
     let frame = Frame::build(FrameType::Hello, control_flags(), 0, 0, HELLO_CORR, body)
         .map_err(StubError::FrameBuild)?;
     send_outbound(writer, frame).await
+}
+
+async fn send_ready_update(
+    writer: &mpsc::Sender<Frame>,
+    config: &StubConfig,
+) -> Result<(), StubError> {
+    let provides = manifest(
+        &config.module_id,
+        config.role.clone(),
+        config.concurrency.clone(),
+        &config.tools,
+        config.capabilities.clone(),
+        &config.busy_gauges,
+        config.ready,
+    )
+    .provides;
+    let body = serde_json::to_vec(&ModuleControlRequestFromModule::CatalogUpdate {
+        provides,
+        capabilities: None,
+        ready: Some(true),
+    })
+    .map_err(StubError::Json)?;
+    let frame = Frame::build(
+        FrameType::Request,
+        control_flags(),
+        0,
+        0,
+        READY_UPDATE_CORR,
+        body,
+    )
+    .map_err(StubError::FrameBuild)?;
+    send_outbound(writer, frame).await?;
+    record_event(config, json!({"kind": "catalog_ready_update_sent"}))
 }
 
 async fn expect_hello_ack<R>(reader: &mut R) -> Result<ModuleHelloAckBody, StubError>
@@ -647,6 +697,12 @@ async fn handle_frame(
                     }),
                 )?,
             }
+            Ok(true)
+        }
+        FrameType::Response
+            if frame.header.channel == 0 && frame.header.corr == READY_UPDATE_CORR =>
+        {
+            record_event(config, json!({"kind": "catalog_ready_update_ack"}))?;
             Ok(true)
         }
         FrameType::Error => {
@@ -1511,6 +1567,7 @@ fn manifest(
     tools: &[String],
     capabilities: Option<CapabilityDeclarations>,
     busy_gauges: &[String],
+    ready: Option<bool>,
 ) -> subc_protocol::manifest::ModuleManifest {
     let self_signals = (!busy_gauges.is_empty()).then(|| {
         vec![SelfSignalDeclaration {
@@ -1525,12 +1582,15 @@ fn manifest(
             note: None,
         }]
     });
-    subc_protocol::manifest::ModuleManifest::builder(module_id, "0.0.0-fake")
+    let mut builder = subc_protocol::manifest::ModuleManifest::builder(module_id, "0.0.0-fake")
         .provides(vec![provider_role(role, concurrency, tools)])
         .capabilities(capabilities)
         .self_signals(self_signals)
-        .provenance(manifest_provenance())
-        .build()
+        .provenance(manifest_provenance());
+    if let Some(ready) = ready {
+        builder = builder.ready(ready);
+    }
+    builder.build()
 }
 
 fn manifest_provenance() -> Option<ManifestProvenance> {
@@ -1662,6 +1722,8 @@ struct StubConfig {
     malformed_bind_reply: Option<MalformedBindReply>,
     fail_registration: bool,
     events_path: Option<PathBuf>,
+    ready: Option<bool>,
+    ready_update_path: Option<PathBuf>,
     emit_after_detach: bool,
     push_on_request: bool,
     fanout_on_request: bool,
@@ -1789,6 +1851,8 @@ impl StubConfig {
             malformed_bind_reply: malformed_bind_reply_from_env()?,
             fail_registration,
             events_path,
+            ready: env_flag(FAKE_AFT_READY_FALSE_ENV).then_some(false),
+            ready_update_path: env::var_os(FAKE_AFT_READY_UPDATE_PATH_ENV).map(PathBuf::from),
             emit_after_detach: env_flag(FAKE_AFT_EMIT_AFTER_DETACH_ENV),
             push_on_request: env_flag(FAKE_AFT_PUSH_ON_REQUEST_ENV),
             fanout_on_request: env_flag(FAKE_AFT_FANOUT_ON_REQUEST_ENV),

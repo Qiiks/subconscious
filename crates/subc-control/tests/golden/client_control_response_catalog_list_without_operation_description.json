@@ -5,6 +5,7 @@
       "control_ops": [],
       "module_id": "legacy-management",
       "module_version": "0.7.0",
+      "ready": true,
       "roles": [
         {
           "concurrency": "module_managed",

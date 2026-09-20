@@ -1286,6 +1286,10 @@ fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// Bounded terminal history for one module, oldest retained record first.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TerminalHistory {
@@ -1403,6 +1407,11 @@ pub enum PollKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CatalogEntry {
     pub module_id: String,
+    /// Whether the registered module currently accepts new route binds.
+    ///
+    /// Older daemons omit this field and are interpreted as ready.
+    #[serde(default = "default_true")]
+    pub ready: bool,
     /// The registered module's self-declared build version, projected from its
     /// manifest so a consumer can tell WHICH BUILD of a module it is talking
     /// to at connect time.

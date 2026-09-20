@@ -5,6 +5,7 @@
   ],
   "module_id": "signal-tools",
   "module_version": "0.10.0",
+  "ready": true,
   "roles": [],
   "self_signals": [
     {

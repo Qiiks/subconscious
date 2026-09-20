@@ -27,6 +27,14 @@ pub struct ModuleManifest {
     pub protocol_ver: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_tier: Option<TrustTier>,
+    /// Whether this registered module is ready to receive new route binds.
+    ///
+    /// Absence means ready, preserving the behavior of manifests emitted before
+    /// this field existed. This is a best-effort admission hint, not an invariant:
+    /// the daemon reads readiness separately from reserving a relay, so modules
+    /// must still tolerate an `on_bind` while not ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready: Option<bool>,
     /// Existing role declarations; capability grammar claims deliberately live in
     /// the separate [`CapabilityDeclarations`] block below.
     pub provides: Vec<ProviderRole>,
@@ -88,6 +96,7 @@ pub struct ModuleManifestBuilder {
     module_version: String,
     protocol_ver: u8,
     trust_tier: Option<TrustTier>,
+    ready: Option<bool>,
     provides: Vec<ProviderRole>,
     consumes: Vec<ConsumerRole>,
     bindings: Option<Bindings>,
@@ -113,6 +122,7 @@ impl ModuleManifest {
             module_version: module_version.into(),
             protocol_ver: PROTOCOL_VERSION,
             trust_tier: None,
+            ready: None,
             provides: Vec::new(),
             consumes: Vec::new(),
             bindings: None,
@@ -135,6 +145,12 @@ impl ModuleManifestBuilder {
     /// The daemon does not evaluate this field on any production path.
     pub fn trust_tier(mut self, trust_tier: Option<TrustTier>) -> Self {
         self.trust_tier = trust_tier;
+        self
+    }
+
+    /// Declares whether the module is ready to receive new route binds.
+    pub fn ready(mut self, ready: bool) -> Self {
+        self.ready = Some(ready);
         self
     }
 
@@ -183,6 +199,7 @@ impl ModuleManifestBuilder {
             module_version: self.module_version,
             protocol_ver: self.protocol_ver,
             trust_tier: self.trust_tier,
+            ready: self.ready,
             provides: self.provides,
             consumes: self.consumes,
             bindings: self.bindings,
@@ -217,6 +234,8 @@ struct ModuleManifestWire {
     protocol_ver: u8,
     #[serde(default)]
     trust_tier: Option<TrustTier>,
+    #[serde(default)]
+    ready: Option<bool>,
     provides: Vec<ProviderRole>,
     #[serde(default)]
     consumes: Vec<ConsumerRole>,
@@ -243,9 +262,13 @@ impl<'de> Deserialize<'de> for ModuleManifest {
         let wire = ModuleManifestWire::deserialize(deserializer)?;
         validate_runtime_computed(wire.runtime_computed.as_ref(), "runtime_computed")
             .map_err(D::Error::custom)?;
-        let manifest = Self::builder(wire.module_id, wire.module_version)
+        let mut builder = Self::builder(wire.module_id, wire.module_version)
             .protocol_ver(wire.protocol_ver)
-            .trust_tier(wire.trust_tier)
+            .trust_tier(wire.trust_tier);
+        if let Some(ready) = wire.ready {
+            builder = builder.ready(ready);
+        }
+        let manifest = builder
             .provides(wire.provides)
             .consumes(wire.consumes)
             .bindings(wire.bindings)
