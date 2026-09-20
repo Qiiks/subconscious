@@ -20,6 +20,7 @@ use subc_daemon::{
     SupervisorProcessLiveness,
 };
 use subc_protocol::{
+    error_codes,
     manifest::{Concurrency, ExecutionMode, IdentityScope, ModuleManifest, ProviderRole, Tool},
     session::HealthStatus,
     BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority,
@@ -4194,11 +4195,11 @@ async fn route_open_connection_ceiling_refuses_without_queueing() {
     let refusal = read_frame_timeout_for(&mut client, SETUP_TIMEOUT).await;
     assert_eq!(refusal.header.ty, FrameType::Error);
     assert_eq!(refusal.header.corr, first_corr + limit as u64);
-    assert_eq!(
-        serde_json::from_slice::<ErrorBody>(&refusal.body)
-            .unwrap()
-            .code,
-        "route_limit"
+    let refusal_body = serde_json::from_slice::<ErrorBody>(&refusal.body).unwrap();
+    assert!(
+        error_codes::is_retryable_route_open(&refusal_body.code),
+        "connection admission refusal must stay retryable, got {}",
+        refusal_body.code
     );
     wait_for_stub_event_count(&events_path, SETUP_TIMEOUT, is_attach_event, limit).await;
     assert_eq!(attach_event_count(&events_path), limit);
@@ -4265,11 +4266,11 @@ async fn route_open_target_ceiling_spans_client_connections() {
     let refusal = read_frame_timeout_for(&mut overflow, SETUP_TIMEOUT).await;
     assert_eq!(refusal.header.ty, FrameType::Error);
     assert_eq!(refusal.header.corr, 899);
-    assert_eq!(
-        serde_json::from_slice::<ErrorBody>(&refusal.body)
-            .unwrap()
-            .code,
-        "route_limit"
+    let refusal_body = serde_json::from_slice::<ErrorBody>(&refusal.body).unwrap();
+    assert!(
+        error_codes::is_retryable_route_open(&refusal_body.code),
+        "target admission refusal must stay retryable, got {}",
+        refusal_body.code
     );
     assert_eq!(attach_event_count(&events_path), limit);
 

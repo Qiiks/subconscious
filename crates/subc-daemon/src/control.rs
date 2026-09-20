@@ -1026,14 +1026,36 @@ impl ControlHandler {
         target_module_id: &str,
         limit: usize,
     ) -> Result<Frame, RouterError> {
+        self.route_open_admission_refusal_frame(
+            ctx,
+            frame,
+            target_module_id,
+            format!(
+                "connection already has {limit} route.open binds in flight; retry after one settles"
+            ),
+        )
+    }
+
+    /// Admission pressure clears as existing binds settle, so its refusal must
+    /// remain in the deployed SDKs' closed retryable set: `unknown_module`,
+    /// `module_reloading`, `module_warming`, `target_unavailable`, or
+    /// `module_timeout`. `target_unavailable` is honest for an attempt that
+    /// cannot currently reach its target; `module_timeout` would falsely claim
+    /// that a wait expired. A new, cleaner code would be terminal to deployed
+    /// clients, so it requires a client-tolerance rollout before daemon emission.
+    fn route_open_admission_refusal_frame(
+        &self,
+        ctx: &RouteCtx,
+        frame: &Frame,
+        target_module_id: &str,
+        message: impl Into<String>,
+    ) -> Result<Frame, RouterError> {
         self.route_open_refusal_frame(
             ctx,
             frame,
             target_module_id,
-            "route_limit",
-            format!(
-                "connection already has {limit} route.open binds in flight; retry after one settles"
-            ),
+            error_codes::TARGET_UNAVAILABLE,
+            message,
         )
     }
 
@@ -2408,11 +2430,10 @@ impl ControlHandler {
         {
             Ok(guard) => guard,
             Err(in_flight) => {
-                return Ok(vec![self.route_open_refusal_frame(
+                return Ok(vec![self.route_open_admission_refusal_frame(
                     ctx,
                     &frame,
                     &target_module_id,
-                    "route_limit",
                     format!(
                         "module_id '{target_module_id}' already has {in_flight} route.bind relays in flight; retry after one settles"
                     ),
