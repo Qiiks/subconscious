@@ -92,6 +92,33 @@ public struct FedFrame: Sendable, Equatable {
         return value
     }
 
+    /// Whether this `call_frame`'s kind SETTLES the call, mirroring fed-core's
+    /// `CallFrameKind::is_terminal()`.
+    ///
+    /// The codec above allowlists all five spec kinds, including the three
+    /// non-terminal ones (`push`, `stream_data`, `stream_end`). Before this
+    /// existed, the consumer settled on ANY kind that was not `error` — so a
+    /// spec-legal `stream_data` was validated here, passed up, and marked a live
+    /// call complete, while every later frame of the stream found no pending
+    /// effect and was discarded. A vocabulary implemented in the validator and
+    /// not in the consumer, with the two disagreeing silently.
+    ///
+    /// `stream_end` IS terminal: it is how a stream finishes, so it settles the
+    /// call exactly as `response` does.
+    ///
+    /// A missing or unknown kind is treated as terminal deliberately. This
+    /// accessor must never keep a call pending on a frame it does not
+    /// understand — an unsettleable call is worse than an early settle, and the
+    /// codec already refuses an absent `k` before reaching here.
+    public var isTerminalKind: Bool {
+        switch terminalKind {
+        case "push", "stream_data":
+            return false
+        default:
+            return true
+        }
+    }
+
     /// The error code of a terminal `call_frame`, absent on success kinds.
     ///
     /// A `call_frame` error carries its code in the BODY (`{"code":..,"message":..}`),

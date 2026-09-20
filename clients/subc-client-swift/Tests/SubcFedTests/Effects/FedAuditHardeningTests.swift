@@ -332,6 +332,44 @@ final class FedAuditHardeningTests: XCTestCase {
         XCTAssertNil(bye.terminalCode)
     }
 
+    /// The three non-terminal kinds must not settle a call, and `stream_end` must.
+    ///
+    /// The codec allowlists all five spec kinds, so a spec-legal `stream_data`
+    /// is validated and passed up. Before `isTerminalKind` existed the consumer
+    /// settled on any kind that was not `error`, so that frame marked a live
+    /// call COMPLETE and every later frame of the stream found no pending
+    /// effect. The validator and the consumer disagreed about the same
+    /// vocabulary, and neither layer could detect it from inside itself.
+    ///
+    /// Phase 1 of the two-phase wire operation is exactly this predicate: every
+    /// deployed client must tolerate a non-terminal frame BEFORE anything emits
+    /// one, because the party that breaks is the one that changed nothing.
+    func testNonTerminalCallFrameKindsDoNotSettleAndStreamEndDoes() throws {
+        for kind in ["push", "stream_data"] {
+            let frame = FedFrame(
+                type: "call_frame",
+                fields: ["k": .string(kind), "last": .bool(false)]
+            )
+            XCTAssertFalse(
+                frame.isTerminalKind,
+                "\(kind) must not settle the call: resolvePendingCall removes the pending entry"
+            )
+        }
+        // stream_end is how a stream FINISHES, so it settles exactly as a response does.
+        for kind in ["response", "error", "stream_end"] {
+            let frame = FedFrame(
+                type: "call_frame",
+                fields: ["k": .string(kind), "last": .bool(true)]
+            )
+            XCTAssertTrue(frame.isTerminalKind, "\(kind) must settle the call")
+        }
+        // An unknown kind settles deliberately: keeping a call pending on a frame
+        // this client cannot interpret is worse than settling it early, because an
+        // unsettleable call never completes and never reports why.
+        let unknown = FedFrame(type: "call_frame", fields: ["k": .string("future_kind")])
+        XCTAssertTrue(unknown.isTerminalKind)
+    }
+
     func testModuleErrorOnPureQueryCarriesTheModuleCode() async throws {
         let store = FedMemoryStateStore()
         _ = try await store.open(localPublicKey: localKey)

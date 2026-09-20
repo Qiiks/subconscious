@@ -103,6 +103,15 @@ public actor SubcFedClient {
     private var receiveTask: Task<Void, Never>?
     private var pendingCalls: [UInt64: PendingCall] = [:]
     private var stateContinuations: [UUID: AsyncStream<FedConnectionState>.Continuation] = [:]
+    /// Non-terminal `call_frame`s (`push` / `stream_data`) received while no
+    /// subscription surface exists to deliver them to.
+    ///
+    /// This is the phase-1 tolerance counter. It must stay at zero in ordinary
+    /// operation: nothing emits these today, so a non-zero value means either
+    /// phase 2 has begun somewhere or a peer is emitting frames this client has
+    /// no consumer for. Either way the operator should be able to SEE it, which
+    /// is why the frames are counted rather than dropped in silence.
+    public private(set) var nonTerminalFramesWithoutConsumer: UInt64 = 0
     /// Counts carrier operations started after attempt-ID minting (tests assert zero
     /// on pre-carrier refusals).
     public private(set) var carrierOperationsStarted: UInt64 = 0
@@ -671,6 +680,21 @@ public actor SubcFedClient {
             guard let effectValue = frame.header["effect"],
                   let effect = FedEffectID.fromJSON(effectValue)
             else {
+                continue
+            }
+            // A NON-TERMINAL frame must not settle the call. `resolvePendingCall`
+            // REMOVES the pending entry before it runs its closure, so resolving here
+            // on a `stream_data` would mark a live call complete and leave every
+            // later frame of that stream with nothing to find.
+            //
+            // This is phase 1 of a two-phase wire operation: every deployed client
+            // must TOLERATE non-terminal frames before anything emits one. Until
+            // phase 2 there is no subscription surface to deliver the body to, so
+            // the frame is counted rather than silently discarded — a receiver that
+            // cannot tell "nothing arrived" from "something was dropped" is the
+            // dead-stream-that-looks-alive failure this whole lane exists to avoid.
+            guard frame.isTerminalKind else {
+                nonTerminalFramesWithoutConsumer &+= 1
                 continue
             }
             // The wire spells the terminal kind `k`; read it through the shared

@@ -78,11 +78,22 @@ on:
     # first-Sunday rule (a daily 00:00Z sample cannot locate an instant inside
     # a day, and that artefact gave a wrong date by one on two seats' first
     # attempt). This repo's 03:17 and cerebellum's 04:17 are both clean on
-    # 11-01 -- each is well clear of 06:00Z and after the 02:00 local fallback
-    # -- and under the Eastern model each FIRE TIME moves five hours, so both
-    # are discriminating that morning:
-    #     UTC reading      this repo keeps delivering ~07:47Z
-    #     Eastern reading  fire moves 03:17->08:17Z, delivery ~08:37-09:12Z
+    # 11-01 -- each is well clear of 06:00Z and after the 02:00 local fallback.
+    #
+    # *** THE OBSERVABLE SEPARATION IS ONE HOUR, NOT FIVE. *** An earlier
+    # version of this comment said the fire time moves five hours, which is
+    # true and unmeasurable: we observe `createdAt`, never the fire. The two
+    # models differ only in what they put BETWEEN fire and createdAt --
+    # eastern puts 20-55m of ordinary queue delay there, utc puts ~4.5h of
+    # backlog -- and the 5h fire-time gap is almost exactly cancelled by it.
+    # Each repo carries its OWN measured residual across the boundary, so the
+    # per-repo term cancels and every arm separates by the same hour:
+    #     this repo   utc 07:36Z   eastern 08:36Z
+    #     cerebellum  utc 09:11Z   eastern 10:11Z
+    #     fusiform    utc 10:31Z   eastern 11:31Z
+    # Expecting five would make a clean positive unreadable: seeing ~08:36Z
+    # against a 5h prediction reads as "neither model fits" when it is the
+    # eastern model landing within twenty minutes.
     # fusiform's `0 6` is NOT readable on 11-01: 06:00Z is the transition
     # instant to the second, so which side it resolves on is an implementation
     # detail no model predicts. Its clean row is 11-02.
