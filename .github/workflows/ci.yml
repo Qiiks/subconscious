@@ -14,6 +14,10 @@ on:
   # registry. A red here with no commit of ours is that class, not a
   # regression, and it must not wait for the next unrelated push to surface.
   schedule:
+    # *** DO NOT CHANGE THIS CRON BEFORE 2026-11-02. *** It is a load-bearing
+    # arm of a three-repo measurement and changing it would not FAIL -- the
+    # numbers would keep arriving and would simply mean something else.
+    #
     # Deliberately NOT on the hour. Measured 2026-09-20 across two repos with
     # identical `0 6 * * *` declarations: subconscious n=14 mean +4h19m (range
     # +3h40m..+5h02m), fusiform n=13 mean +4h31m (+3h50m..+5h19m). A stable
@@ -47,6 +51,20 @@ on:
     # with a spread that also admits 1.0. The gap is degenerate across the two
     # live models above -- both predict 60m -- so it sharpens, it does not
     # discriminate.
+    #
+    # READING THE BOUNDARY. Transition instant is 2026-11-01T06:00:00Z, located
+    # by binary search against the tz database rather than by the
+    # first-Sunday rule (a daily 00:00Z sample cannot locate an instant inside
+    # a day, and that artefact gave a wrong date by one on two seats' first
+    # attempt). This repo's 03:17 and cerebellum's 04:17 are both clean on
+    # 11-01 -- each is well clear of 06:00Z and after the 02:00 local fallback
+    # -- and under the Eastern model each FIRE TIME moves five hours, so both
+    # are discriminating that morning:
+    #     UTC reading      this repo keeps delivering ~07:47Z
+    #     Eastern reading  fire moves 03:17->08:17Z, delivery ~08:37-09:12Z
+    # fusiform's `0 6` is NOT readable on 11-01: 06:00Z is the transition
+    # instant to the second, so which side it resolves on is an implementation
+    # detail no model predicts. Its clean row is 11-02.
     # Re-measure with:
     #   gh run list --workflow CI --event schedule --limit 20 \
     #     --json createdAt --jq '.[].createdAt'
