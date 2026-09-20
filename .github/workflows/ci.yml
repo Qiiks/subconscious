@@ -14,7 +14,19 @@ on:
   # registry. A red here with no commit of ours is that class, not a
   # regression, and it must not wait for the next unrelated push to surface.
   schedule:
-    - cron: '0 6 * * *'
+    # Deliberately NOT on the hour. Measured 2026-09-20 across two repos with
+    # identical `0 6 * * *` declarations: subconscious n=14 mean +4h19m (range
+    # +3h40m..+5h02m), fusiform n=13 mean +4h31m (+3h50m..+5h19m). A stable
+    # ~4.5h SHIFT with ~40m of jitter on top, not the load jitter GitHub
+    # documents. This repo is the moving arm of a two-repo experiment; fusiform
+    # stays at `0 6` as the control, so the difference between the two series
+    # after a week separates "everything from 06:00 is delayed" from "this
+    # queue is delayed". Re-measure with:
+    #   gh run list --workflow CI --event schedule --limit 20 \
+    #     --json createdAt --jq '.[].createdAt'
+    # Until that resolves: anything asking "did the nightly fire?" must size its
+    # window from the OBSERVED delivery distribution, never from this line.
+    - cron: '17 3 * * *'
 
 concurrency:
   # Deliberate: rapid pushes to the same ref cancel the earlier runs, so only the
