@@ -52,6 +52,27 @@ on:
     # live models above -- both predict 60m -- so it sharpens, it does not
     # discriminate.
     #
+    # WHY THIS LINE IS ALSO A WITHIN-REPO CONTROL, which was not the reason it
+    # was moved. CEREB's one-sided test (delivery cannot precede the declared
+    # time, so each repo's EARLIEST observation bounds any timezone reading)
+    # falsifies UTC-5 on all three repos and UTC-4 on two: subconscious's
+    # `0 6` would have to land no earlier than 10:00Z and its minimum is
+    # 09:40Z, fusiform's 09:50Z. The test is conservative in the safe
+    # direction -- a sample minimum can only FALL with more data -- so those
+    # margins are floors on the violation. What survives (UTC-3 and east) does
+    # so only by inflating the implied jitter until "timezone" and "constant
+    # offset" are the same functional form: declared + constant + non-negative
+    # jitter, separable ONLY by whether the constant moves on a DST boundary.
+    #
+    # That left one unexplained term: the three minima are +3h40m, +3h50m,
+    # +4h22m, and cerebellum sits 42m above this repo at comparable n. A
+    # cross-repo pair cannot resolve it, because a shared constant is exactly
+    # the common-mode noise same-morning pairing cancels. THIS repo at `17 3`
+    # against THIS repo's own `0 6` history (n=14, mean +4h19m, min +3h40m)
+    # is the comparison that can: same repo, org, workflow and runners, only
+    # the declared time changed, so every per-repo term cancels. Constant
+    # offset predicts the new series reproduces ~+4h19m.
+    #
     # READING THE BOUNDARY. Transition instant is 2026-11-01T06:00:00Z, located
     # by binary search against the tz database rather than by the
     # first-Sunday rule (a daily 00:00Z sample cannot locate an instant inside
