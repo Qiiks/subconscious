@@ -10,6 +10,7 @@ members = [
     "crates/subc-core",
     "crates/subc-daemon",
     "crates/subc-daemon/tests/consumer",
+    "crates/ck-bus",
     "crates/subc-mcp",
     "crates/mcp-stdio-adapter",
     "crates/agent-token-vectors",
@@ -26,6 +27,7 @@ members = [
 # - crates/subc-control  : the client-facing control wire contract.
 # - crates/subc-core     : CLI, installer, and daemon executable.
 # - crates/subc-daemon   : publishable in-process daemon library.
+# - crates/ck-bus        : supervised NATS plane owner; bus primitives come from cortexkit/commons.
 #
 # NOTE: cortexkit-paths is NOT here — it's a product-neutral primitive living in
 # the cortexkit/commons monorepo (https://github.com/cortexkit/commons) and is

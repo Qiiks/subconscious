@@ -1,0 +1,101 @@
+// Each runtime capability is installed independently; until then its placeholder returns an explicit not-implemented error.
+#[allow(dead_code)]
+mod runtime;
+
+use std::{
+    env,
+    error::Error,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use async_trait::async_trait;
+use serde_json::json;
+use subc_client_rs::{HandlerOutcome, ModuleHandler, RequestCtx};
+use subc_protocol::{
+    manifest::ModuleManifest,
+    session::{HealthReport, HealthStatus},
+    SUBC_MODULE_ID_ENV,
+};
+
+const MODULE_ID: &str = "ckbus";
+const SENTINEL_PERIOD_MS: u64 = 10_000;
+const SENTINEL_TIMEOUT_MS: u64 = 2_000;
+
+struct BusHandler {
+    runtime: Arc<runtime::Runtime>,
+}
+
+#[async_trait]
+impl ModuleHandler for BusHandler {
+    async fn handle(&self, _ctx: RequestCtx, _body: Vec<u8>) -> HandlerOutcome {
+        HandlerOutcome::Error {
+            code: "ckbus_area_not_yet_landed".to_string(),
+            message: "ck-bus data routes refuse until their owning runtime area lands".to_string(),
+        }
+    }
+
+    async fn health(&self) -> HealthReport {
+        match self.runtime.sentinel_health.report_health().await {
+            Ok(report) => report,
+            Err(refusal) => HealthReport {
+                status: HealthStatus::Failing,
+                detail: Some("bus.health.down".to_string()),
+                metrics: Some(json!({
+                    "class": "Unavailable",
+                    "runtime_refusal": refusal.to_string(),
+                })),
+            },
+        }
+    }
+}
+
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let module_id = env::var(SUBC_MODULE_ID_ENV)
+        .map_err(|_| format!("{SUBC_MODULE_ID_ENV} is required; ck-bus only runs supervised"))?;
+    let store_root = runtime::resolve_store_root()?;
+    let runtime = Arc::new(runtime::Runtime::refusing_defaults(store_root));
+
+    let sentinel_period_ms = positive_env_ms("CKBUS_SENTINEL_PERIOD_MS", SENTINEL_PERIOD_MS)?;
+    let sentinel_timeout_ms = positive_env_ms("CKBUS_SENTINEL_TIMEOUT_MS", SENTINEL_TIMEOUT_MS)?;
+    let incarnation = process_incarnation();
+    eprintln!(
+        "{}",
+        json!({
+            "event": "ckbus.runtime.started",
+            "module_id": module_id,
+            "process_incarnation": incarnation,
+            "sentinel_period_ms": sentinel_period_ms,
+            "sentinel_timeout_ms": sentinel_timeout_ms,
+        })
+    );
+
+    let manifest = ModuleManifest::builder(&module_id, env!("CARGO_PKG_VERSION")).build();
+    subc_client_rs::serve(manifest, BusHandler { runtime }).await?;
+    Ok(())
+}
+
+fn positive_env_ms(name: &str, default: u64) -> Result<u64, Box<dyn Error + Send + Sync>> {
+    let Some(raw) = env::var_os(name) else {
+        return Ok(default);
+    };
+    let raw = raw
+        .into_string()
+        .map_err(|_| format!("{name} must be valid UTF-8"))?;
+    let value = raw
+        .parse::<u64>()
+        .map_err(|_| format!("{name} must be a positive integer"))?;
+    if value == 0 {
+        return Err(format!("{name} must be greater than zero").into());
+    }
+    Ok(value)
+}
+
+fn process_incarnation() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{}-{nanos}", std::process::id())
+}
