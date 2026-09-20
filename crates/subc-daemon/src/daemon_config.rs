@@ -539,6 +539,64 @@ pub fn load_logging(path: impl AsRef<Path>) -> Result<Option<LoggingConfig>, Dae
         .transpose()
 }
 
+/// Create the daemon run directory at 0700 if absent, and tighten it if wider.
+///
+/// WHY A SEPARATE STEP RATHER THAN A MODE ON THE CREATOR. Several things create
+/// this directory and none of them owns it: the log sink's `create_dir_all`
+/// (0777 & ~umask, so 0755 on a default desk), the terminal journal, and the
+/// connection-file writer -- which DOES build its parents at 0700, but returns
+/// early when the directory already exists, because an existing directory keeps
+/// its mode. So the first creator to run decides the mode for every later one,
+/// and on this fleet that was the log sink.
+///
+/// WHAT THE BIT COSTS, stated so nobody over- or under-reads it: the connection
+/// secret inside is written 0600 and was never readable by another account. A
+/// world-listable run directory leaks the MAP -- which modules are live and what
+/// their connection files are named -- not the key. It is worth closing anyway
+/// because the map is reconnaissance and costs nothing to withhold. (Found by
+/// prefrontal's campaign-rig isolation probe, 2026-09-20, on a real desk.)
+///
+/// TIGHTENING IS BEST-EFFORT AND NEVER FATAL. The daemon does not own every
+/// deployment: a directory it cannot chmod belongs to someone else, and refusing
+/// to boot over a permission bit would trade a reconnaissance leak for an
+/// outage. The caller logs what it could not do.
+pub fn ensure_daemon_run_dir_private() -> Result<PathBuf, io::Error> {
+    let path = daemon_run_dir();
+    ensure_directory_private(&path)?;
+    Ok(path)
+}
+
+/// The policy half, taking the directory so a test drives a real one without
+/// touching the process environment (this crate forbids unsafe, and `set_var` is
+/// unsafe in this edition -- which is the better outcome: the seam is a parameter
+/// rather than a global the test has to fight).
+#[cfg(unix)]
+fn ensure_directory_private(path: &Path) -> Result<(), io::Error> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    if !path.exists() {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)?;
+        return Ok(());
+    }
+    let mode = fs::metadata(path)?.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Windows has no mode bits to tighten; the directory is created on first use.
+#[cfg(not(unix))]
+fn ensure_directory_private(path: &Path) -> Result<(), io::Error> {
+    if !path.exists() {
+        fs::create_dir_all(path)?;
+    }
+    Ok(())
+}
+
 /// Existing per-user daemon run directory (`<data-home>/cortexkit/run`).
 pub fn daemon_run_dir() -> PathBuf {
     let path = default_data_home().join("cortexkit").join("run");
@@ -1210,6 +1268,58 @@ impl Error for DaemonConfigError {
             | Self::UnsupportedVersion { .. }
             | Self::InvalidValue { .. } => None,
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod run_dir_privacy_tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    use crate::test_support::TestTempDir;
+
+    /// Both arms of the thing that actually bit: a directory this code CREATES,
+    /// and one it INHERITS from another creator. The second is the real case --
+    /// every desk in the fleet already had a 0755 run directory made by the log
+    /// sink, so a fix that only sets the mode at creation would have changed
+    /// nothing anywhere it mattered.
+    #[test]
+    fn run_dir_is_created_private_and_an_inherited_wide_one_is_tightened() {
+        let temp = TestTempDir::new("subc-run-dir-privacy");
+        let created = temp.path().join("cortexkit").join("run");
+        super::ensure_directory_private(&created).expect("create run dir");
+        let mode = fs::metadata(&created)
+            .expect("stat created")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "observable a run directory this code creates must be 0700, got {mode:o}"
+        );
+
+        // Now the inherited case: widen it the way create_dir_all would have.
+        fs::set_permissions(&created, fs::Permissions::from_mode(0o755)).expect("widen");
+        let widened = fs::metadata(&created)
+            .expect("stat widened")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            widened, 0o755,
+            "observable the fixture must actually be wide before the tighten"
+        );
+
+        super::ensure_directory_private(&created).expect("tighten run dir");
+        let mode = fs::metadata(&created)
+            .expect("stat tightened")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "observable an inherited group- or world-readable run directory must be tightened to 0700, got {mode:o}"
+        );
     }
 }
 

@@ -104,6 +104,20 @@ fn init_tracing() -> Result<(), cortexkit_log::InitError> {
         })
         .ok()
         .flatten();
+    // Secure the run directory BEFORE anything opens a sink inside it. The log
+    // sink creates its parents with create_dir_all, which lands 0755 on a default
+    // desk, and whichever creator runs first fixes the mode for every later one --
+    // the connection-file writer builds parents at 0700 but returns early when the
+    // directory exists. Doing it here makes the daemon the first creator on a
+    // clean box and the tightener on an existing one.
+    match subc_daemon::daemon_config::ensure_daemon_run_dir_private() {
+        Ok(_) => {}
+        Err(error) => eprintln!(
+            "ck-subc: could not secure the run directory at {}: {error}; continuing, \
+             but another account on this host may be able to list it",
+            subc_daemon::daemon_config::daemon_run_dir().display()
+        ),
+    }
     let logs_dir = subc_daemon::daemon_config::daemon_run_dir().join("logs");
     install_tracing(daemon_logger_config(logs_dir, logging.as_ref()))
 }
