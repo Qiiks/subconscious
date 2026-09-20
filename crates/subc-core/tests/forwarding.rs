@@ -14,9 +14,10 @@ use subc_control::{
     SupervisorHealthStatus,
 };
 use subc_daemon::{
-    read_frame, test_support::TestTempDir, write_frame, ExitKind, ForwardingTable, Frame,
-    HealthAction, HealthConfig, ModuleSpec, ModuleState, ModuleStatus, Registry, RestartPolicy,
-    SupervisedModule, Supervisor, SupervisorHandle, SupervisorProcessLiveness,
+    read_frame, server::CONNECTION_EGRESS_BUFFER, test_support::TestTempDir, write_frame, ExitKind,
+    ForwardingTable, Frame, HealthAction, HealthConfig, ModuleSpec, ModuleState, ModuleStatus,
+    Registry, RestartPolicy, SupervisedModule, Supervisor, SupervisorHandle,
+    SupervisorProcessLiveness,
 };
 use subc_protocol::{
     manifest::{Concurrency, ExecutionMode, IdentityScope, ModuleManifest, ProviderRole, Tool},
@@ -3776,12 +3777,15 @@ async fn module_error_lane_rejection_is_relayed_verbatim_without_committing_bind
     accepting.stop().await.unwrap();
 }
 
+/// Dropping a connection aborts its spawned bind tails immediately. The module's
+/// matching detach and a later successful open prove the synchronous reservation
+/// guard left neither a slot pair nor per-target admission behind.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_drop_during_pending_route_open_releases_reservation() {
-    // The abandoned-bind cleanup here is driven by the route.bind relay timeout
-    // (the stub never replies), so use a short timeout rather than the
-    // production-safe default to keep the test fast.
-    let server = TestServer::start_with_bind_timeout(Duration::from_millis(500)).await;
+    // Keep the relay budget beyond the cleanup deadline. The test therefore
+    // proves connection-owned task cancellation ran the synchronous reservation
+    // guard; it cannot pass by waiting for the ordinary relay timeout.
+    let server = TestServer::start_with_bind_timeout(Duration::from_secs(6)).await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module_id = "fake-aft-pending-client-drop";
     let (pending, events_path) = spawn_stub_with_events(
@@ -3811,7 +3815,7 @@ async fn client_drop_during_pending_route_open_releases_reservation() {
     .await;
     drop(client);
 
-    let detach = wait_for_stub_event(&events_path, SETUP_TIMEOUT, |event| {
+    let detach = wait_for_stub_event(&events_path, HELD_READER_DEADLINE, |event| {
         event["kind"] == "detach" && event["route_channel"] == attach["route_channel"]
     })
     .await;
@@ -4074,21 +4078,250 @@ async fn route_open_timeout_sends_module_goodbye_for_abandoned_bind() {
 /// only when a reader is being held across the bind budget.
 const HELD_READER_DEADLINE: Duration = Duration::from_secs(2);
 
+/// A pending `route.open` cannot hold a later data frame on the same socket.
+/// This assertion is intentionally frame order, not elapsed time. Before the
+/// route.open tail was spawned the test was red by construction: the reader did
+/// not read the data request until the never-replying bind produced its refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pending_route_open_cannot_hold_a_bound_neighbours_response() {
+    let server = TestServer::start_with_bind_timeout(Duration::from_secs(6)).await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let wedged_id = "fake-aft-spawned-open-wedged";
+    let neighbour_id = "fake-aft-spawned-open-neighbour";
+    let wedged = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        wedged_id,
+        [("FAKE_AFT_BIND_NEVER_REPLY", "1")],
+    )
+    .await;
+    let neighbour = spawn_stub(&server, &supervisor, neighbour_id).await;
+
+    let project = TestProject::new();
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let neighbour_ack = attach_on_stream(
+        &mut client,
+        &project,
+        610,
+        "ses-spawned-open-neighbour",
+        neighbour_id,
+    )
+    .await;
+
+    let payload = br#"{"jsonrpc":"2.0","id":1,"method":"read"}"#;
+    write_frame(
+        &mut client,
+        &attach_frame(
+            611,
+            attach_request(&project, "ses-spawned-open-wedged", wedged_id),
+        ),
+    )
+    .await
+    .unwrap();
+    write_frame(
+        &mut client,
+        &data_request(
+            neighbour_ack.route_channel,
+            neighbour_ack.route_epoch,
+            612,
+            payload,
+        ),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+
+    let response = read_frame_timeout_for(&mut client, SETUP_TIMEOUT).await;
+    assert_response(&response, neighbour_ack.route_channel, 612, payload);
+
+    let refusal = read_frame_timeout_for(&mut client, SETUP_TIMEOUT).await;
+    assert_eq!(refusal.header.ty, FrameType::Error);
+    assert_eq!(refusal.header.channel, 0);
+    assert_eq!(refusal.header.corr, 611);
+    assert_eq!(
+        serde_json::from_slice::<ErrorBody>(&refusal.body)
+            .unwrap()
+            .code,
+        "module_timeout"
+    );
+
+    wedged.stop().await.unwrap();
+    neighbour.stop().await.unwrap();
+}
+
+/// The connection ceiling is a refusal gate, not a waiting semaphore. The
+/// overflow refusal must be the first returned frame while every admitted bind
+/// is still waiting on the never-replying module.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn route_open_connection_ceiling_refuses_without_queueing() {
+    let server = TestServer::start_with_bind_timeout(Duration::from_secs(6)).await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-open-connection-ceiling";
+    let (module, events_path) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_id,
+        "open-connection-ceiling",
+        [("FAKE_AFT_BIND_NEVER_REPLY", "1")],
+    )
+    .await;
+    let project = TestProject::new();
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let limit = CONNECTION_EGRESS_BUFFER / 8;
+    let first_corr = 700u64;
+
+    for offset in 0..=limit {
+        write_frame(
+            &mut client,
+            &attach_frame(
+                first_corr + offset as u64,
+                attach_request(
+                    &project,
+                    &format!("ses-open-connection-ceiling-{offset}"),
+                    module_id,
+                ),
+            ),
+        )
+        .await
+        .unwrap();
+    }
+    client.flush().await.unwrap();
+
+    let refusal = read_frame_timeout_for(&mut client, SETUP_TIMEOUT).await;
+    assert_eq!(refusal.header.ty, FrameType::Error);
+    assert_eq!(refusal.header.corr, first_corr + limit as u64);
+    assert_eq!(
+        serde_json::from_slice::<ErrorBody>(&refusal.body)
+            .unwrap()
+            .code,
+        "route_limit"
+    );
+    wait_for_stub_event_count(&events_path, SETUP_TIMEOUT, is_attach_event, limit).await;
+    assert_eq!(attach_event_count(&events_path), limit);
+
+    drop(client);
+    module.stop().await.unwrap();
+}
+
+/// Target admission is daemon-wide rather than per connection: spreading a
+/// reconnect herd over separate sockets still permits only two safe connection
+/// bursts to wait on one module.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn route_open_target_ceiling_spans_client_connections() {
+    let server = TestServer::start_with_bind_timeout(Duration::from_secs(30)).await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-open-target-ceiling";
+    let (module, events_path) = spawn_stub_with_events(
+        &server,
+        &supervisor,
+        module_id,
+        "open-target-ceiling",
+        [("FAKE_AFT_BIND_NEVER_REPLY", "1")],
+    )
+    .await;
+    let project = TestProject::new();
+    let limit = (CONNECTION_EGRESS_BUFFER / 8) * 2;
+    let mut admitted_clients = Vec::with_capacity(limit);
+
+    for offset in 0..limit {
+        let mut client = connect_authed_client(&server.connection_file_path)
+            .await
+            .unwrap();
+        write_frame(
+            &mut client,
+            &attach_frame(
+                800 + offset as u64,
+                attach_request(
+                    &project,
+                    &format!("ses-open-target-ceiling-{offset}"),
+                    module_id,
+                ),
+            ),
+        )
+        .await
+        .unwrap();
+        client.flush().await.unwrap();
+        wait_for_stub_event_count(&events_path, SETUP_TIMEOUT, is_attach_event, offset + 1).await;
+        admitted_clients.push(client);
+    }
+
+    let mut overflow = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    write_frame(
+        &mut overflow,
+        &attach_frame(
+            899,
+            attach_request(&project, "ses-open-target-ceiling-overflow", module_id),
+        ),
+    )
+    .await
+    .unwrap();
+    overflow.flush().await.unwrap();
+    let refusal = read_frame_timeout_for(&mut overflow, SETUP_TIMEOUT).await;
+    assert_eq!(refusal.header.ty, FrameType::Error);
+    assert_eq!(refusal.header.corr, 899);
+    assert_eq!(
+        serde_json::from_slice::<ErrorBody>(&refusal.body)
+            .unwrap()
+            .code,
+        "route_limit"
+    );
+    assert_eq!(attach_event_count(&events_path), limit);
+
+    drop(overflow);
+    drop(admitted_clients);
+    module.stop().await.unwrap();
+}
+
+/// Spawning changes only overlap: clients that issue route.open sequentially
+/// still receive one accepted route before sending the next request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sequential_route_open_acceptance_is_unchanged() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module_id = "fake-aft-open-sequential";
+    let module = spawn_stub(&server, &supervisor, module_id).await;
+    let project = TestProject::new();
+    let mut client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+
+    let first = attach_on_stream(
+        &mut client,
+        &project,
+        900,
+        "ses-open-sequential-first",
+        module_id,
+    )
+    .await;
+    let second = attach_on_stream(
+        &mut client,
+        &project,
+        901,
+        "ses-open-sequential-second",
+        module_id,
+    )
+    .await;
+
+    assert_ne!(first.route_channel, second.route_channel);
+    assert_eq!(server.forwarding.active_binding_count().unwrap(), 2);
+    module.stop().await.unwrap();
+}
+
 /// While a module's breaker is open, an open to it neither relays nor spends
 /// the bind budget, so the frames behind it on the same socket are served
 /// instead of waiting the budget out.
 ///
-/// WHAT THIS DELIBERATELY DOES NOT ASSERT, and why: that the neighbour's
-/// response arrives BEFORE the wedged module's refusal. The connection reader
-/// is serial -- it awaits a frame's dispatch before reading the next -- and the
-/// breaker does not change that, so the neighbour's frame is not even read
-/// until the open ahead of it has settled. With the breaker closed, settling
-/// costs the full budget; with it open, the refusal is written first and the
-/// neighbour follows. Nothing short of answering the open asynchronously can
-/// put the neighbour first, and that is a separate change this one deliberately
-/// does not make (see `docs/designs/route-open-head-of-line.md`).
+/// This test does not constrain which of the fast breaker refusal and neighbour
+/// response arrives first. `route.open` now runs independently of the reader, so
+/// channel-0 and data responses are correlated by id rather than arrival order.
 ///
-/// So the witnesses here are structural: no relay was sent (the stub's attach
+/// The witnesses here are structural: no relay was sent (the stub's attach
 /// count is unchanged across the refusal), the refusal was counted under the
 /// breaker's own key, and both frames came back inside a deadline well under
 /// the bind budget -- which is what fails if the breaker check is deleted.
@@ -4180,19 +4413,27 @@ async fn an_open_breaker_keeps_a_wedged_module_from_holding_later_frames_on_the_
     .unwrap();
     client.flush().await.unwrap();
 
-    let refusal = read_frame_timeout_for(&mut client, HELD_READER_DEADLINE).await;
-    assert_eq!(refusal.header.ty, FrameType::Error);
-    assert_eq!(refusal.header.corr, 623);
+    let first = read_frame_timeout_for(&mut client, HELD_READER_DEADLINE).await;
+    let second = read_frame_timeout_for(&mut client, HELD_READER_DEADLINE).await;
+    let frames = [&first, &second];
+    let refusal = frames
+        .iter()
+        .find(|frame| frame.header.ty == FrameType::Error && frame.header.corr == 623)
+        .expect("breaker refusal is returned");
     assert_eq!(
         serde_json::from_slice::<ErrorBody>(&refusal.body)
             .unwrap()
             .code,
         "module_timeout"
     );
-    let response = read_frame_timeout_for(&mut client, HELD_READER_DEADLINE).await;
-    assert_eq!(response.header.ty, FrameType::Response);
-    assert_eq!(response.header.channel, neighbour_ack.route_channel);
-    assert_eq!(response.header.corr, 624);
+    let response = frames
+        .iter()
+        .find(|frame| {
+            frame.header.ty == FrameType::Response
+                && frame.header.channel == neighbour_ack.route_channel
+                && frame.header.corr == 624
+        })
+        .expect("neighbour response is returned");
     assert_eq!(response.body, payload);
 
     assert_eq!(

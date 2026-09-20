@@ -16,8 +16,11 @@ use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::{
-    control::RouteBindBreakers, observability::DaemonCounters, registry::ConnectionId,
-    router::FrameSink, Frame,
+    control::{RouteBindBreakers, RouteBindConcurrency},
+    observability::DaemonCounters,
+    registry::ConnectionId,
+    router::FrameSink,
+    Frame,
 };
 
 /// Default per-channel request-credit window for modules that schedule internally.
@@ -344,6 +347,9 @@ pub struct ForwardingTable {
     /// connection's identity is established and therefore where a stale
     /// verdict has to be discarded.
     route_bind_breakers: RouteBindBreakers,
+    /// Current route.bind relays keyed by target module. Admission is shared
+    /// across every client connection that points at the same endpoint.
+    route_bind_concurrency: RouteBindConcurrency,
 }
 
 impl ForwardingTable {
@@ -353,6 +359,10 @@ impl ForwardingTable {
 
     pub(crate) fn route_bind_breakers(&self) -> RouteBindBreakers {
         self.route_bind_breakers.clone()
+    }
+
+    pub(crate) fn route_bind_concurrency(&self) -> RouteBindConcurrency {
+        self.route_bind_concurrency.clone()
     }
 
     pub(crate) fn register_connection_close(

@@ -48,6 +48,7 @@ use crate::{
     },
     registry::{ChannelState, ConnectionId, Registry, RegistryError},
     router::{RouteCtx, RouterError},
+    server::MAX_PENDING_ROUTE_BINDS_PER_TARGET,
     stderr_tail::{CaptureState, TailEntry},
     supervise::{validate_spec, ModuleProcessLiveness, ReservedHelloRejection, SupervisorHandle},
     ConnectedClients, DaemonCounters, Frame, ProjectRootId, Supervisor,
@@ -195,6 +196,9 @@ pub struct ControlHandler {
     /// Per-target-module bind-relay breaker state. Shared with the forwarding
     /// table, which is where a new module connection resets it.
     route_bind_breakers: RouteBindBreakers,
+    /// Live relay admissions keyed by target module. Shared through the
+    /// forwarding table so cloned or separately built handlers enforce one cap.
+    route_bind_concurrency: RouteBindConcurrency,
     /// Consecutive relay timeouts that open a module's breaker.
     route_bind_breaker_threshold: u32,
     /// How long a breaker stays open before one probe is admitted.
@@ -342,6 +346,56 @@ impl Drop for RouteBindReservationGuard {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RouteBindBreakers {
     modules: Arc<Mutex<HashMap<String, ModuleBreakerState>>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RouteBindConcurrency {
+    modules: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+struct RouteBindConcurrencyGuard {
+    concurrency: RouteBindConcurrency,
+    module_id: String,
+}
+
+impl RouteBindConcurrency {
+    /// Admit without waiting. Waiting here would move the bind stall from the
+    /// module reply to a semaphore and restore reader head-of-line blocking.
+    fn try_admit(&self, module_id: &str, limit: usize) -> Result<RouteBindConcurrencyGuard, usize> {
+        let mut modules = self
+            .modules
+            .lock()
+            .expect("route.bind concurrency mutex poisoned");
+        let in_flight = modules.entry(module_id.to_string()).or_default();
+        if *in_flight >= limit {
+            return Err(*in_flight);
+        }
+        *in_flight += 1;
+        Ok(RouteBindConcurrencyGuard {
+            concurrency: self.clone(),
+            module_id: module_id.to_string(),
+        })
+    }
+}
+
+impl Drop for RouteBindConcurrencyGuard {
+    fn drop(&mut self) {
+        let mut modules = self
+            .concurrency
+            .modules
+            .lock()
+            .expect("route.bind concurrency mutex poisoned");
+        let remove = {
+            let in_flight = modules
+                .get_mut(&self.module_id)
+                .expect("admitted route.bind has a concurrency entry");
+            *in_flight -= 1;
+            *in_flight == 0
+        };
+        if remove {
+            modules.remove(&self.module_id);
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -576,6 +630,7 @@ impl ControlHandler {
         // breaker a `route.open` consults is the same one a module's
         // registration resets, however many handlers are built over one table.
         let route_bind_breakers = forwarding.route_bind_breakers();
+        let route_bind_concurrency = forwarding.route_bind_concurrency();
         Self {
             registry,
             forwarding,
@@ -591,6 +646,7 @@ impl ControlHandler {
             route_bind_relay_timeout: DEFAULT_ROUTE_BIND_RELAY_TIMEOUT,
             route_bind_relay_timeouts: BTreeMap::new(),
             route_bind_breakers,
+            route_bind_concurrency,
             route_bind_breaker_threshold: DEFAULT_ROUTE_BIND_BREAKER_THRESHOLD,
             route_bind_breaker_cooldown: DEFAULT_ROUTE_BIND_BREAKER_COOLDOWN,
             health_probe_timeout: DEFAULT_HEALTH_PROBE_TIMEOUT,
@@ -949,6 +1005,36 @@ impl ControlHandler {
         connection_id: ConnectionId,
     ) -> Result<Vec<crate::registry::ModuleRegistration>, RegistryError> {
         self.registry.deregister_connection(connection_id)
+    }
+
+    pub(crate) fn route_open_target(&self, frame: &Frame) -> Option<String> {
+        if frame.header.channel != 0 || frame.header.ty != FrameType::Request {
+            return None;
+        }
+        let Ok(ClientControlRequest::RouteOpen { target, .. }) =
+            parse_client_control_request(&frame.body)
+        else {
+            return None;
+        };
+        Some(target_module_id(&target).to_string())
+    }
+
+    pub(crate) fn route_open_capacity_refusal(
+        &self,
+        ctx: &RouteCtx,
+        frame: &Frame,
+        target_module_id: &str,
+        limit: usize,
+    ) -> Result<Frame, RouterError> {
+        self.route_open_refusal_frame(
+            ctx,
+            frame,
+            target_module_id,
+            "route_limit",
+            format!(
+                "connection already has {limit} route.open binds in flight; retry after one settles"
+            ),
+        )
     }
 
     /// Test-only compatibility entry point for unit control handling that does not have a socket sink.
@@ -2312,10 +2398,30 @@ impl ControlHandler {
         // by the precise code than by this one.
         //
         // Everything below this point costs an egress permit, a reserved handle
-        // pair and, if the module does not answer, the whole relay budget with
-        // the connection's reader held for it. A module that has already burned
-        // that budget `threshold` times in a row does not get to charge it
-        // again until a probe says it recovered.
+        // pair and, if the module does not answer, the whole relay budget. The
+        // reader no longer waits for that budget, so cap each target explicitly;
+        // serial dispatch used to provide the accidental cap of one relay per
+        // connection. Admission is a mutex-protected count and never waits.
+        let _concurrency_guard = match self
+            .route_bind_concurrency
+            .try_admit(&target_module_id, MAX_PENDING_ROUTE_BINDS_PER_TARGET)
+        {
+            Ok(guard) => guard,
+            Err(in_flight) => {
+                return Ok(vec![self.route_open_refusal_frame(
+                    ctx,
+                    &frame,
+                    &target_module_id,
+                    "route_limit",
+                    format!(
+                        "module_id '{target_module_id}' already has {in_flight} route.bind relays in flight; retry after one settles"
+                    ),
+                )?]);
+            }
+        };
+
+        // A module that has already burned the whole budget `threshold` times
+        // in a row does not get to charge it again until a probe says it recovered.
         let mut breaker = match self.route_bind_breakers.admit(&target_module_id) {
             RouteBindAdmission::Admitted { guard, probe } => {
                 if probe {

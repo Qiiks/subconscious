@@ -1,11 +1,17 @@
-use std::{error::Error, fmt, io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    error::Error,
+    fmt, io,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use subc_transport::{authenticate_server, AuthError, DAEMON_ID_LEN, WATCHDOG_CLIENT_ROLE};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
     net::TcpListener,
     sync::{mpsc, Semaphore},
-    task::JoinHandle,
+    task::{JoinHandle, JoinSet},
     time::timeout,
 };
 use tracing::{debug, warn};
@@ -19,6 +25,16 @@ use crate::{
 };
 
 pub const CONNECTION_EGRESS_BUFFER: usize = 64;
+/// A pending `route.open` owns one slot in the connection's shared egress queue
+/// until its module answers. Limit binds to one eighth of that queue so even a
+/// client spending its whole bind allowance leaves seven eighths available for
+/// data-plane responses and other control traffic.
+pub(crate) const MAX_PENDING_ROUTE_OPENS_PER_CONNECTION: usize = CONNECTION_EGRESS_BUFFER / 8;
+/// A reconnect herd may spread one target's opens over many client connections.
+/// Two safe per-connection bursts retain useful parallelism without restoring
+/// the hundreds-of-binds fanout that serial dispatch used to suppress.
+pub(crate) const MAX_PENDING_ROUTE_BINDS_PER_TARGET: usize =
+    MAX_PENDING_ROUTE_OPENS_PER_CONNECTION * 2;
 pub const DEFAULT_AUTH_DEADLINE: Duration = Duration::from_secs(2);
 // Sized for the restart-herd shape: after a daemon bounce, every live client
 // connection plus all supervised children re-dial within the same second
@@ -192,9 +208,9 @@ enum ConnectionLoopExit {
 ///
 /// Every accepted TCP connection must complete the key-auth prelude before any
 /// envelope bytes are read by the router. Outbound frames flow through a bounded
-/// [`FrameSink`] drained by one writer task. This locks in the streaming-capable
-/// sink shape while intentionally keeping inbound dispatch serial: each routed
-/// frame is awaited before reading the next one.
+/// [`FrameSink`] drained by one writer task. Inbound dispatch remains serial for
+/// every frame except `route.open`; only that bind wait runs in a connection-owned
+/// task so it cannot hold unrelated frames behind a slow target module.
 pub async fn handle_connection<S>(
     mut stream: S,
     router: Arc<Router>,
@@ -282,7 +298,13 @@ where
         egress: egress.clone(),
     };
 
-    let loop_result = connection_loop(&mut read_half, &router, &ctx, close_receiver).await;
+    let loop_result = connection_loop(
+        &mut read_half,
+        Arc::clone(&router),
+        ctx.clone(),
+        close_receiver,
+    )
+    .await;
 
     drop(ctx);
     drop(egress);
@@ -391,17 +413,29 @@ where
 
 async fn connection_loop<R>(
     read_half: &mut R,
-    router: &Router,
-    ctx: &RouteCtx,
+    router: Arc<Router>,
+    ctx: RouteCtx,
     mut close_receiver: ConnectionCloseReceiver,
 ) -> Result<ConnectionLoopExit, ConnectionError>
 where
     R: AsyncRead + Unpin,
 {
+    let mut route_open_tasks = JoinSet::new();
+
     loop {
+        while let Some(result) = route_open_tasks.try_join_next() {
+            finish_route_open_task(result)?;
+        }
+
         let frame = tokio::select! {
             close = &mut close_receiver => {
                 return Ok(ConnectionLoopExit::CloseRequested(close_reason(close)));
+            }
+            result = route_open_tasks.join_next(), if !route_open_tasks.is_empty() => {
+                finish_route_open_task(
+                    result.expect("a non-empty route.open JoinSet has a next task")
+                )?;
+                continue;
             }
             read = read_frame(read_half) => {
                 match read.map_err(ConnectionError::FrameIo)? {
@@ -411,11 +445,53 @@ where
             }
         };
 
+        if let Some(target_module_id) = router.route_open_target(&frame) {
+            // A task can finish while the reader is waiting for the next frame.
+            // Reap it before checking admission so completed work never occupies
+            // one of the deliberately scarce connection slots.
+            while let Some(result) = route_open_tasks.try_join_next() {
+                finish_route_open_task(result)?;
+            }
+
+            if route_open_tasks.len() >= MAX_PENDING_ROUTE_OPENS_PER_CONNECTION {
+                // Never wait for capacity here: doing so would recreate the same
+                // reader head-of-line stall with a smaller constant.
+                let refusal = router
+                    .route_open_capacity_refusal(
+                        &ctx,
+                        &frame,
+                        &target_module_id,
+                        MAX_PENDING_ROUTE_OPENS_PER_CONNECTION,
+                    )
+                    .map_err(ConnectionError::Router)?;
+                let send_result = tokio::select! {
+                    close = &mut close_receiver => {
+                        return Ok(ConnectionLoopExit::CloseRequested(close_reason(close)));
+                    }
+                    result = ctx.egress.send(refusal) => result,
+                };
+                send_result.map_err(ConnectionError::Router)?;
+                continue;
+            }
+
+            let task_router = Arc::clone(&router);
+            let task_ctx = ctx.clone();
+            // Start slow-dispatch timing before spawn so it covers the task's
+            // full scheduler and handler lifetime, as inline timing did.
+            let dispatch_started_at = Instant::now();
+            route_open_tasks.spawn(async move {
+                route_open_tail(task_router, task_ctx, frame, dispatch_started_at).await
+            });
+            continue;
+        }
+
+        // Every non-route.open frame keeps the original serial dispatch path,
+        // including read backpressure and close-cancellation coupling.
         let route_result = tokio::select! {
             close = &mut close_receiver => {
                 return Ok(ConnectionLoopExit::CloseRequested(close_reason(close)));
             }
-            result = router.route_for_connection(ctx, frame) => result,
+            result = router.route_for_connection(&ctx, frame) => result,
         };
 
         if let Err(err) = route_result {
@@ -441,6 +517,45 @@ where
                 return Err(ConnectionError::Router(err));
             }
         }
+    }
+}
+
+async fn route_open_tail(
+    router: Arc<Router>,
+    ctx: RouteCtx,
+    frame: crate::Frame,
+    dispatch_started_at: Instant,
+) -> Result<(), RouterError> {
+    match router
+        .route_for_connection_started(&ctx, frame, Some(dispatch_started_at))
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let Some(error_frame) = err.to_error_frame() else {
+                return Err(err);
+            };
+            warn!(
+                connection_id = ctx.connection_id.get(),
+                error = %err,
+                "routing failure recovered with ERROR frame"
+            );
+            ctx.egress.send(error_frame).await
+        }
+    }
+}
+
+fn finish_route_open_task(
+    result: Result<Result<(), RouterError>, tokio::task::JoinError>,
+) -> Result<(), ConnectionError> {
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(ConnectionError::Router(err)),
+        Err(err) => Err(ConnectionError::Router(RouterError::backend(
+            0,
+            0,
+            format!("route.open task failed: {err}"),
+        ))),
     }
 }
 

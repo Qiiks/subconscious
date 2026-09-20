@@ -327,10 +327,34 @@ impl Router {
         }
     }
 
+    pub(crate) fn route_open_target(&self, frame: &Frame) -> Option<String> {
+        self.control.route_open_target(frame)
+    }
+
+    pub(crate) fn route_open_capacity_refusal(
+        &self,
+        ctx: &RouteCtx,
+        frame: &Frame,
+        target_module_id: &str,
+        limit: usize,
+    ) -> Result<Frame, RouterError> {
+        self.control
+            .route_open_capacity_refusal(ctx, frame, target_module_id, limit)
+    }
+
     pub async fn route_for_connection(
         &self,
         ctx: &RouteCtx,
         frame: Frame,
+    ) -> Result<(), RouterError> {
+        self.route_for_connection_started(ctx, frame, None).await
+    }
+
+    pub(crate) async fn route_for_connection_started(
+        &self,
+        ctx: &RouteCtx,
+        frame: Frame,
+        dispatch_started_at: Option<Instant>,
     ) -> Result<(), RouterError> {
         let channel = frame.header.channel;
         let epoch = frame.header.epoch;
@@ -342,10 +366,12 @@ impl Router {
                 frame_type = ?frame.header.ty,
                 "routing control frame"
             );
-            // The connection loop calls this handler directly after reading the frame;
-            // there is no channel send, semaphore, or spawn await between receipt and
-            // dispatch, so this timing has no queue segment by construction.
-            let dispatch_started_at = (frame.header.ty == FrameType::Request).then(Instant::now);
+            // The connection loop dispatches every control operation directly
+            // except `route.open`. Its task passes a timestamp captured before
+            // spawn, so slow-dispatch timing includes scheduler delay but no
+            // wait in an application-owned queue.
+            let dispatch_started_at = (frame.header.ty == FrameType::Request)
+                .then(|| dispatch_started_at.unwrap_or_else(Instant::now));
             let responses = self
                 .control
                 .handle_control_frame_timed(ctx, frame, dispatch_started_at)
