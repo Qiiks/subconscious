@@ -169,7 +169,15 @@ fn external_domain_candidates() -> BTreeMap<String, ExternalDomainCandidate> {
                 continue;
             };
             let name = name.strip_suffix(".exe").unwrap_or(name);
-            if name.is_empty() || candidates.contains_key(name) {
+            // A domain name has no dots. Placement tooling leaves rollback
+            // snapshots beside the live binary under names like
+            // `ck-broca.bak-20260914T004527` and `ck-aft.rollback-<stamp>`
+            // (275 of them, 3.6 GB, across the fleet on 2026-09-20); without
+            // this line every one is an executable `ck-*` on PATH and gets
+            // spawned once with `--ck-domain`, which runs an old module binary
+            // unsupervised. The probe cache hides the cost after the first
+            // run, which is why it went unnoticed.
+            if name.is_empty() || name.contains('.') || candidates.contains_key(name) {
                 continue;
             }
             let path = entry.path();

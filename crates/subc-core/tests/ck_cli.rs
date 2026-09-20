@@ -1583,6 +1583,13 @@ fn external_domains_opt_in_dispatch_and_cache_their_probe() {
     write_program("ck-hang", "sleep 30");
     write_program("ck-aft", "exit 1");
     write_program("ck-mc", "exit 1");
+    // A rollback snapshot beside a live binary. It is the SAME program as
+    // ck-yes and would answer the handshake if asked; the count below proves
+    // it is never asked, because a dotted name is not a domain.
+    write_program(
+        "ck-yes.bak-20260914T004527",
+        "if [ \"$1\" = \"--ck-domain\" ]; then printf x >> \"$CK_DOMAIN_PROBE_COUNT\"; echo \"stale snapshot answering\"; exit 0; fi",
+    );
 
     // The production probe deadline is two seconds; under a full parallel
     // suite a shell-script domain has taken longer than that just to start,
@@ -1622,7 +1629,15 @@ fn external_domains_opt_in_dispatch_and_cache_their_probe() {
         !help_text.contains("\n  aft "),
         "module binary leaked into help:\n{help_text}"
     );
-    assert_eq!(fs::read_to_string(&count).expect("probe count"), "x");
+    assert_eq!(
+        fs::read_to_string(&count).expect("probe count"),
+        "x",
+        "exactly one probe: the dotted rollback snapshot must never be spawned"
+    );
+    assert!(
+        !help_text.contains("yes.bak"),
+        "rollback snapshot leaked into help as a domain:\n{help_text}"
+    );
 
     let second_help = ck_command()
         .arg("--help")
