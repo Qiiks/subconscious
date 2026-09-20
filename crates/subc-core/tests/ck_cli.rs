@@ -3151,6 +3151,7 @@ fn scripted_supervisor_entry(module_id: &str, drain_timeout_ms: Option<u64>) -> 
         restart_count: Some(0),
         max_restarts: Some(3),
         lifetime_restarts: Some(0),
+        spawn_generation: Some(1),
         restart_window_secs: Some(600),
         drain_timeout_ms,
         restart_backoff_ms: Some(100),

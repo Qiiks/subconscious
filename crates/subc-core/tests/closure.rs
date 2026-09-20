@@ -765,6 +765,8 @@ fn thin_core_ops() -> BTreeSet<&'static str> {
         ops::SUPERVISOR_TERMINALS,
         ops::SUPERVISOR_ROUTES,
         ops::SUPERVISOR_PROVENANCE,
+        ops::SUPERVISOR_SPAWN_SNAPSHOT,
+        ops::SUPERVISOR_SPAWN_SUBSCRIBE,
     ])
 }
 

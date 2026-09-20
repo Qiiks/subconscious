@@ -1,0 +1,11 @@
+{
+  "cursor": {
+    "daemon_incarnation": "0123456789abcdef0123456789abcdef",
+    "seq": 12
+  },
+  "exit_signal": 9,
+  "kind": "exited",
+  "module_id": "nats",
+  "pid": 4242,
+  "spawn_generation": 3
+}

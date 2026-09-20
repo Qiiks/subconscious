@@ -1,0 +1,16 @@
+{
+  "cursor": {
+    "daemon_incarnation": "0123456789abcdef0123456789abcdef",
+    "seq": 11
+  },
+  "live": [
+    {
+      "module_id": "nats",
+      "pid": 4242,
+      "spawn_generation": 3,
+      "spawned_at_ms": 1700000000000
+    }
+  ],
+  "op": "supervisor.spawn_snapshot",
+  "ring_bound": 4096
+}

@@ -1,16 +1,27 @@
 use std::{ops::Deref, path::PathBuf, sync::Arc, time::Duration};
 
-use subc_control::{ModuleProtocol, TerminalDisposition};
+use subc_control::{
+    ClientControlRequest, ClientControlResponse, ModuleProtocol, SpawnCursor, SpawnEvent,
+    SpawnEventKind, SpawnSnapshot, TerminalDisposition,
+};
 use subc_daemon::{
     stderr_tail::{CaptureState, StderrTailSnapshot, TailEntry},
     test_support::TestTempDir,
     ModuleSpec, ModuleState, ModuleStatus, Registry, RestartPolicy, SuperviseError,
-    SupervisedModule, Supervisor,
+    SupervisedModule, Supervisor, SupervisorHandle, SupervisorProcessLiveness,
 };
-use tokio::time::{sleep, Instant};
+use subc_protocol::{ErrorBody, Flags, FrameType, Priority};
+use subc_transport::{read_frame, write_frame};
+use tokio::{
+    io::AsyncWriteExt,
+    net::TcpStream,
+    time::{sleep, timeout, Instant},
+};
 
 mod common;
-use common::TestDaemon;
+use common::{
+    connect_authed_client, start_test_daemon_with_process_liveness_and_supervisor, TestDaemon,
+};
 
 struct TestServer {
     daemon: TestDaemon,
@@ -59,6 +70,7 @@ async fn spawn_registers_stub_and_reports_running() {
     assert!(status.process_alive);
     assert!(status.registration_active);
     assert_eq!(status.restart_count, 0);
+    assert_eq!(status.spawn_generation, 1);
 
     module.stop().await.unwrap();
 }
@@ -352,6 +364,7 @@ async fn operator_restart_resets_restart_count() {
     .await;
     assert_eq!(crashed.restart_count, 2);
     assert_eq!(crashed.lifetime_restarts, 2);
+    assert_eq!(crashed.spawn_generation, 3);
 
     module.restart(None).await.unwrap();
 
@@ -364,6 +377,7 @@ async fn operator_restart_resets_restart_count() {
     .await;
     assert_eq!(restarted.restart_count, 0);
     assert_eq!(restarted.lifetime_restarts, 2);
+    assert_eq!(restarted.spawn_generation, 4);
     assert!(restarted.process_alive);
     assert!(restarted.registration_active);
 
@@ -421,6 +435,10 @@ async fn operator_restart_spawn_failure_lands_failed_not_restarting() {
         ModuleState::Failed,
         "spawn failure on operator restart must be visible as Failed, not stranded in a transient state"
     );
+    assert_eq!(
+        failed.spawn_generation, 1,
+        "a failed spawn must not consume a successful-spawn generation"
+    );
 
     // And Failed is the revivable state: restoring the program and re-enabling
     // heals it, which is the property Restarting-stranding denied the operator.
@@ -438,6 +456,7 @@ async fn operator_restart_spawn_failure_lands_failed_not_restarting() {
     })
     .await;
     assert!(revived.process_alive);
+    assert_eq!(revived.spawn_generation, 2);
 
     module.stop().await.unwrap();
 }
@@ -1260,4 +1279,368 @@ async fn wait_for_status(
         }
         sleep(Duration::from_millis(10)).await;
     }
+}
+
+struct SpawnEventHarness {
+    server: TestServer,
+    supervisor: Supervisor,
+    handle: SupervisorHandle,
+    incarnation: String,
+}
+
+impl SpawnEventHarness {
+    async fn start(name: &str, capacity: Option<usize>) -> Self {
+        let process_liveness = Arc::new(SupervisorProcessLiveness::new());
+        let handle = SupervisorHandle::new();
+        if let Some(capacity) = capacity {
+            handle.set_spawn_event_capacity_for_test(capacity);
+        }
+        let daemon = start_test_daemon_with_process_liveness_and_supervisor(
+            name,
+            process_liveness.clone(),
+            handle.clone(),
+        )
+        .await;
+        let server = TestServer { daemon };
+        let incarnation = format!("{name}-incarnation");
+        let supervisor = Supervisor::new(
+            Arc::clone(&server.registry),
+            RestartPolicy::new(0, Duration::ZERO),
+        )
+        .with_process_liveness(process_liveness)
+        .with_handle(handle.clone())
+        .with_connection_file_path(server.connection_file_path.clone())
+        .with_terminal_journal(
+            server.temp_dir.join("spawn-events-terminals.jsonl"),
+            incarnation.clone(),
+        )
+        .with_drain_timeout(Duration::from_millis(25));
+        Self {
+            server,
+            supervisor,
+            handle,
+            incarnation,
+        }
+    }
+
+    async fn client(&self) -> TcpStream {
+        connect_authed_client(&self.server.connection_file_path)
+            .await
+            .unwrap()
+    }
+
+    async fn spawn(&self, module_id: &str) -> SupervisedModule {
+        spawn_stub(&self.server, &self.supervisor, module_id).await
+    }
+}
+
+fn spawn_control_request(corr: u64, request: ClientControlRequest) -> subc_daemon::Frame {
+    subc_daemon::Frame::build(
+        FrameType::Request,
+        Flags::new(false, Priority::Passive, false),
+        0,
+        0,
+        corr,
+        serde_json::to_vec(&request).unwrap(),
+    )
+    .unwrap()
+}
+
+async fn send_spawn_request(client: &mut TcpStream, corr: u64, request: ClientControlRequest) {
+    write_frame(client, &spawn_control_request(corr, request))
+        .await
+        .unwrap();
+    client.flush().await.unwrap();
+}
+
+async fn spawn_snapshot(client: &mut TcpStream, corr: u64) -> SpawnSnapshot {
+    send_spawn_request(
+        client,
+        corr,
+        ClientControlRequest::SupervisorSpawnSnapshot {},
+    )
+    .await;
+    let frame = timeout(Duration::from_secs(5), read_frame(client))
+        .await
+        .expect("spawn snapshot response timed out")
+        .unwrap()
+        .expect("connection closed before spawn snapshot response");
+    assert_eq!(frame.header.ty, FrameType::Response);
+    assert_eq!(frame.header.corr, corr);
+    match serde_json::from_slice(&frame.body).unwrap() {
+        ClientControlResponse::SupervisorSpawnSnapshot { snapshot } => snapshot,
+        other => panic!("unexpected spawn snapshot response: {other:?}"),
+    }
+}
+
+async fn spawn_event(client: &mut TcpStream, corr: u64) -> SpawnEvent {
+    let frame = timeout(Duration::from_secs(5), read_frame(client))
+        .await
+        .expect("spawn event timed out")
+        .unwrap()
+        .expect("connection closed before spawn event");
+    assert_eq!(frame.header.ty, FrameType::StreamData);
+    assert_eq!(frame.header.corr, corr);
+    serde_json::from_slice(&frame.body).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_snapshot_then_subscribe_has_no_overlap_or_gap() {
+    let harness = SpawnEventHarness::start("spawn-snapshot-subscribe", None).await;
+    let before = harness.spawn("spawn-before-snapshot").await;
+    let mut client = harness.client().await;
+    send_spawn_request(&mut client, 70, ClientControlRequest::SupervisorList {}).await;
+    let list = timeout(Duration::from_secs(5), read_frame(&mut client))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let list: ClientControlResponse = serde_json::from_slice(&list.body).unwrap();
+    let ClientControlResponse::SupervisorList { modules, .. } = list else {
+        panic!("unexpected supervisor.list response: {list:?}");
+    };
+    assert_eq!(modules[0].spawn_generation, Some(1));
+
+    let snapshot = spawn_snapshot(&mut client, 71).await;
+    assert_eq!(snapshot.ring_bound, 4096);
+    assert!(snapshot
+        .live
+        .iter()
+        .any(|live| live.module_id == "spawn-before-snapshot"));
+
+    send_spawn_request(
+        &mut client,
+        72,
+        ClientControlRequest::SupervisorSpawnSubscribe {
+            since: Some(snapshot.cursor),
+        },
+    )
+    .await;
+    let after = harness.spawn("spawn-after-snapshot").await;
+    let event = spawn_event(&mut client, 72).await;
+    assert_eq!(event.kind, SpawnEventKind::Spawned);
+    assert_eq!(event.module_id, "spawn-after-snapshot");
+    assert_ne!(event.module_id, "spawn-before-snapshot");
+
+    after.stop().await.unwrap();
+    before.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_event_sequences_are_dense_across_spawn_and_exit_paths() {
+    let harness = SpawnEventHarness::start("spawn-density", None).await;
+    for index in 0..3 {
+        let module = harness.spawn(&format!("spawn-density-{index}")).await;
+        module.stop().await.unwrap();
+    }
+    let mut client = harness.client().await;
+    send_spawn_request(
+        &mut client,
+        81,
+        ClientControlRequest::SupervisorSpawnSubscribe {
+            since: Some(SpawnCursor {
+                daemon_incarnation: harness.incarnation.clone(),
+                seq: 0,
+            }),
+        },
+    )
+    .await;
+    let mut events = Vec::new();
+    for _ in 0..6 {
+        events.push(spawn_event(&mut client, 81).await);
+    }
+    assert_eq!(events.len(), 6);
+    for pair in events.windows(2) {
+        assert_eq!(pair[1].cursor.seq, pair[0].cursor.seq + 1);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_subscribe_replays_strictly_after_cursor_then_continues_live() {
+    let harness = SpawnEventHarness::start("spawn-replay-live", None).await;
+    let first = harness.spawn("spawn-replay-first").await;
+    first.stop().await.unwrap();
+    let mut client = harness.client().await;
+    send_spawn_request(
+        &mut client,
+        91,
+        ClientControlRequest::SupervisorSpawnSubscribe {
+            since: Some(SpawnCursor {
+                daemon_incarnation: harness.incarnation.clone(),
+                seq: 1,
+            }),
+        },
+    )
+    .await;
+    let replay = spawn_event(&mut client, 91).await;
+    assert_eq!(replay.cursor.seq, 2);
+    assert_eq!(replay.kind, SpawnEventKind::Exited);
+
+    let live = harness.spawn("spawn-replay-live-next").await;
+    let next = spawn_event(&mut client, 91).await;
+    assert_eq!(next.cursor.seq, 3);
+    assert_eq!(next.module_id, "spawn-replay-live-next");
+    live.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_subscribe_refuses_stale_and_foreign_cursors_with_typed_details() {
+    let harness = SpawnEventHarness::start("spawn-refusal", Some(2)).await;
+    let first = harness.spawn("spawn-refusal-first").await;
+    first.stop().await.unwrap();
+    let second = harness.spawn("spawn-refusal-second").await;
+    second.stop().await.unwrap();
+    let mut client = harness.client().await;
+
+    send_spawn_request(
+        &mut client,
+        101,
+        ClientControlRequest::SupervisorSpawnSubscribe {
+            since: Some(SpawnCursor {
+                daemon_incarnation: harness.incarnation.clone(),
+                seq: 0,
+            }),
+        },
+    )
+    .await;
+    let stale = timeout(Duration::from_secs(5), read_frame(&mut client))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(stale.header.ty, FrameType::Error);
+    let stale: ErrorBody = serde_json::from_slice(&stale.body).unwrap();
+    assert_eq!(stale.code, "spawn_cursor_too_old");
+    assert_eq!(stale.detail.unwrap()["oldest_retained_cursor"]["seq"], 3);
+
+    send_spawn_request(
+        &mut client,
+        102,
+        ClientControlRequest::SupervisorSpawnSubscribe {
+            since: Some(SpawnCursor {
+                daemon_incarnation: "foreign-incarnation".to_string(),
+                seq: 4,
+            }),
+        },
+    )
+    .await;
+    let foreign = timeout(Duration::from_secs(5), read_frame(&mut client))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(foreign.header.ty, FrameType::Error);
+    let foreign: ErrorBody = serde_json::from_slice(&foreign.body).unwrap();
+    assert_eq!(foreign.code, "spawn_cursor_incarnation_mismatch");
+    assert_eq!(
+        foreign.detail.unwrap()["current_daemon_incarnation"],
+        harness.incarnation
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sigkill_spawn_event_is_fact_only_while_terminal_keeps_disposition() {
+    let harness = SpawnEventHarness::start("spawn-fact-only", None).await;
+    let module = harness.spawn("spawn-fact-only-module").await;
+    let status = module.status().unwrap();
+    let pid = status.pid.expect("spawned module has pid");
+    let mut client = harness.client().await;
+    let snapshot = spawn_snapshot(&mut client, 111).await;
+    send_spawn_request(
+        &mut client,
+        112,
+        ClientControlRequest::SupervisorSpawnSubscribe {
+            since: Some(snapshot.cursor),
+        },
+    )
+    .await;
+    let kill = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(kill.success());
+    let frame = timeout(Duration::from_secs(5), read_frame(&mut client))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let raw: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+    assert_eq!(raw["kind"], "exited");
+    assert_eq!(raw["exit_signal"], 9);
+    assert!(raw.get("reason").is_none());
+    let event: SpawnEvent = serde_json::from_value(raw).unwrap();
+    assert_eq!(event.pid, pid);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let history = module.durable_terminal_history();
+        if let Some(entry) = history.entries.last() {
+            assert_eq!(entry.exit_signal, Some(9));
+            assert_eq!(entry.disposition, TerminalDisposition::Failed);
+            break;
+        }
+        assert!(Instant::now() < deadline, "terminal record did not arrive");
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_spawn_subscription_ends_its_stream() {
+    let harness = SpawnEventHarness::start("spawn-subscriber-cancel", None).await;
+    let mut client = harness.client().await;
+    send_spawn_request(
+        &mut client,
+        120,
+        ClientControlRequest::SupervisorSpawnSubscribe { since: None },
+    )
+    .await;
+    let cancel = subc_daemon::Frame::build(
+        FrameType::Cancel,
+        Flags::new(false, Priority::Passive, false),
+        0,
+        0,
+        120,
+        Vec::new(),
+    )
+    .unwrap();
+    write_frame(&mut client, &cancel).await.unwrap();
+    client.flush().await.unwrap();
+    let end = timeout(Duration::from_secs(5), read_frame(&mut client))
+        .await
+        .expect("cancelled subscription did not end")
+        .unwrap()
+        .expect("connection closed before StreamEnd");
+    assert_eq!(end.header.ty, FrameType::StreamEnd);
+    assert_eq!(end.header.corr, 120);
+    assert_eq!(harness.handle.spawn_subscriber_count_for_test(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closed_spawn_subscriber_is_removed_before_the_next_emit() {
+    let harness = SpawnEventHarness::start("spawn-subscriber-cleanup", None).await;
+    let mut client = harness.client().await;
+    send_spawn_request(
+        &mut client,
+        121,
+        ClientControlRequest::SupervisorSpawnSubscribe { since: None },
+    )
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while harness.handle.spawn_subscriber_count_for_test() != 1 {
+        assert!(Instant::now() < deadline, "subscriber was not registered");
+        sleep(Duration::from_millis(10)).await;
+    }
+    drop(client);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while harness.handle.spawn_subscriber_count_for_test() != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "closed subscriber remained registered"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+    let module = harness.spawn("spawn-after-subscriber-close").await;
+    assert_eq!(module.status().unwrap().spawn_generation, 1);
+    module.stop().await.unwrap();
 }

@@ -11,8 +11,8 @@ use std::{
 use cortexkit_log::Retention;
 use serde_json::Value;
 use subc_control::{
-    ClientControlPush, ModuleProtocol, RouteCloseReason, SupervisorHealthStatus,
-    TerminalDisposition, TerminalExitKind,
+    ClientControlPush, LiveSpawn, ModuleProtocol, RouteCloseReason, SpawnCursor, SpawnEvent,
+    SpawnEventKind, SpawnSnapshot, SupervisorHealthStatus, TerminalDisposition, TerminalExitKind,
 };
 use subc_protocol::{
     manifest::{SelfSignalKind, SignalAnchor},
@@ -39,13 +39,13 @@ use crate::{
         ModuleDrainTarget, PendingModuleControlRpc,
     },
     provenance::{spawned_file_identity, ExecutableIdentityProbe, SpawnedFileIdentity},
-    registry::RegistryError,
+    registry::{ConnectionId, RegistryError},
     stderr_tail::{
         pump_stderr_to, pump_stdout_to, ChildOutputSink, StderrRing, StderrTailConfig,
         StderrTailSnapshot,
     },
     terminal_ring::{TerminalHistorySnapshot, TerminalRecord, TerminalRing, TerminalRingConfig},
-    Frame, Registry,
+    Frame, FrameSink, Registry,
 };
 
 /// Command-line flag used by supervised modules to find subc.
@@ -76,6 +76,9 @@ pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const REGISTRY_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 const REGISTRY_RELEASE_POLL: Duration = Duration::from_millis(10);
 const STDERR_PUMP_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+/// Maximum number of supervised process spawn/exit facts retained per daemon incarnation.
+pub const SPAWN_EVENT_RING_CAPACITY: usize = 4096;
+const SPAWN_SUBSCRIBER_BUFFER: usize = SPAWN_EVENT_RING_CAPACITY + 1;
 
 struct SupervisedChild {
     child: Child,
@@ -91,11 +94,12 @@ struct SupervisedChild {
     spawned_file_identity: Option<SpawnedFileIdentity>,
     process_start_time: Option<u64>,
     process_identity: Option<ProcessIdentity>,
+    pid: u32,
 }
 
 impl SupervisedChild {
     fn id(&self) -> Option<u32> {
-        self.child.id()
+        Some(self.pid)
     }
 
     fn process_identity(&self) -> Option<ProcessIdentity> {
@@ -519,6 +523,7 @@ pub struct ModuleStatus {
     /// unlike `restart_count`, this value is never reset by an operator action
     /// and never falls out of a window.
     pub lifetime_restarts: u32,
+    pub spawn_generation: u64,
     /// The budget `restart_count` is spent against. Carried alongside the count
     /// because the count alone does not say how close the module is to being
     /// disabled, and reporting one without the other is what makes an
@@ -554,6 +559,15 @@ struct SupervisorSnapshot {
     /// operator actions that used to zero the old lifetime counter.
     crash_restarts: VecDeque<Instant>,
     lifetime_restarts: u32,
+    /// Successful child spawns in this daemon incarnation.
+    ///
+    /// `lifetime_restarts` was considered and rejected: it starts at zero
+    /// (line 640), successful initial/operator spawns in `set_running` do not
+    /// increment it (lines 5264-5274), and crash/deliberate retry bookkeeping
+    /// increments before a successful replacement exists (lines 604, 3846,
+    /// and 3921), so a failed spawn can consume it. This counter moves only
+    /// when a live PID is accepted below.
+    spawn_generation: u64,
     pid: Option<u32>,
     spawned_at_ms: Option<u64>,
     spawned_from: Option<PathBuf>,
@@ -638,6 +652,7 @@ impl SupervisorSnapshot {
             process_alive: false,
             crash_restarts: VecDeque::new(),
             lifetime_restarts: 0,
+            spawn_generation: 0,
             pid: None,
             spawned_at_ms: None,
             spawned_from: None,
@@ -651,6 +666,303 @@ impl SupervisorSnapshot {
 }
 
 type SharedSnapshot = Arc<Mutex<SupervisorSnapshot>>;
+
+type SpawnSubscriberKey = (ConnectionId, u64);
+
+#[derive(Debug)]
+struct SpawnSubscriber {
+    version: u8,
+    frames: mpsc::Sender<Frame>,
+}
+
+#[derive(Debug)]
+struct SpawnEventState {
+    daemon_incarnation: String,
+    seq: u64,
+    capacity: usize,
+    live: HashMap<String, LiveSpawn>,
+    generations: HashMap<String, u64>,
+    events: VecDeque<SpawnEvent>,
+    subscribers: HashMap<SpawnSubscriberKey, SpawnSubscriber>,
+}
+
+impl Default for SpawnEventState {
+    fn default() -> Self {
+        Self {
+            daemon_incarnation: "unconfigured".to_string(),
+            seq: 0,
+            capacity: SPAWN_EVENT_RING_CAPACITY,
+            live: HashMap::new(),
+            generations: HashMap::new(),
+            events: VecDeque::new(),
+            subscribers: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct SpawnEventFeed(Arc<Mutex<SpawnEventState>>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SpawnSubscribeRefusal {
+    ForeignIncarnation { current: String },
+    TooOld { oldest: SpawnCursor },
+    Frame(String),
+}
+
+impl SpawnEventFeed {
+    fn configure_incarnation(&self, daemon_incarnation: String) {
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        state.daemon_incarnation = daemon_incarnation;
+        state.seq = 0;
+        state.live.clear();
+        state.generations.clear();
+        state.events.clear();
+        state.subscribers.clear();
+    }
+
+    fn cursor(state: &SpawnEventState) -> SpawnCursor {
+        SpawnCursor {
+            daemon_incarnation: state.daemon_incarnation.clone(),
+            seq: state.seq,
+        }
+    }
+
+    fn snapshot(&self) -> SpawnSnapshot {
+        let state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let mut live = state.live.values().cloned().collect::<Vec<_>>();
+        live.sort_by(|left, right| left.module_id.cmp(&right.module_id));
+        SpawnSnapshot {
+            cursor: Self::cursor(&state),
+            ring_bound: state.capacity as u64,
+            live,
+        }
+    }
+
+    fn emit_spawned(&self, module_id: &str, pid: u32, spawned_at_ms: u64) -> u64 {
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let generation = state
+            .generations
+            .get(module_id)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .expect("spawn generation exhausted");
+        state.generations.insert(module_id.to_string(), generation);
+        let live = LiveSpawn {
+            module_id: module_id.to_string(),
+            spawn_generation: generation,
+            pid,
+            spawned_at_ms,
+        };
+        state.live.insert(module_id.to_string(), live);
+        Self::emit_locked(
+            &mut state,
+            SpawnEventKind::Spawned,
+            module_id.to_string(),
+            generation,
+            pid,
+            None,
+            None,
+        );
+        generation
+    }
+
+    fn emit_exited(&self, module_id: &str, exit_code: Option<i32>, exit_signal: Option<i32>) {
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(live) = state.live.remove(module_id) else {
+            warn!(
+                module_id,
+                "terminal record had no live spawn event identity"
+            );
+            return;
+        };
+        Self::emit_locked(
+            &mut state,
+            SpawnEventKind::Exited,
+            module_id.to_string(),
+            live.spawn_generation,
+            live.pid,
+            exit_code,
+            exit_signal,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_locked(
+        state: &mut SpawnEventState,
+        kind: SpawnEventKind,
+        module_id: String,
+        spawn_generation: u64,
+        pid: u32,
+        exit_code: Option<i32>,
+        exit_signal: Option<i32>,
+    ) {
+        state.seq = state
+            .seq
+            .checked_add(1)
+            .expect("spawn event sequence exhausted");
+        let event = SpawnEvent {
+            cursor: Self::cursor(state),
+            kind,
+            module_id,
+            spawn_generation,
+            pid,
+            exit_code,
+            exit_signal,
+        };
+        state.events.push_back(event.clone());
+        while state.events.len() > state.capacity {
+            state.events.pop_front();
+        }
+        let body = match serde_json::to_vec(&event) {
+            Ok(body) => body,
+            Err(error) => {
+                error!(%error, "failed to serialize supervisor spawn event");
+                return;
+            }
+        };
+        state.subscribers.retain(|(connection_id, corr), subscriber| {
+            let frame = Frame::build_with_version(
+                subscriber.version,
+                FrameType::StreamData,
+                control_flags(),
+                0,
+                0,
+                *corr,
+                body.clone(),
+            );
+            match frame {
+                Ok(frame) => {
+                    if subscriber.frames.try_send(frame).is_ok() {
+                        true
+                    } else {
+                        warn!(connection_id = connection_id.get(), corr, "dropping lagged supervisor spawn subscriber");
+                        false
+                    }
+                }
+                Err(error) => {
+                    warn!(connection_id = connection_id.get(), corr, %error, "dropping supervisor spawn subscriber after frame build failure");
+                    false
+                }
+            }
+        });
+    }
+
+    fn subscribe(
+        &self,
+        connection_id: ConnectionId,
+        corr: u64,
+        version: u8,
+        since: Option<SpawnCursor>,
+        sink: FrameSink,
+    ) -> Result<(), SpawnSubscribeRefusal> {
+        let (frames, mut receiver) = mpsc::channel(SPAWN_SUBSCRIBER_BUFFER);
+        {
+            let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+            let replay = if let Some(since) = since {
+                if since.daemon_incarnation != state.daemon_incarnation {
+                    return Err(SpawnSubscribeRefusal::ForeignIncarnation {
+                        current: state.daemon_incarnation.clone(),
+                    });
+                }
+                if let Some(oldest) = state.events.front().map(|event| event.cursor.clone()) {
+                    if since.seq < oldest.seq.saturating_sub(1) {
+                        return Err(SpawnSubscribeRefusal::TooOld { oldest });
+                    }
+                }
+                state
+                    .events
+                    .iter()
+                    .filter(|event| event.cursor.seq > since.seq)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            for event in replay {
+                let body = serde_json::to_vec(&event)
+                    .map_err(|error| SpawnSubscribeRefusal::Frame(error.to_string()))?;
+                let frame = Frame::build_with_version(
+                    version,
+                    FrameType::StreamData,
+                    control_flags(),
+                    0,
+                    0,
+                    corr,
+                    body,
+                )
+                .map_err(|error| SpawnSubscribeRefusal::Frame(error.to_string()))?;
+                frames
+                    .try_send(frame)
+                    .map_err(|error| SpawnSubscribeRefusal::Frame(error.to_string()))?;
+            }
+            state.subscribers.insert(
+                (connection_id, corr),
+                SpawnSubscriber {
+                    version,
+                    frames: frames.clone(),
+                },
+            );
+        }
+        tokio::spawn(async move {
+            while let Some(frame) = receiver.recv().await {
+                if sink.send(frame).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(())
+    }
+
+    fn cancel(&self, connection_id: ConnectionId, corr: u64) -> bool {
+        let Some(subscriber) = self
+            .0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .subscribers
+            .remove(&(connection_id, corr))
+        else {
+            return false;
+        };
+        if let Ok(frame) = Frame::build_with_version(
+            subscriber.version,
+            FrameType::StreamEnd,
+            control_flags(),
+            0,
+            0,
+            corr,
+            Vec::new(),
+        ) {
+            tokio::spawn(async move {
+                let _ = subscriber.frames.send(frame).await;
+            });
+        }
+        true
+    }
+
+    fn remove_connection(&self, connection_id: ConnectionId) {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .subscribers
+            .retain(|(subscriber_connection, _), _| *subscriber_connection != connection_id);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn set_capacity(&self, capacity: usize) {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).capacity = capacity;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn subscriber_count(&self) -> usize {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .subscribers
+            .len()
+    }
+}
 
 /// Narrow process-liveness signal published by supervisors and consumed by passive liveness polls.
 pub trait ModuleProcessLiveness: Send + Sync {
@@ -734,6 +1046,7 @@ struct SupervisorRuntimeConfig {
     /// exactly when it is asked for.
     stderr_ring: Arc<Mutex<StderrRing>>,
     terminal_ring: Arc<Mutex<TerminalRing>>,
+    spawn_events: SpawnEventFeed,
     #[cfg(target_os = "linux")]
     cgroup_placement: Option<subc_cgroup::Placement>,
     #[cfg(test)]
@@ -754,6 +1067,7 @@ struct SupervisedConfiguration {
 #[derive(Debug, Clone, Default)]
 pub struct SupervisorHandle {
     modules: Arc<Mutex<HashMap<String, SupervisedModule>>>,
+    spawn_events: SpawnEventFeed,
     /// The current expected launch nonce for each reserved module_id. Set when the
     /// supervisor spawns the reserved module; checked when a HELLO claims that id. A
     /// non-reserved module never has an entry here and is never nonce-checked.
@@ -803,6 +1117,41 @@ pub(crate) enum ReservedHelloRejection {
 impl SupervisorHandle {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn spawn_snapshot(&self) -> SpawnSnapshot {
+        self.spawn_events.snapshot()
+    }
+
+    pub(crate) fn subscribe_spawns(
+        &self,
+        connection_id: ConnectionId,
+        corr: u64,
+        version: u8,
+        since: Option<SpawnCursor>,
+        sink: FrameSink,
+    ) -> Result<(), SpawnSubscribeRefusal> {
+        self.spawn_events
+            .subscribe(connection_id, corr, version, since, sink)
+    }
+
+    pub(crate) fn cancel_spawn_subscription(&self, connection_id: ConnectionId, corr: u64) -> bool {
+        self.spawn_events.cancel(connection_id, corr)
+    }
+
+    pub(crate) fn remove_spawn_subscribers(&self, connection_id: ConnectionId) {
+        self.spawn_events.remove_connection(connection_id);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_spawn_event_capacity_for_test(&self, capacity: usize) {
+        assert!(capacity > 0, "spawn event capacity must be non-zero");
+        self.spawn_events.set_capacity(capacity);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn spawn_subscriber_count_for_test(&self) -> usize {
+        self.spawn_events.subscriber_count()
     }
 
     /// Record the launch nonce from a supervised spawn, replacing any prior nonce so
@@ -1111,6 +1460,7 @@ pub struct Supervisor {
     health: HealthConfig,
     daemon_started_at_ms: u64,
     terminal_journal: Option<Arc<crate::terminal_journal::TerminalJournal>>,
+    spawn_events: SpawnEventFeed,
     provenance_probe: ExecutableIdentityProbe,
     #[cfg(target_os = "linux")]
     cgroup_placement: Option<subc_cgroup::Placement>,
@@ -1238,6 +1588,7 @@ impl Supervisor {
             health: HealthConfig::default(),
             daemon_started_at_ms: unix_ms_now(),
             terminal_journal: None,
+            spawn_events: SpawnEventFeed::default(),
             provenance_probe: ExecutableIdentityProbe::default(),
             #[cfg(target_os = "linux")]
             cgroup_placement: None,
@@ -1273,6 +1624,8 @@ impl Supervisor {
         // A millisecond start stamp can repeat after clock rollback or a rapid
         // restart. Use the connection file's random daemon_id instead: it already
         // identifies this daemon lifetime independently of the wall clock.
+        self.spawn_events
+            .configure_incarnation(daemon_incarnation.clone());
         self.terminal_journal = Some(Arc::new(crate::terminal_journal::TerminalJournal::open(
             path,
             daemon_incarnation,
@@ -1286,6 +1639,7 @@ impl Supervisor {
     }
 
     pub fn with_handle(mut self, supervisor_handle: SupervisorHandle) -> Self {
+        self.spawn_events = supervisor_handle.spawn_events.clone();
         self.supervisor_handle = Some(supervisor_handle);
         self
     }
@@ -1323,7 +1677,7 @@ impl Supervisor {
             #[cfg(target_os = "linux")]
             runtime.cgroup_placement.as_ref(),
         )?;
-        set_running(&snapshot, &child)?;
+        set_running(&snapshot, &child, &spec.module_id, &runtime.spawn_events)?;
         self.process_liveness
             .track(spec.module_id.clone(), Arc::clone(&snapshot));
 
@@ -1359,7 +1713,7 @@ impl Supervisor {
             runtime.cgroup_placement.as_ref(),
         ) {
             Ok(child) => {
-                set_running(&snapshot, &child)?;
+                set_running(&snapshot, &child, &spec.module_id, &runtime.spawn_events)?;
                 self.process_liveness
                     .track(spec.module_id.clone(), Arc::clone(&snapshot));
                 Ok(self.supervised_module(spec, runtime, snapshot, Some(child)))
@@ -1418,7 +1772,7 @@ impl Supervisor {
             runtime.cgroup_placement.as_ref(),
         ) {
             Ok(child) => {
-                set_running(&snapshot, &child)?;
+                set_running(&snapshot, &child, &spec.module_id, &runtime.spawn_events)?;
                 self.process_liveness
                     .track(spec.module_id.clone(), Arc::clone(&snapshot));
                 Ok(self.supervised_module(spec, runtime, snapshot, Some(child)))
@@ -1461,6 +1815,7 @@ impl Supervisor {
                 TerminalRing::new(TerminalRingConfig::default(), self.daemon_started_at_ms)
                     .with_journal(self.terminal_journal.clone()),
             )),
+            spawn_events: self.spawn_events.clone(),
             #[cfg(target_os = "linux")]
             cgroup_placement: self.cgroup_placement.clone(),
             #[cfg(test)]
@@ -1699,6 +2054,7 @@ impl SupervisedModule {
             live,
             restart_count,
             lifetime_restarts: snapshot.lifetime_restarts,
+            spawn_generation: snapshot.spawn_generation,
             max_restarts: self.inner.restart_policy.max_restarts,
             restart_window: self.inner.restart_policy.window,
             drain_timeout,
@@ -2785,6 +3141,7 @@ async fn health_restart_child(
             registry,
             snapshot,
             &runtime.terminal_ring,
+            &runtime.spawn_events,
             child,
             runtime.drain_timeout,
             ModuleState::Disabled,
@@ -2829,6 +3186,7 @@ async fn health_restart_child(
         registry,
         snapshot,
         &runtime.terminal_ring,
+        &runtime.spawn_events,
         child,
         runtime.drain_timeout,
         ModuleState::Restarting,
@@ -3173,11 +3531,10 @@ async fn supervise_loop(
                             // before moving on. Without one here, a module whose wait()
                             // itself errored (e.g. already reaped) leaves no terminal
                             // record at all -- an empty ring reads as "nothing died".
-                            record_terminal(
+                            record_wait_error_terminal(
                                 &spec.module_id,
                                 &runtime.terminal_ring,
-                                &wait_error_exit_report(),
-                                TerminalDisposition::Failed,
+                                &runtime.spawn_events,
                             );
                             untrack_if_registration_released(
                                 &process_liveness,
@@ -3198,6 +3555,7 @@ async fn supervise_loop(
                         &registry,
                         &snapshot,
                         &runtime.terminal_ring,
+                        &runtime.spawn_events,
                         exit_report,
                     ).await {
                         NextAction::Stop { registration_released } => {
@@ -3329,6 +3687,7 @@ async fn handle_supervisor_command(
                 registry,
                 snapshot,
                 &runtime.terminal_ring,
+                &runtime.spawn_events,
                 child,
                 runtime.drain_timeout,
                 ModuleState::Stopped,
@@ -3359,6 +3718,7 @@ async fn handle_supervisor_command(
                     registry,
                     snapshot,
                     &runtime.terminal_ring,
+                    &runtime.spawn_events,
                     child,
                     runtime.drain_timeout,
                     ModuleState::Stopped,
@@ -3505,6 +3865,7 @@ async fn restart_child(
             registry,
             snapshot,
             &runtime.terminal_ring,
+            &runtime.spawn_events,
             child,
             drain_timeout,
             ModuleState::Restarting,
@@ -3574,6 +3935,7 @@ async fn reload_child(
             registry,
             snapshot,
             &runtime.terminal_ring,
+            &runtime.spawn_events,
             child,
             runtime.drain_timeout,
             ModuleState::Restarting,
@@ -3768,6 +4130,7 @@ async fn set_child_enabled(
             registry,
             snapshot,
             &runtime.terminal_ring,
+            &runtime.spawn_events,
             child,
             runtime.drain_timeout,
             ModuleState::Disabled,
@@ -3785,6 +4148,7 @@ async fn on_child_exit(
     registry: &Registry,
     snapshot: &SharedSnapshot,
     terminal_ring: &Arc<Mutex<TerminalRing>>,
+    spawn_events: &SpawnEventFeed,
     exit_report: ExitReport,
 ) -> NextAction {
     match exit_report.kind {
@@ -3805,6 +4169,7 @@ async fn on_child_exit(
             record_terminal(
                 &spec.module_id,
                 terminal_ring,
+                spawn_events,
                 &exit_report,
                 TerminalDisposition::Stopped,
             );
@@ -3878,6 +4243,7 @@ async fn on_child_exit(
             record_terminal_with_detail(
                 &spec.module_id,
                 terminal_ring,
+                spawn_events,
                 &exit_report,
                 disposition,
                 disposition_detail,
@@ -3932,7 +4298,13 @@ async fn on_child_exit(
                     registration_released: false,
                 };
             }
-            record_terminal(&spec.module_id, terminal_ring, &exit_report, disposition);
+            record_terminal(
+                &spec.module_id,
+                terminal_ring,
+                spawn_events,
+                &exit_report,
+                disposition,
+            );
 
             if should_restart {
                 NextAction::Restart { schedule: None }
@@ -3958,22 +4330,46 @@ async fn on_child_exit(
     }
 }
 
+fn record_wait_error_terminal(
+    module_id: &str,
+    terminal_ring: &Arc<Mutex<TerminalRing>>,
+    spawn_events: &SpawnEventFeed,
+) {
+    record_terminal(
+        module_id,
+        terminal_ring,
+        spawn_events,
+        &wait_error_exit_report(),
+        TerminalDisposition::Failed,
+    );
+}
+
 fn record_terminal(
     module_id: &str,
     terminal_ring: &Arc<Mutex<TerminalRing>>,
+    spawn_events: &SpawnEventFeed,
     exit_report: &ExitReport,
     disposition: TerminalDisposition,
 ) {
-    record_terminal_with_detail(module_id, terminal_ring, exit_report, disposition, None);
+    record_terminal_with_detail(
+        module_id,
+        terminal_ring,
+        spawn_events,
+        exit_report,
+        disposition,
+        None,
+    );
 }
 
 fn record_terminal_with_detail(
     module_id: &str,
     terminal_ring: &Arc<Mutex<TerminalRing>>,
+    spawn_events: &SpawnEventFeed,
     exit_report: &ExitReport,
     disposition: TerminalDisposition,
     disposition_detail: Option<String>,
 ) {
+    spawn_events.emit_exited(module_id, exit_report.code, exit_report.signal);
     let mut ring = terminal_ring
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -4141,11 +4537,13 @@ fn spawn_child(
     let spawned_at_ms = unix_ms_now();
     let spawned_from = spec.program.clone();
     let spawned_file_identity = spawned_file_identity(&spawned_from);
-    let pid = child.id();
-    let process_start_time = pid.and_then(crate::provenance::process_start_time);
-    let process_identity = pid
-        .zip(process_start_time)
-        .map(|(pid, start_time)| ProcessIdentity { pid, start_time });
+    let pid = child.id().ok_or_else(|| SuperviseError::Spawn {
+        program: spec.program.clone(),
+        source: io::Error::other("spawned child exposed no live pid"),
+        cgroup_path: cgroup_path.clone(),
+    })?;
+    let process_start_time = crate::provenance::process_start_time(pid);
+    let process_identity = process_start_time.map(|start_time| ProcessIdentity { pid, start_time });
 
     let stdout_pump = match child.stdout.take() {
         Some(stdout) => Some(tokio::spawn(pump_stdout_to(stdout, output_sink.clone()))),
@@ -4197,6 +4595,7 @@ fn spawn_child(
         spawned_file_identity,
         process_start_time,
         process_identity,
+        pid,
     })
 }
 
@@ -4287,7 +4686,7 @@ fn spawn_and_mark_running(
         #[cfg(target_os = "linux")]
         runtime.cgroup_placement.as_ref(),
     )?;
-    set_running(snapshot, &child)?;
+    set_running(snapshot, &child, &spec.module_id, &runtime.spawn_events)?;
     Ok(child)
 }
 
@@ -4870,6 +5269,7 @@ async fn handle_reload_child_registration_failure(
         registry,
         snapshot,
         &runtime.terminal_ring,
+        &runtime.spawn_events,
         exit_report,
     )
     .await
@@ -4985,6 +5385,7 @@ async fn drain_optional_child(
     registry: &Registry,
     snapshot: &SharedSnapshot,
     terminal_ring: &Arc<Mutex<TerminalRing>>,
+    spawn_events: &SpawnEventFeed,
     child: &mut Option<SupervisedChild>,
     drain_timeout: Duration,
     final_state: ModuleState,
@@ -4997,6 +5398,7 @@ async fn drain_optional_child(
             registry,
             snapshot,
             terminal_ring,
+            spawn_events,
             child,
             drain_timeout,
             final_state,
@@ -5022,6 +5424,7 @@ async fn drain_child_to_state(
     registry: &Registry,
     snapshot: &SharedSnapshot,
     terminal_ring: &Arc<Mutex<TerminalRing>>,
+    spawn_events: &SpawnEventFeed,
     mut child: SupervisedChild,
     drain_timeout: Duration,
     final_state: ModuleState,
@@ -5093,6 +5496,7 @@ async fn drain_child_to_state(
     record_terminal(
         module_id,
         terminal_ring,
+        spawn_events,
         &exit_report,
         terminal_disposition(final_state),
     );
@@ -5261,17 +5665,25 @@ fn reset_restart_count(snapshot: &SharedSnapshot, module_id: &str) -> Result<(),
     })
 }
 
-fn set_running(snapshot: &SharedSnapshot, child: &SupervisedChild) -> Result<(), SuperviseError> {
-    update_snapshot(snapshot, None, |state| {
-        state.state = ModuleState::Running;
-        state.enabled = true;
-        state.process_alive = true;
-        state.pid = child.id();
-        state.spawned_at_ms = Some(child.spawned_at_ms);
-        state.spawned_from = Some(child.spawned_from.clone());
-        state.spawned_file_identity = child.spawned_file_identity;
-        state.process_start_time = child.process_start_time;
-    })
+fn set_running(
+    snapshot: &SharedSnapshot,
+    child: &SupervisedChild,
+    module_id: &str,
+    spawn_events: &SpawnEventFeed,
+) -> Result<(), SuperviseError> {
+    let mut state = snapshot.lock().map_err(|_| SuperviseError::StatePoisoned {
+        module_id: Some(module_id.to_string()),
+    })?;
+    state.spawn_generation = spawn_events.emit_spawned(module_id, child.pid, child.spawned_at_ms);
+    state.state = ModuleState::Running;
+    state.enabled = true;
+    state.process_alive = true;
+    state.pid = child.id();
+    state.spawned_at_ms = Some(child.spawned_at_ms);
+    state.spawned_from = Some(child.spawned_from.clone());
+    state.spawned_file_identity = child.spawned_file_identity;
+    state.process_start_time = child.process_start_time;
+    Ok(())
 }
 
 fn clear_current_process_facts(state: &mut SupervisorSnapshot) {
@@ -5386,11 +5798,11 @@ mod terminal_history_tests {
     use super::{
         apply_deliberate_severance_marker, daemon_will_restart, drain_child_to_state,
         drained_after_quiescence_wait, handle_reload_spawn_failure, health_restart_child,
-        lock_snapshot, on_child_exit, record_deliberate_severance, record_terminal,
+        lock_snapshot, on_child_exit, record_deliberate_severance, record_wait_error_terminal,
         reset_restart_count, spawn_and_mark_running, update_snapshot, wait_error_exit_report,
         ExitKind, ExitReport, ModuleProtocol, ModuleSpec, ModuleState, NextAction, ProcessIdentity,
-        RestartPolicy, SuperviseError, SupervisedModule, Supervisor, SupervisorHandle,
-        SupervisorHealthStatus, SupervisorSnapshot,
+        RestartPolicy, SpawnEventKind, SuperviseError, SupervisedModule, Supervisor,
+        SupervisorHandle, SupervisorHealthStatus, SupervisorSnapshot,
     };
     // The supervisor's clock, distinct from the `std::time::Instant` these tests
     // use for their own wall-clock deadlines: crash-restart instants must be on
@@ -5809,6 +6221,7 @@ mod terminal_history_tests {
                 &supervisor.registry,
                 &crash_snapshot,
                 &runtime.terminal_ring,
+                &runtime.spawn_events,
                 ExitReport {
                     kind: ExitKind::Crash,
                     code: Some(1),
@@ -5913,6 +6326,7 @@ mod terminal_history_tests {
                 &supervisor.registry,
                 &snapshot,
                 &runtime.terminal_ring,
+                &runtime.spawn_events,
                 exit_report,
             )
             .await,
@@ -5948,6 +6362,7 @@ mod terminal_history_tests {
                 &supervisor.registry,
                 &snapshot,
                 &runtime.terminal_ring,
+                &runtime.spawn_events,
                 ExitReport {
                     kind: ExitKind::Crash,
                     code: Some(1),
@@ -6009,6 +6424,7 @@ mod terminal_history_tests {
                         &supervisor.registry,
                         &snapshot,
                         &runtime.terminal_ring,
+                        &runtime.spawn_events,
                         crash_exit_report(attempt),
                     )
                     .await,
@@ -6025,6 +6441,7 @@ mod terminal_history_tests {
                 &supervisor.registry,
                 &snapshot,
                 &runtime.terminal_ring,
+                &runtime.spawn_events,
                 crash_exit_report(3),
             )
             .await,
@@ -6085,6 +6502,7 @@ mod terminal_history_tests {
                     &supervisor.registry,
                     &snapshot,
                     &runtime.terminal_ring,
+                    &runtime.spawn_events,
                     crash_exit_report(attempt),
                 )
                 .await,
@@ -6107,6 +6525,7 @@ mod terminal_history_tests {
                     &supervisor.registry,
                     &snapshot,
                     &runtime.terminal_ring,
+                    &runtime.spawn_events,
                     crash_exit_report(3),
                 )
                 .await,
@@ -6150,6 +6569,7 @@ mod terminal_history_tests {
                     &supervisor.registry,
                     &snapshot,
                     &runtime.terminal_ring,
+                    &runtime.spawn_events,
                     crash_exit_report(attempt),
                 )
                 .await,
@@ -6178,6 +6598,7 @@ mod terminal_history_tests {
                     &supervisor.registry,
                     &snapshot,
                     &runtime.terminal_ring,
+                    &runtime.spawn_events,
                     crash_exit_report(3),
                 )
                 .await,
@@ -6259,6 +6680,7 @@ mod terminal_history_tests {
             &registry,
             &snapshot,
             &runtime.terminal_ring,
+            &runtime.spawn_events,
             child,
             Duration::from_secs(1),
             ModuleState::Stopped,
@@ -6308,6 +6730,7 @@ mod terminal_history_tests {
             &registry,
             &snapshot,
             &runtime.terminal_ring,
+            &runtime.spawn_events,
             child,
             Duration::from_secs(1),
             ModuleState::Stopped,
@@ -6365,12 +6788,7 @@ mod terminal_history_tests {
             TerminalRingConfig::default(),
             0,
         )));
-        record_terminal(
-            "wait-error",
-            &ring,
-            &wait_error_exit_report(),
-            TerminalDisposition::Failed,
-        );
+        record_wait_error_terminal("wait-error", &ring, &super::SpawnEventFeed::default());
 
         let snapshot = ring.lock().unwrap().snapshot();
         assert_eq!(snapshot.entries.len(), 1);
@@ -6378,6 +6796,31 @@ mod terminal_history_tests {
         assert_eq!(entry.exit_code, None);
         assert_eq!(entry.exit_signal, None);
         assert_eq!(entry.disposition, TerminalDisposition::Failed);
+    }
+
+    #[test]
+    fn wait_error_exit_path_preserves_spawn_event_density() {
+        let feed = super::SpawnEventFeed::default();
+        feed.configure_incarnation("wait-error-density".to_string());
+        feed.emit_spawned("wait-error", 41, 1);
+        let ring = Arc::new(Mutex::new(TerminalRing::new(
+            TerminalRingConfig::default(),
+            0,
+        )));
+
+        record_wait_error_terminal("wait-error", &ring, &feed);
+        feed.emit_spawned("after-wait-error", 42, 2);
+
+        let state = feed.0.lock().unwrap();
+        let sequences = state
+            .events
+            .iter()
+            .map(|event| event.cursor.seq)
+            .collect::<Vec<_>>();
+        assert_eq!(sequences, vec![1, 2, 3]);
+        assert_eq!(state.events[1].kind, SpawnEventKind::Exited);
+        assert_eq!(state.events[1].exit_code, None);
+        assert_eq!(state.events[1].exit_signal, None);
     }
 
     /// Pins the report's `kind` too: the wait-error arm treats an unwaitable child
@@ -6908,6 +7351,7 @@ mod cgroup_placement_tests {
         let child = Command::new("true")
             .spawn()
             .expect("spawn short-lived child");
+        let pid = child.id().expect("spawned child has pid");
         let mut child = SupervisedChild {
             child,
             module_id: module_id.to_string(),
@@ -6920,6 +7364,7 @@ mod cgroup_placement_tests {
             spawned_file_identity: None,
             process_start_time: None,
             process_identity: None,
+            pid,
         };
 
         child.wait().await.expect("reap short-lived child");

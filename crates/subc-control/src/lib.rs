@@ -111,6 +111,8 @@ pub mod ops {
     pub const SUPERVISOR_TERMINALS: &str = "supervisor.terminals";
     pub const SUPERVISOR_ROUTES: &str = "supervisor.routes";
     pub const SUPERVISOR_PROVENANCE: &str = "supervisor.provenance";
+    pub const SUPERVISOR_SPAWN_SNAPSHOT: &str = "supervisor.spawn_snapshot";
+    pub const SUPERVISOR_SPAWN_SUBSCRIBE: &str = "supervisor.spawn_subscribe";
 }
 
 /// Client-originated channel-0 control RPC body.
@@ -166,6 +168,19 @@ pub enum ClientControlRequest {
     },
     #[serde(rename = "supervisor.list")]
     SupervisorList {},
+    /// Read the live supervised processes and the event cursor atomically.
+    #[serde(rename = "supervisor.spawn_snapshot")]
+    SupervisorSpawnSnapshot {},
+    /// Replay spawn events after `since`, then remain open for live events.
+    ///
+    /// The cursor is one value copied from a snapshot or event. It includes the
+    /// daemon incarnation so a restarted daemon rejects an earlier instance's
+    /// sequence instead of treating it as a position in the current stream.
+    #[serde(rename = "supervisor.spawn_subscribe")]
+    SupervisorSpawnSubscribe {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since: Option<SpawnCursor>,
+    },
     #[serde(rename = "supervisor.restart")]
     SupervisorRestart {
         module_id: String,
@@ -327,6 +342,11 @@ pub enum ClientControlResponse {
         generation: u64,
         modules: Vec<SupervisorEntry>,
     },
+    #[serde(rename = "supervisor.spawn_snapshot")]
+    SupervisorSpawnSnapshot {
+        #[serde(flatten)]
+        snapshot: SpawnSnapshot,
+    },
     #[serde(rename = "supervisor.ack")]
     SupervisorAck { module_id: String, applied: bool },
     #[serde(rename = "supervisor.rescan")]
@@ -401,6 +421,57 @@ pub enum ClientControlPush {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         terminal: Option<bool>,
     },
+}
+
+/// A daemon-incarnation-scoped position in the supervised spawn event stream.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpawnCursor {
+    pub daemon_incarnation: String,
+    pub seq: u64,
+}
+
+/// One process present in an atomic supervisor spawn snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LiveSpawn {
+    pub module_id: String,
+    pub spawn_generation: u64,
+    pub pid: u32,
+    pub spawned_at_ms: u64,
+}
+
+/// Atomic live-process census and the cursor at which it was observed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpawnSnapshot {
+    pub cursor: SpawnCursor,
+    /// Maximum retained event count for this daemon.
+    pub ring_bound: u64,
+    pub live: Vec<LiveSpawn>,
+}
+
+/// Fact observed by the supervisor when a child process starts or exits.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SpawnEventKind {
+    Spawned,
+    Exited,
+}
+
+/// One retained or live spawn event.
+///
+/// Exit events intentionally carry no disposition or reason because exit
+/// classification is recorded separately; credential consumers revoke on every
+/// exit regardless of the cause.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpawnEvent {
+    pub cursor: SpawnCursor,
+    pub kind: SpawnEventKind,
+    pub module_id: String,
+    pub spawn_generation: u64,
+    pub pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_signal: Option<i32>,
 }
 
 /// A module's retained stderr, oldest entry first.
@@ -1615,6 +1686,11 @@ pub struct SupervisorEntry {
     /// Unlike `restart_count`, this value is never reset by an operator action.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifetime_restarts: Option<u32>,
+    /// Successful child spawns in this daemon incarnation. Zero means the
+    /// module has not successfully spawned; every successful spawn increments
+    /// the value exactly once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_generation: Option<u64>,
     /// The span `restart_count` is counted over, in seconds. The crash budget is
     /// a RATE, not a lifetime total: `restart_count` counts only the restarts
     /// inside the last `restart_window_secs`, and older ones no longer hold a

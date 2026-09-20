@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use subc_control::{
     ops, CapabilityRequirementStatus, CatalogEntry, ClientControlPush, ClientControlRequest,
     ClientControlResponse, ConsumerIdentity, DaemonBuildProvenance, DaemonObservedProcess,
-    ModuleDeclaredProvenance, ModuleProtocol, PollKind, RouteCloseReason, StderrCaptureState,
-    StderrTail, StderrTailEntry, SupervisorDaemonProvenance, SupervisorEntry,
+    ModuleDeclaredProvenance, ModuleProtocol, PollKind, RouteCloseReason, SpawnCursor,
+    StderrCaptureState, StderrTail, StderrTailEntry, SupervisorDaemonProvenance, SupervisorEntry,
     SupervisorHealthEntry, SupervisorModuleProvenance, SupervisorObservedProcess,
     SupervisorRescanResult, SupervisorRoute, SupervisorRouteConsumer, SupervisorRouteModule,
 };
@@ -51,7 +51,10 @@ use crate::{
     router::{RouteCtx, RouterError},
     server::MAX_PENDING_ROUTE_BINDS_PER_TARGET,
     stderr_tail::{CaptureState, TailEntry},
-    supervise::{validate_spec, ModuleProcessLiveness, ReservedHelloRejection, SupervisorHandle},
+    supervise::{
+        validate_spec, ModuleProcessLiveness, ReservedHelloRejection, SpawnSubscribeRefusal,
+        SupervisorHandle,
+    },
     ConnectedClients, DaemonCounters, Frame, ProjectRootId, Supervisor,
 };
 
@@ -87,6 +90,8 @@ const SUBC_CONTROL_OPS: &[&str] = &[
     ops::SUPERVISOR_TERMINALS,
     ops::SUPERVISOR_ROUTES,
     ops::SUPERVISOR_PROVENANCE,
+    ops::SUPERVISOR_SPAWN_SNAPSHOT,
+    ops::SUPERVISOR_SPAWN_SUBSCRIBE,
 ];
 
 const MODULE_TO_SUBC_CONTROL_OPS: &[&str] = &[MODULE_TO_SUBC_OP_CATALOG_UPDATE];
@@ -1103,6 +1108,20 @@ impl ControlHandler {
                 self.handle_hello(ctx.connection_id, Some(ctx.egress.clone()), frame)
             }
             FrameType::Goodbye => self.handle_goodbye(ctx.connection_id),
+            FrameType::Cancel => {
+                if self
+                    .supervisor
+                    .cancel_spawn_subscription(ctx.connection_id, frame.header.corr)
+                {
+                    Ok(Vec::new())
+                } else {
+                    Ok(vec![control_error_frame(
+                        &frame,
+                        "unknown_subscription",
+                        "no supervisor spawn subscription has this correlation id",
+                    )?])
+                }
+            }
             FrameType::Request => {
                 if self
                     .forwarding
@@ -1267,6 +1286,7 @@ impl ControlHandler {
             self.capability_evaluator.wake_deadline_loop();
             self.refresh_capability_requirements();
         }
+        self.supervisor.remove_spawn_subscribers(connection_id);
         registrations
     }
 
@@ -1717,6 +1737,12 @@ impl ControlHandler {
                 kind,
             } => self.handle_route_poll(ctx, frame, route_channel, route_epoch, kind),
             ClientControlRequest::SupervisorList {} => self.handle_supervisor_list(frame),
+            ClientControlRequest::SupervisorSpawnSnapshot {} => {
+                self.handle_supervisor_spawn_snapshot(frame)
+            }
+            ClientControlRequest::SupervisorSpawnSubscribe { since } => {
+                self.handle_supervisor_spawn_subscribe(ctx, frame, since)
+            }
             ClientControlRequest::SupervisorRestart {
                 module_id,
                 drain_timeout_ms,
@@ -2717,6 +2743,62 @@ impl ControlHandler {
         }
     }
 
+    fn handle_supervisor_spawn_snapshot(&self, frame: Frame) -> Result<Vec<Frame>, RouterError> {
+        let response = ClientControlResponse::SupervisorSpawnSnapshot {
+            snapshot: self.supervisor.spawn_snapshot(),
+        };
+        Ok(vec![control_response_body_frame(
+            &frame,
+            &response,
+            "ClientControlResponse::SupervisorSpawnSnapshot",
+        )?])
+    }
+
+    fn handle_supervisor_spawn_subscribe(
+        &self,
+        ctx: &RouteCtx,
+        frame: Frame,
+        since: Option<SpawnCursor>,
+    ) -> Result<Vec<Frame>, RouterError> {
+        match self.supervisor.subscribe_spawns(
+            ctx.connection_id,
+            frame.header.corr,
+            response_version(&frame),
+            since,
+            ctx.egress.clone(),
+        ) {
+            Ok(()) => Ok(Vec::new()),
+            Err(SpawnSubscribeRefusal::ForeignIncarnation { current }) => {
+                Ok(vec![control_error_body_frame(
+                    &frame,
+                    ErrorBody {
+                        code: "spawn_cursor_incarnation_mismatch".to_string(),
+                        message: "spawn cursor belongs to a different daemon incarnation"
+                            .to_string(),
+                        detail: Some(serde_json::json!({
+                            "current_daemon_incarnation": current
+                        })),
+                    },
+                )?])
+            }
+            Err(SpawnSubscribeRefusal::TooOld { oldest }) => Ok(vec![control_error_body_frame(
+                &frame,
+                ErrorBody {
+                    code: "spawn_cursor_too_old".to_string(),
+                    message: "spawn cursor predates the retained event ring".to_string(),
+                    detail: Some(serde_json::json!({
+                        "oldest_retained_cursor": oldest
+                    })),
+                },
+            )?]),
+            Err(SpawnSubscribeRefusal::Frame(error)) => Err(RouterError::backend(
+                0,
+                frame.header.corr,
+                format!("failed to open supervisor spawn subscription: {error}"),
+            )),
+        }
+    }
+
     fn handle_supervisor_list(&self, frame: Frame) -> Result<Vec<Frame>, RouterError> {
         let generation = self
             .registry
@@ -2749,6 +2831,7 @@ impl ControlHandler {
                     restart_count: Some(status.restart_count),
                     max_restarts: Some(status.max_restarts),
                     lifetime_restarts: Some(status.lifetime_restarts),
+                    spawn_generation: Some(status.spawn_generation),
                     restart_window_secs: Some(status.restart_window.as_secs()),
                     drain_timeout_ms: Some(status.drain_timeout.as_millis() as u64),
                     restart_backoff_ms: Some(status.restart_backoff.as_millis() as u64),
@@ -4362,6 +4445,8 @@ fn client_control_request_op(request: &ClientControlRequest) -> &'static str {
         ClientControlRequest::RouteOpen { .. } => ops::ROUTE_OPEN,
         ClientControlRequest::RoutePoll { .. } => ops::ROUTE_POLL,
         ClientControlRequest::SupervisorList {} => ops::SUPERVISOR_LIST,
+        ClientControlRequest::SupervisorSpawnSnapshot {} => ops::SUPERVISOR_SPAWN_SNAPSHOT,
+        ClientControlRequest::SupervisorSpawnSubscribe { .. } => ops::SUPERVISOR_SPAWN_SUBSCRIBE,
         ClientControlRequest::SupervisorRestart { .. } => ops::SUPERVISOR_RESTART,
         ClientControlRequest::SupervisorReload { .. } => ops::SUPERVISOR_RELOAD,
         ClientControlRequest::SupervisorRescan { .. } => ops::SUPERVISOR_RESCAN,
