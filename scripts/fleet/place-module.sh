@@ -60,7 +60,8 @@
 #
 # Usage:
 #   place-module.sh --module <id> --staged <path> [--dest <path>] [--path-face <name>]
-#                   --marker <string> [--control <string>] [--no-restart]
+#                   --marker <string> [--control <string>] [--old-control <string>]
+#                   [--no-restart]
 #
 # Refuses (exit 2) before touching the destination if any pre-arm fails.
 #
@@ -72,7 +73,7 @@ set -euo pipefail
 
 STAGING="${CK_STAGING:-$HOME/.local/share/cortexkit/staging}"
 BIN_DIR="${CK_BIN_DIR:-$HOME/.local/share/cortexkit/bin}"
-MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; GONE=""; RESTART=1; PLACE=0; OLDER=0; MIGRATES=""
+MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; OLD_CONTROL=""; GONE=""; RESTART=1; PLACE=0; OLDER=0; MIGRATES=""
 
 while (($# > 0)); do
   case "$1" in
@@ -82,6 +83,7 @@ while (($# > 0)); do
     --path-face) PATH_FACE="$2"; shift 2 ;;
     --marker) MARKER="$2"; shift 2 ;;
     --control) CONTROL="$2"; shift 2 ;;
+    --old-control) OLD_CONTROL="$2"; shift 2 ;;
     --gone) GONE="$2"; shift 2 ;;
     --place) PLACE=1; shift ;;
     --older) OLDER=1; shift ;;
@@ -409,6 +411,35 @@ for t in strings nm; do
     say "  note: marker also reads on both images in the $t table; that table is not evidence either way"
   fi
 done
+# SECOND CONTROL, PRESENT ONLY ON THE LIVE IMAGE (CEREB's design, adopted 2026-09-20
+# from their cerebellum b68b31e0 card, which carried two where this gate asked for one).
+#
+# WHY ONE CONTROL IS NOT ENOUGH. The control above proves the counting tool can read
+# both files. It does NOT prove the two reads are aimed at DIFFERENT files. Aim both
+# at the staged artifact and a present-on-both control still passes -- every row then
+# reads "staged N / live N" and the gate refuses the MARKER, naming the build when the
+# fault is the reader. That refusal is indistinguishable from a genuinely stale stage.
+#
+# A needle present only on the live side cannot pass unless the live read genuinely
+# reached the OLD file, so marker (staged-only) plus this (live-only) is a two-way
+# proof through one instrument. The natural pick is the marker's own SUPERSEDED
+# predecessor -- v10 against v12 -- which settles supersession in a single row instead
+# of asserting arrival and departure separately.
+if [ -n "$OLD_CONTROL" ]; then
+  oc_seen=0
+  for t in strings nm; do
+    oc_staged=$(count_in "$t" "$STAGED" "$OLD_CONTROL")
+    oc_live=$(count_in "$t" "$DEST" "$OLD_CONTROL")
+    [ "$oc_live" -gt 0 ] || continue
+    say "old-control $t:\"$OLD_CONTROL\" staged $oc_staged / live $oc_live"
+    [ "$oc_staged" -eq 0 ] \
+      || refuse "--old-control \"$OLD_CONTROL\" still reads $oc_staged in the staged artifact ($t): it is not superseded, so it cannot prove the two reads are aimed at different files"
+    oc_seen=1
+  done
+  [ "$oc_seen" = "1" ] \
+    || refuse "--old-control \"$OLD_CONTROL\" is ABSENT from the running image in both tables; 0 there means the needle is wrong or the live read is not reaching the running file, and separating those is exactly what this arm is for"
+fi
+
 [ -n "$marker_tables" ] || refuse "marker discriminates in NEITHER table: either absent from the staged artifact (dead-code-eliminated, a phrase from a comment, a string from a different binary) or present on BOTH images everywhere (a control, not a marker)"
 marker_table=""
 if [ -n "$CONTROL" ]; then
