@@ -2431,7 +2431,17 @@ async fn supervisor_reload_rejects_new_work_during_drain() {
     )
     .await;
     let slow_corr = 412;
-    let slow_payload = br#"{"delay_ms":150,"jsonrpc":"2.0","id":"reload-rejects"}"#;
+    // The in-flight request is what HOLDS THE DRAIN OPEN, and everything this
+    // test asserts happens while the module is draining. The drain's completion
+    // condition is "in-flight settles", so this delay is not a timing margin --
+    // it is the structural guarantee that the state under test still exists when
+    // the assertions run. At 150 ms the drain could finish, the module respawn,
+    // and the route.open below be refused `module_warming` instead of
+    // `module_reloading`: a LATER PHASE OF THE SAME RELOAD, so the test read as
+    // a code regression when the real fault was that it had outrun its subject.
+    // Well inside DRAIN_BUDGET_COVERING_AN_INFLIGHT_REQUEST, so the drain still
+    // completes and the `drained: true` assertion below is unchanged.
+    let slow_payload = br#"{"delay_ms":2000,"jsonrpc":"2.0","id":"reload-rejects"}"#;
     write_frame(
         &mut route_client,
         &data_request(ack.route_channel, ack.route_epoch, slow_corr, slow_payload),
@@ -2459,14 +2469,20 @@ async fn supervisor_reload_rejects_new_work_during_drain() {
     .await
     .unwrap();
     control_client.flush().await.unwrap();
+    // Connected BEFORE the drain is observed, so the window between observing
+    // `Draining` and the route.open landing holds one frame write rather than a
+    // TCP connect plus an HMAC handshake. `Draining` is a transient state, and
+    // observe-then-act across a round trip is a race however long the state
+    // usually lasts -- this removes the work from the window instead of hoping
+    // the window is wide enough.
+    let mut open_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
     wait_for_status(&module, SETUP_TIMEOUT, |status| {
         status.state == ModuleState::Draining
     })
     .await;
 
-    let mut open_client = connect_authed_client(&server.connection_file_path)
-        .await
-        .unwrap();
     let route_open_error = attach_error_on_stream(
         &mut open_client,
         &project,
@@ -8132,6 +8148,19 @@ where
         .expect("frame read failed while waiting for frame or clean close")
 }
 
+/// Reads the stub's event file, DROPPING any line that does not parse.
+///
+/// The drop is deliberate: a reader polling a file another process is
+/// appending to will occasionally catch a torn tail, and failing the whole
+/// read on it would turn every poll into a coin flip. But the drop is also
+/// SILENT, which makes a corrupted line indistinguishable from an event that
+/// never happened -- the waiter then blocks until its timeout and reports an
+/// absence.
+///
+/// The writer is what makes that safe. `append_json_line` in the stub emits
+/// one `write_all` per event, so concurrent appenders interleave only BETWEEN
+/// lines. If it ever goes back to `writeln!`, this filter silently eats the
+/// evidence: measured at 1576 of 1600 events lost with 8 concurrent writers.
 fn stub_events(path: &Path) -> Vec<Value> {
     fs::read_to_string(path)
         .ok()

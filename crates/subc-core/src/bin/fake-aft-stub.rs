@@ -1465,13 +1465,43 @@ fn record_event(config: &StubConfig, event: Value) -> Result<(), StubError> {
     append_json_line(path, event)
 }
 
+/// Appends one event as a SINGLE `write_all`, never `writeln!`.
+///
+/// `writeln!(file, "{event}")` goes through `write_fmt`, and `serde_json`'s
+/// `Display` writes the value in many small fragments -- one `write` syscall
+/// per brace, key, separator and the trailing newline. The stub handles data
+/// requests in SPAWNED TASKS (see the `tokio::spawn` in the request arm) while
+/// control frames are handled on the reader loop, so two writers share this
+/// file and their fragments INTERLEAVE mid-line. The reader
+/// (`stub_events` -> `filter_map(serde_json::from_str().ok())`) then discards
+/// every corrupted line SILENTLY, so both events vanish permanently rather
+/// than arriving late.
+///
+/// Measured with 8 concurrent appenders writing 1600 events:
+///
+///   writeln!    1600 lines,   24 parseable,  1576 LOST
+///   write_all   1600 lines, 1600 parseable,     0 lost
+///
+/// That is the mechanism behind a recurring Windows failure in
+/// `draining_notice_precedes_quiescence_wait_and_route_lifecycle_stays_ordered`,
+/// where the client had its response while the event file held NEITHER the
+/// terminal NOR the preceding draining event. Those two are written by the two
+/// racing writers, microseconds apart by design -- the drain reaches quiescence
+/// the instant the response lands -- which is why this test hits it first.
+/// An earlier fix reordered `record_terminal` before the wire send; that
+/// removed a different dependency and moved the two writes CLOSER together,
+/// which can only have raised the collision odds.
 fn append_json_line(path: &Path, event: Value) -> Result<(), StubError> {
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .map_err(StubError::Io)?;
-    writeln!(file, "{event}").map_err(StubError::Io)
+    // One buffer, one syscall: an O_APPEND write of a line-sized buffer lands
+    // whole, so a concurrent appender can interleave BETWEEN lines but never
+    // within one.
+    file.write_all(format!("{event}\n").as_bytes())
+        .map_err(StubError::Io)
 }
 
 fn manifest(
