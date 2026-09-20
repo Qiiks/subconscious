@@ -622,4 +622,14 @@ if [ "$RESTART" -eq 1 ]; then
     # like findings about the module.
     say "  ck --json provenance $MODULE | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"modules\"][0][\"daemon_observed\"][\"pid\"])'"
     say "  then inode proc-vs-disk on that pid, which is the only proof it runs these bytes"
+    # LOGS: TWO FILES, TWO QUESTIONS. The module's own r2 sink is where a
+    # current line lands; the daemon's stderr capture is a frozen archive
+    # once a module adopts fleet logging, and it can only hold or grow --
+    # nothing removes lines from it. A grep there returns a true count of
+    # HISTORICAL lines that reads exactly like a fresh one (broca's five
+    # un-timestamped seal lines, all pre-adoption, read as "newest" on the
+    # 0.3.106 card). So: read the event from the r2 sink, and read only the
+    # SIZE of the archive, which must not move.
+    say "  logs: event in the module's r2 sink ~/.local/share/cortexkit/$MODULE/logs/$MODULE.<YYYY-MM-DD>.log (timestamped)"
+    say "        archive ~/.local/share/cortexkit/run/logs/$MODULE.stderr.log must not GROW ($(wc -c < ~/.local/share/cortexkit/run/logs/$MODULE.stderr.log 2>/dev/null || echo 0) bytes now); a line found there is historical"
 fi
