@@ -1,0 +1,5 @@
+source_repository: cortexkit/prefrontal
+source_commit: 76a910737c646b72c5c2cc931113ab72a071b38d
+source_path: docs/specs/nats-message-plane-foundation.md
+source_sha256: 27bdfeac9393ec41d02aebafc01f4cc0c3d32fef7ba2dbf4d80176b6291c5901
+recorded_at: 2026-09-20

@@ -1,0 +1,160 @@
+use std::{collections::BTreeSet, error::Error, fmt, sync::Arc};
+
+use async_trait::async_trait;
+use subc_protocol::session::HealthReport;
+
+/// A typed error returned when a runtime capability has not yet been implemented.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AreaNotLanded {
+    area: &'static str,
+}
+
+impl AreaNotLanded {
+    pub const fn new(area: &'static str) -> Self {
+        Self { area }
+    }
+
+    pub const fn area(&self) -> &'static str {
+        self.area
+    }
+}
+
+impl fmt::Display for AreaNotLanded {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ck-bus runtime area '{}' not yet landed", self.area)
+    }
+}
+
+impl Error for AreaNotLanded {}
+
+pub type SeamResult<T> = Result<T, AreaNotLanded>;
+
+#[async_trait]
+pub trait CredentialMinting: Send + Sync {
+    async fn reconcile_credentials(&self) -> SeamResult<()>;
+}
+
+#[async_trait]
+pub trait Census: Send + Sync {
+    async fn read_census(&self) -> SeamResult<()>;
+    async fn write_census(&self) -> SeamResult<()>;
+}
+
+#[async_trait]
+pub trait Revocation: Send + Sync {
+    async fn resume_revocations(&self) -> SeamResult<()>;
+}
+
+pub trait GrantGeneration: Send + Sync {
+    fn generated_subjects(&self) -> SeamResult<BTreeSet<String>>;
+}
+
+#[async_trait]
+pub trait SpawnStream: Send + Sync {
+    async fn consume_spawn_stream(&self) -> SeamResult<()>;
+}
+
+#[async_trait]
+pub trait LeafConfiguration: Send + Sync {
+    async fn refresh_leaf_configuration(&self) -> SeamResult<()>;
+}
+
+#[async_trait]
+pub trait SentinelHealth: Send + Sync {
+    async fn report_health(&self) -> SeamResult<HealthReport>;
+}
+
+#[derive(Debug)]
+struct RefusingArea {
+    area: &'static str,
+}
+
+impl RefusingArea {
+    const fn new(area: &'static str) -> Self {
+        Self { area }
+    }
+
+    const fn refusal(&self) -> AreaNotLanded {
+        AreaNotLanded::new(self.area)
+    }
+}
+
+#[async_trait]
+impl CredentialMinting for RefusingArea {
+    async fn reconcile_credentials(&self) -> SeamResult<()> {
+        Err(self.refusal())
+    }
+}
+
+#[async_trait]
+impl Census for RefusingArea {
+    async fn read_census(&self) -> SeamResult<()> {
+        Err(self.refusal())
+    }
+
+    async fn write_census(&self) -> SeamResult<()> {
+        Err(self.refusal())
+    }
+}
+
+#[async_trait]
+impl Revocation for RefusingArea {
+    async fn resume_revocations(&self) -> SeamResult<()> {
+        Err(self.refusal())
+    }
+}
+
+impl GrantGeneration for RefusingArea {
+    fn generated_subjects(&self) -> SeamResult<BTreeSet<String>> {
+        Err(self.refusal())
+    }
+}
+
+#[async_trait]
+impl SpawnStream for RefusingArea {
+    async fn consume_spawn_stream(&self) -> SeamResult<()> {
+        Err(self.refusal())
+    }
+}
+
+#[async_trait]
+impl LeafConfiguration for RefusingArea {
+    async fn refresh_leaf_configuration(&self) -> SeamResult<()> {
+        Err(self.refusal())
+    }
+}
+
+#[async_trait]
+impl SentinelHealth for RefusingArea {
+    async fn report_health(&self) -> SeamResult<HealthReport> {
+        Err(self.refusal())
+    }
+}
+
+pub fn refusing_credential_minting() -> Arc<dyn CredentialMinting> {
+    Arc::new(RefusingArea::new("credential-minting"))
+}
+
+pub fn refusing_census() -> Arc<dyn Census> {
+    Arc::new(RefusingArea::new("census"))
+}
+
+pub fn refusing_revocation() -> Arc<dyn Revocation> {
+    Arc::new(RefusingArea::new("revocation"))
+}
+
+pub fn refusing_grant_generation() -> Arc<dyn GrantGeneration> {
+    Arc::new(RefusingArea::new("grant-generation"))
+}
+
+pub fn refusing_spawn_stream() -> Arc<dyn SpawnStream> {
+    Arc::new(RefusingArea::new("spawn-stream"))
+}
+
+pub fn refusing_leaf_configuration() -> Arc<dyn LeafConfiguration> {
+    Arc::new(RefusingArea::new("leaf-configuration"))
+}
+
+pub fn refusing_sentinel_health() -> Arc<dyn SentinelHealth> {
+    Arc::new(RefusingArea::new("sentinel-health"))
+}

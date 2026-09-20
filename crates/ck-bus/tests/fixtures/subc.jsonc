@@ -1,0 +1,53 @@
+{
+  // This single template declares every module used by the acceptance rows, preventing per-test configuration drift.
+  "version": 1,
+  "modules": {
+    "ckbus": {
+      "program": "__CK_BUS_BIN__",
+      "args": [],
+      "env": {
+        "XDG_DATA_HOME": "__XDG_DATA_HOME__"
+      },
+      "enabled": true,
+      "reserved": true,
+      "protocol": "subc",
+      "drain_timeout_ms": 2000,
+      "health": {
+        "on_degraded": "report",
+        "on_failing": "report"
+      }
+    },
+    "nats-server": {
+      "program": "nats-server",
+      "args": ["--port", "0", "--name", "ckbus-acceptance-final-argument"],
+      "enabled": false,
+      "protocol": "none",
+      "drain_timeout_ms": 2000
+    },
+    "standin-none": {
+      "program": "crates/ck-bus/tests/support/standin_child.sh",
+      "args": ["standin-none-final-argument"],
+      "enabled": false,
+      "protocol": "none",
+      "drain_timeout_ms": 2000
+    },
+    "standin-default-protocol": {
+      "program": "crates/ck-bus/tests/support/standin_child.sh",
+      "args": ["standin-default-final-argument"],
+      "enabled": false,
+      "drain_timeout_ms": 2000
+    },
+    "claustrum": {
+      "program": "__CK_BUS_BIN__",
+      "args": [],
+      "enabled": false,
+      "protocol": "subc"
+    },
+    "callosum": {
+      "program": "__CK_BUS_BIN__",
+      "args": [],
+      "enabled": false,
+      "protocol": "subc"
+    }
+  }
+}
