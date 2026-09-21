@@ -74,6 +74,10 @@ const DEFAULT_RESTART_WINDOW: Duration = Duration::from_secs(600);
 /// where a stuck request will never settle).
 pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const REGISTRY_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
+/// Bound on the last-exit tree kill, so a process that will not die cannot hold
+/// the daemon open behind it.
+#[cfg(windows)]
+const TREE_KILL_TIMEOUT: Duration = Duration::from_secs(10);
 const REGISTRY_RELEASE_POLL: Duration = Duration::from_millis(10);
 const STDERR_PUMP_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 /// Maximum number of supervised process spawn/exit facts retained per daemon incarnation.
@@ -2179,7 +2183,42 @@ impl SupervisedModule {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.inner
             .commands
-            .send(SupervisorCommand::Retire { reply: reply_tx })
+            .send(SupervisorCommand::Retire {
+                reply: reply_tx,
+                tree: false,
+            })
+            .await
+            .map_err(|_| SuperviseError::CommandClosed {
+                module_id: self.inner.module_id.clone(),
+            })?;
+        reply_rx.await.map_err(|_| SuperviseError::CommandClosed {
+            module_id: self.inner.module_id.clone(),
+        })?
+    }
+
+    /// Retire the module and its process tree, inside the supervisor loop.
+    ///
+    /// The tree kill has to happen in here rather than at the caller: the drain
+    /// takes the child, so by the time a caller could act the pid is gone, and
+    /// descendants are already detached. See the `Retire` arm for the ordering.
+    pub(crate) async fn retire_tree(&self) -> Result<(), SuperviseError> {
+        match self.state()? {
+            ModuleState::Stopped | ModuleState::Failed => return Ok(()),
+            ModuleState::Starting
+            | ModuleState::Running
+            | ModuleState::Unresponsive
+            | ModuleState::Restarting
+            | ModuleState::Draining
+            | ModuleState::Disabled => {}
+        }
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.inner
+            .commands
+            .send(SupervisorCommand::Retire {
+                reply: reply_tx,
+                tree: true,
+            })
             .await
             .map_err(|_| SuperviseError::CommandClosed {
                 module_id: self.inner.module_id.clone(),
@@ -2352,6 +2391,13 @@ enum SupervisorCommand {
     },
     Retire {
         reply: oneshot::Sender<Result<(), SuperviseError>>,
+        /// Kill the module's process tree after the drain, not just the module.
+        ///
+        /// Set by [`SupervisedModule::retire_tree`] for last-exit retirement,
+        /// where nothing else will come along to reap a helper the module
+        /// spawned. Ordinary retires leave it false and keep their exact
+        /// previous behaviour.
+        tree: bool,
     },
     Restart {
         /// Operator override for this one restart's drain budget, in ms. `None`
@@ -3718,8 +3764,24 @@ async fn handle_supervisor_command(
             }
             false
         }
-        SupervisorCommand::Retire { reply } => {
+        SupervisorCommand::Retire { reply, tree } => {
             let result = async {
+                // Capture the pid BEFORE the drain. `drain_optional_child` takes
+                // the child, so reading it afterwards always yields `None` and
+                // the tree kill would silently never run -- which is what the
+                // first version of this did.
+                #[cfg(windows)]
+                let tree_pid = if tree {
+                    child.as_ref().and_then(SupervisedChild::id)
+                } else {
+                    None
+                };
+
+                // Drain BEFORE the tree kill: a module hangs graceful-stop work
+                // off the GOODBYE the drain delivers (broca seals its WAL,
+                // engram closes a capture). Killing first turns that delivery
+                // into a no-op against a dead process and can kill a module
+                // mid-write.
                 begin_forwarding_drain_if_configured(
                     spec,
                     runtime,
@@ -3729,7 +3791,7 @@ async fn handle_supervisor_command(
                     RouteCloseReason::Disable,
                 )
                 .await?;
-                drain_optional_child(
+                let drain_result = drain_optional_child(
                     &spec.module_id,
                     spec.protocol,
                     registry,
@@ -3741,7 +3803,26 @@ async fn handle_supervisor_command(
                     ModuleState::Stopped,
                     None,
                 )
-                .await
+                .await;
+
+                // `taskkill /T` reaches grandchildren the direct-child kill
+                // cannot, and it belongs HERE -- after the drain-and-wait, not
+                // ahead of it. Best-effort: a tree-kill failure must not turn a
+                // drained module into a failed one, so it is logged and the
+                // drain result still decides the outcome.
+                #[cfg(windows)]
+                if let Some(pid) = tree_pid {
+                    if let Err(error) = kill_process_tree(&spec.module_id, pid).await {
+                        warn!(
+                            module_id = %spec.module_id,
+                            pid,
+                            %error,
+                            "tree retirement failed; the module itself is already drained"
+                        );
+                    }
+                }
+
+                drain_result
             }
             .await;
             let registration_released = result.is_ok();
@@ -3749,7 +3830,12 @@ async fn handle_supervisor_command(
             if registration_released {
                 process_liveness.untrack_if_current(&spec.module_id, snapshot);
             }
-            false
+            // A TREE retirement ends this module's supervision loop; an ordinary
+            // one does not. Returning `false` unconditionally left the loop
+            // running with the restart policy still armed after a last-exit
+            // retirement, so the daemon could respawn a module the holder monitor
+            // had just retired -- the orphan leak this whole change closes.
+            tree && registration_released
         }
         SupervisorCommand::Restart {
             drain_timeout_ms,
@@ -4631,6 +4717,49 @@ fn spawn_child(
         process_identity,
         pid,
     })
+}
+
+/// Kill a process and its descendants, for last-exit retirement.
+///
+/// `taskkill /T` walks the current parent-child relationships, which is why it
+/// reaches a module's helper processes that `Child::kill` cannot. It is not
+/// complete on its own: a grandchild whose parent already exited has been
+/// reparented out of the tree and is invisible here, which is why the daemon's
+/// job-object containment (`subc-jobobject`) is the primary mechanism and this
+/// is the belt to its braces.
+///
+/// Bounded, because `taskkill` can block on a process that will not die and the
+/// daemon must not hang behind it during shutdown.
+#[cfg(windows)]
+async fn kill_process_tree(module_id: &str, pid: u32) -> Result<(), SuperviseError> {
+    let mut command = Command::new("taskkill.exe");
+    command
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        // A daemon runs detached from any console, so a child spawned without
+        // this allocates a fresh console window -- a visible flash on every
+        // retirement.
+        .creation_flags(0x0800_0000);
+    let status = timeout(TREE_KILL_TIMEOUT, command.status())
+        .await
+        .map_err(|_| SuperviseError::Kill {
+            module_id: module_id.to_string(),
+            source: io::Error::new(io::ErrorKind::TimedOut, "tree retirement timed out"),
+        })?
+        .map_err(|source| SuperviseError::Kill {
+            module_id: module_id.to_string(),
+            source,
+        })?;
+    if !status.success() {
+        return Err(SuperviseError::Kill {
+            module_id: module_id.to_string(),
+            source: io::Error::other(format!("tree retirement exited {status}")),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]

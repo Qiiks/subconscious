@@ -24,6 +24,9 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 
+#[cfg(windows)]
+use crate::holder_monitor::HolderMonitor;
+
 use crate::{
     daemon_config::{self, ConfiguredModule, DaemonConfigError},
     server::{serve_listeners, ServerAuth, ServerError},
@@ -665,7 +668,7 @@ async fn serve_bound_daemon(
         .unwrap_or(u64::MAX);
     let mut control = ControlHandler::with_forwarding(Arc::clone(&registry), forwarding)
         .with_process_liveness(process_liveness)
-        .with_supervisor(supervisor_handle)
+        .with_supervisor(supervisor_handle.clone())
         .with_connected_clients(connected_clients.clone())
         .with_storage_config(storage_config)
         .with_admission_facts_config(admission_facts.carrier_module_id, admission_facts.targets)
@@ -752,6 +755,42 @@ async fn serve_bound_daemon(
 
     control.refresh_capability_requirements();
     Arc::clone(&control).spawn_capability_deadline_loop();
+
+    // The daemon-side last-exit retirement (issue #103). When OMP started this
+    // daemon it set OMP_SUBC_OWNED=1, so this monitor is the ONLY thing that
+    // retires the tree: the extension deletes its own lease on shutdown and
+    // nothing else. A lease directory that loses its last live holder is the
+    // trigger, which covers a forced close where no `session_shutdown` runs.
+    //
+    // Windows-only by construction (`spawn_if_owned` returns `None` elsewhere),
+    // and it returns `None` unless this daemon was spawned as an owned one, so a
+    // service-mode daemon is untouched.
+    #[cfg(windows)]
+    let mut holder_task =
+        HolderMonitor::spawn_if_owned(bound.connection_file_path.clone(), supervisor_handle)
+            .map(AbortOnDrop::new);
+    #[cfg(not(windows))]
+    let mut holder_task: Option<AbortOnDrop<()>> = None;
+
+    // Retirement means the daemon has no reason to exist, so the select races it
+    // against normal serving. The two drops are deliberate and ordered: the
+    // listener first, so no new accept can start work while the tree is going
+    // down, then the watchdog, whose only job is to keep a live daemon
+    // advertised.
+    if let Some(task) = holder_task.as_mut() {
+        tokio::select! {
+            result = serve_task.join() => {
+                return result.map_err(BootstrapError::ServeJoin)?.map_err(BootstrapError::Serve);
+            }
+            result = task.join() => {
+                result.map_err(BootstrapError::ServeJoin)?;
+                info!("holder monitor retired the daemon; exiting");
+                drop(serve_task);
+                drop(_watchdog_task);
+                return Ok(());
+            }
+        }
+    }
 
     #[cfg(unix)]
     {
