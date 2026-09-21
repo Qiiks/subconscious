@@ -1872,6 +1872,7 @@ dependencies = [
  "sha2",
  "subc-cgroup",
  "subc-control",
+ "subc-jobobject",
  "subc-jsonc",
  "subc-protocol",
  "subc-transport",
@@ -1890,6 +1891,14 @@ dependencies = [
  "subc-protocol",
  "subc-transport",
  "tokio",
+]
+
+[[package]]
+name = "subc-jobobject"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
