@@ -371,7 +371,24 @@ retry deadline, 30 s by default. **So on a plain restart the budget must
 stay well under 30 s, or opens fail rather than wait.** The budget value
 itself is the module's, measured from per-root load times. It is a module
 constant, not daemon config, because only the module knows what one root
-costs.
+costs. AFT measured about 45 s to warm its live set after a restart, so it
+sets two budgets: 10 s on a plain restart (then flip, and the rest warm
+lazily) and a 90 s ceiling as a swap candidate, where nobody waits.
+
+**Telling a swap from a restart.** Two budgets only work if the module
+knows which case it is in, and it has to know before HELLO, since that is
+when it plans its warm-up. The supervisor decides this at spawn, so the
+signal is an environment variable set on the candidate's spawn:
+
+    SUBC_SPAWN_ROLE=swap_candidate
+
+It is absent on every other spawn, and **absence means plain restart**, the
+safe reading: a module that misses it uses the short budget and gives up
+some warmth, never correctness. Of the three possible carriers it is the
+only one available before HELLO, and it needs no wire change. It says only
+which budget applies. It is not an authority: the swap-token check at HELLO
+(slice C) stays the thing that proves a candidate is the one the supervisor
+minted, and nothing in the daemon trusts this variable.
 
 ### What rung 3 does not do
 
@@ -397,7 +414,8 @@ costs.
        under the write lock. One slice, daemon only, and it is the
        concurrency-critical one.
     C. rung 3 supervisor — candidate child slot with per-slot nonce,
-       cgroup suffix and capture file, mandatory swap-token HELLO check
+       cgroup suffix and capture file, `SUBC_SPAWN_ROLE=swap_candidate` on
+       the candidate's spawn only, mandatory swap-token HELLO check
        ordered before the reserved gate, swap state machine with the
        failure arms, `supervisor.swap` control op, `--swap` on the CLI,
        `overlap` in ModuleSpec + frozen on catalog.update + refusal.
