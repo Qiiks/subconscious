@@ -1475,7 +1475,7 @@ pub struct Supervisor {
     process_liveness: Arc<SupervisorProcessLiveness>,
     supervisor_handle: Option<SupervisorHandle>,
     health: HealthConfig,
-    daemon_started_at_ms: u64,
+    daemon_start_clock: crate::clock::StartClock,
     terminal_journal: Option<Arc<crate::terminal_journal::TerminalJournal>>,
     spawn_events: SpawnEventFeed,
     provenance_probe: ExecutableIdentityProbe,
@@ -1603,7 +1603,7 @@ impl Supervisor {
             process_liveness: Arc::new(SupervisorProcessLiveness::default()),
             supervisor_handle: None,
             health: HealthConfig::default(),
-            daemon_started_at_ms: unix_ms_now(),
+            daemon_start_clock: crate::clock::StartClock::capture(),
             terminal_journal: None,
             spawn_events: SpawnEventFeed::default(),
             provenance_probe: ExecutableIdentityProbe::default(),
@@ -1829,8 +1829,12 @@ impl Supervisor {
             supervisor_handle: self.supervisor_handle.clone(),
             stderr_ring: Arc::new(Mutex::new(StderrRing::new(StderrTailConfig::default()))),
             terminal_ring: Arc::new(Mutex::new(
-                TerminalRing::new(TerminalRingConfig::default(), self.daemon_started_at_ms)
-                    .with_journal(self.terminal_journal.clone()),
+                TerminalRing::new(
+                    TerminalRingConfig::default(),
+                    self.daemon_start_clock.started_at_ms(),
+                )
+                .with_start_clock(self.daemon_start_clock)
+                .with_journal(self.terminal_journal.clone()),
             )),
             spawn_events: self.spawn_events.clone(),
             #[cfg(target_os = "linux")]

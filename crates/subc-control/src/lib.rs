@@ -575,6 +575,10 @@ pub struct DaemonBuildProvenance {
 pub struct DaemonObservedProcess {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+    /// Wall time derived from suspend-inclusive elapsed time at each read. Clock
+    /// correction can move it by the size of a clock step, and even without a
+    /// step it may vary by about a second between reads. Do not equality-compare
+    /// it. Use raw process start ticks for stable identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at_ms: Option<u64>,
     pub running_image: RunningImageAgreement,

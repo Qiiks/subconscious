@@ -7,7 +7,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     process,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use fs4::{FileExt, TryLockError};
@@ -657,12 +657,7 @@ async fn serve_bound_daemon(
                 .map(|ms| (module.module_id.clone(), Duration::from_millis(ms)))
         })
         .collect::<std::collections::BTreeMap<_, _>>();
-    let control_started_at_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX);
+    let control_start_clock = crate::clock::StartClock::capture();
     let mut control = ControlHandler::with_forwarding(Arc::clone(&registry), forwarding)
         .with_process_liveness(process_liveness)
         .with_supervisor(supervisor_handle)
@@ -672,11 +667,12 @@ async fn serve_bound_daemon(
         .with_route_bind_relay_timeouts(route_bind_relay_timeouts)
         .with_daemon_provenance(
             bound.connection_info.pid,
-            control_started_at_ms,
+            control_start_clock.started_at_ms(),
             std::env::current_exe().ok(),
             normalized_build_provenance(env!("SUBC_BUILD_GIT_SHA")),
             normalized_build_provenance(env!("SUBC_BUILD_LOCK_DIGEST")),
         )
+        .with_daemon_start_clock(control_start_clock)
         .with_capability_config(
             configured_modules
                 .iter()
@@ -703,6 +699,7 @@ async fn serve_bound_daemon(
     let mut serve_task =
         AbortOnDrop::new(tokio::spawn(serve_listeners(bound.listeners, router, auth)));
     tokio::task::yield_now().await;
+    let _clock_step_task = AbortOnDrop::new(crate::watchdog::spawn_clock_step_monitor());
     let _watchdog_task = AbortOnDrop::new(
         DaemonSelfWatchdog::new(
             bound.connection_info.clone(),

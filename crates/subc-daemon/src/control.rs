@@ -150,6 +150,7 @@ struct DaemonProvenanceFacts {
     build: DaemonBuildProvenance,
     pid: Option<u32>,
     started_at_ms: Option<u64>,
+    start_clock: Option<crate::clock::StartClock>,
     executable_path: Option<PathBuf>,
     executable_identity: Option<SpawnedFileIdentity>,
     process_start_time: Option<u64>,
@@ -165,6 +166,7 @@ impl Default for DaemonProvenanceFacts {
             },
             pid: None,
             started_at_ms: None,
+            start_clock: None,
             executable_path: None,
             executable_identity: None,
             process_start_time: None,
@@ -781,11 +783,17 @@ impl ControlHandler {
             },
             pid: Some(pid),
             started_at_ms: Some(started_at_ms),
+            start_clock: None,
             executable_path,
             executable_identity,
             process_start_time,
             probe: ExecutableIdentityProbe::default(),
         };
+        self
+    }
+
+    pub(crate) fn with_daemon_start_clock(mut self, clock: crate::clock::StartClock) -> Self {
+        self.daemon_provenance.start_clock = Some(clock);
         self
     }
 
@@ -3026,7 +3034,11 @@ impl ControlHandler {
             daemon_build: self.daemon_provenance.build.clone(),
             daemon_observed: DaemonObservedProcess {
                 pid: self.daemon_provenance.pid,
-                started_at_ms: self.daemon_provenance.started_at_ms,
+                started_at_ms: self
+                    .daemon_provenance
+                    .start_clock
+                    .map(|clock| clock.started_at_ms())
+                    .or(self.daemon_provenance.started_at_ms),
                 running_image: self
                     .daemon_provenance
                     .probe

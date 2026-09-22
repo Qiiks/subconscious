@@ -18,11 +18,39 @@ use tokio::{
     task::JoinHandle,
     time::{self, Instant},
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{read_frame, write_frame, Frame};
 
 pub const DEFAULT_SELF_WATCHDOG_INTERVAL: Duration = Duration::from_secs(60);
+const CLOCK_STEP_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+pub(crate) fn spawn_clock_step_monitor() -> JoinHandle<()> {
+    tokio::spawn(async {
+        let mut detector = crate::clock::ClockStepDetector::new();
+        // Establish the first offset at startup, before the first periodic tick.
+        detector.check_now();
+        let mut interval = time::interval(CLOCK_STEP_CHECK_INTERVAL);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if let Some(step) = detector.check_now() {
+                let direction = if step.delta_ms > 0 {
+                    "forward"
+                } else {
+                    "backward"
+                };
+                warn!(
+                    step_ms = step.delta_ms.abs(),
+                    direction,
+                    old_offset_ms = step.old_offset_ms,
+                    new_offset_ms = step.new_offset_ms,
+                    "wall clock stepped; timestamps around this point in the log may not be monotonic"
+                );
+            }
+        }
+    })
+}
 pub const DEFAULT_SELF_WATCHDOG_DEADLINE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]

@@ -1,0 +1,16 @@
+[package]
+name = "subc-uptime"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "Suspend-inclusive monotonic clock for the subc daemon."
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", default-features = false, features = ["time"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_SystemInformation"] }
+
+[lints.rust]
+unsafe_code = "deny"

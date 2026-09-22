@@ -8,6 +8,7 @@
 
 pub mod bootstrap;
 pub(crate) mod capability_requirements;
+mod clock;
 pub mod control;
 pub mod daemon_config;
 #[cfg(test)]

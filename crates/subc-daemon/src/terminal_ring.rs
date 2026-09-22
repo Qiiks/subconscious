@@ -61,6 +61,7 @@ pub struct TerminalRing {
     journal: Option<Arc<TerminalJournal>>,
     config: TerminalRingConfig,
     daemon_started_at_ms: u64,
+    start_clock: Option<crate::clock::StartClock>,
     entries: VecDeque<TerminalRecord>,
     dropped: u64,
 }
@@ -71,9 +72,15 @@ impl TerminalRing {
             journal: None,
             config,
             daemon_started_at_ms,
+            start_clock: None,
             entries: VecDeque::new(),
             dropped: 0,
         }
+    }
+
+    pub(crate) fn with_start_clock(mut self, clock: crate::clock::StartClock) -> Self {
+        self.start_clock = Some(clock);
+        self
     }
 
     pub(crate) fn with_journal(mut self, journal: Option<Arc<TerminalJournal>>) -> Self {
@@ -104,7 +111,9 @@ impl TerminalRing {
 
     pub fn snapshot(&self) -> TerminalHistorySnapshot {
         TerminalHistorySnapshot {
-            daemon_started_at_ms: self.daemon_started_at_ms,
+            daemon_started_at_ms: self
+                .start_clock
+                .map_or(self.daemon_started_at_ms, |clock| clock.started_at_ms()),
             entries: self.entries.iter().cloned().collect(),
             dropped: self.dropped,
         }
