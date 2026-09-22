@@ -47,6 +47,7 @@ interface FakeStats {
   // Count of accepted TCP connections — a test asserts a healthy-socket deadline
   // does NOT trigger a reconnect (count stays 1).
   connections: number;
+  closedConnections: number;
 }
 
 interface FakeDaemonOptions {
@@ -96,6 +97,7 @@ interface FakeDaemonOptions {
   // unanswered is explained by OUR own in-flight control op.
   holdCatalogList?: boolean;
   catalogModules?: CatalogEntry[];
+  onHeldData?: (reply: () => Promise<void>) => void;
   reverseRequest?: { body: Uint8Array; corr: bigint };
 }
 
@@ -114,6 +116,7 @@ function newStats(): FakeStats {
     requestFrames: [],
     routeOpenConsumerIdentities: [],
     connections: 0,
+    closedConnections: 0,
   };
 }
 
@@ -1024,6 +1027,38 @@ describe("SubcClient managed call", () => {
     }
   });
 
+  test("a route GOODBYE preserves the shared socket and a sibling route's pending reply", async () => {
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    let signalHeld!: (reply: () => Promise<void>) => void;
+    const heldReady = new Promise<() => Promise<void>>((resolve) => { signalHeld = resolve; });
+    const daemon = await startFakeDaemon({ stats, onHeldData: signalHeld });
+    writeConnectionFile(connFile, daemon.port);
+    const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY, reconnectBackoff: BACKOFF });
+    try {
+      const sibling = client.call("sibling-provider", "hold", { n: 1 }, { timeoutMs: 2_000 });
+      const siblingOutcome = sibling.then(() => "reply", () => "rejected");
+      const replyHeld = await heldReady;
+      await expect(client.call("closing-provider", "close", {}, { timeoutMs: 2_000 })).rejects.toMatchObject({
+        kind: "outcome_unknown", code: "route_closed",
+      });
+      // Give the asynchronous reconnect a chance to replace the connection before
+      // the sibling response is released; the route closure must not cause one.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await replyHeld().catch(() => undefined);
+      const settled = await Promise.race([
+        siblingOutcome,
+        new Promise<string>((resolve) => setTimeout(() => resolve("still pending"), 200)),
+      ]);
+      expect(settled).toBe("reply");
+      await expect(sibling).resolves.toEqual({ method: "hold", params: { n: 1 } });
+      expect(stats.closedConnections).toBe(0);
+      expect(stats.connections).toBe(1);
+    } finally {
+      client.close();
+    }
+  });
+
   test("a genuine deadline on a healthy socket is outcome_unknown + deadline code and does NOT reconnect", async () => {
     // The target accepts the request and never replies while the socket stays
     // healthy. The call must settle as outcome_unknown with the deadline-not-drop
@@ -1154,7 +1189,10 @@ async function startFakeDaemon(options: FakeDaemonOptions): Promise<FakeDaemon> 
   const server = createServer((socket) => {
     options.stats.connections += 1;
     sockets.add(socket);
-    socket.once("close", () => sockets.delete(socket));
+    socket.once("close", () => {
+      sockets.delete(socket);
+      options.stats.closedConnections += 1;
+    });
     void handleFakeConnection(socket, options).catch(() => socket.destroy());
   });
   await new Promise<void>((resolve, reject) => {
@@ -1302,6 +1340,15 @@ async function handleFakeConnection(socket: Socket, options: FakeDaemonOptions):
         ),
         deadline,
       );
+    }
+
+    if (options.onHeldData && (body as { method?: string }).method === "hold") {
+      options.onHeldData(() => writeFrame(socket, responseFrame(frame, body), Date.now() + 5_000));
+      continue;
+    }
+    if (options.onHeldData && (body as { method?: string }).method === "close") {
+      await writeFrame(socket, buildFrame(FrameType.Goodbye, buildFlags(false, Priority.Interactive, false), frame.header.channel, frame.header.epoch, 0n, new Uint8Array()), deadline);
+      continue;
     }
 
     if (options.dataMode === "drop") {

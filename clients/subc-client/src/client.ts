@@ -701,7 +701,12 @@ export class SubcClient {
         if (deadBindCode && retriedUnknownChannel) {
           this.evictRouteHandle(routeHandle);
         }
+        if (err.code === "route_closed") {
+          this.evictRouteHandle(routeHandle);
+          throw err;
+        }
         if (err.kind === "not_sent") {
+          if (!this.closedErr) throw err;
           try {
             await this.reconnectAfterDrop(err);
           } catch (reconnectErr) {
@@ -710,11 +715,9 @@ export class SubcClient {
           continue;
         }
         if (err.kind === "outcome_unknown" && err.code !== DEADLINE_NO_DROP_CODE) {
-          // A real drop schedules a reconnect. A deadline-with-no-drop does NOT:
-          // the socket was never observed to fail (the reply was likely just read
-          // late under load), so tearing it down would abandon a healthy connection
-          // and its other in-flight routes for nothing.
-          this.scheduleReconnectAfterDrop(err);
+          // A route failure can have an unknown outcome without the shared socket
+          // failing. Only a diagnosed transport drop warrants replacing it.
+          if (this.closedErr) this.scheduleReconnectAfterDrop(err);
         } else if (err.kind === "outcome_unknown" && err.code === DEADLINE_NO_DROP_CODE) {
           // Keeping the socket is only correct when the socket is actually
           // alive. A HALF-OPEN socket (peer gone with no FIN/RST — the
@@ -1413,6 +1416,9 @@ export class SubcClient {
   }
 
   private replaceConnection(opened: OpenedConnection): void {
+    // The old reader is generation-gated and cannot fail its waiters after the
+    // swap. Settle them now, before correlation numbers can be reused.
+    this.fail(new SubcError("subc connection replaced"));
     this.sock.close();
     this.sock = opened.sock;
     this.currentConn = opened.conn;
