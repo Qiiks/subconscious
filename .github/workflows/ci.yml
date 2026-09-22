@@ -168,6 +168,26 @@ jobs:
         run: git status --porcelain | sort > "$RUNNER_TEMP/tree-before.txt"
         shell: bash
 
+      # ck-bus's A1 acceptance rows supervise the REAL nats-server binary under
+      # protocol:none; the spec forbids a stand-in for that arm, so the binary
+      # must exist on every unix leg or the rows fail at their precondition.
+      # Pinned by version and by the sha256 of the release tarball, checked
+      # before extraction, so a replaced upstream asset fails here loudly
+      # instead of changing what the test measures. Windows skips A1 by design
+      # (the row records a1-signal-unix-only), so it needs no install.
+      - name: Install nats-server (ck-bus A1 rows)
+        if: ${{ matrix.os == 'ubuntu' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          v=v2.15.0
+          sum=5d2c51caca950333aba84911df7d377f826f3a59ec36061c6539105084f65c92
+          tgz="$RUNNER_TEMP/nats-server.tar.gz"
+          curl -fsSL -o "$tgz" "https://github.com/nats-io/nats-server/releases/download/$v/nats-server-$v-linux-amd64.tar.gz"
+          echo "$sum  $tgz" | sha256sum -c -
+          tar -xzf "$tgz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/nats-server-$v-linux-amd64" >> "$GITHUB_PATH"
+
       - name: Format check
         run: cargo fmt --all -- --check
 

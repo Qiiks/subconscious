@@ -51,14 +51,20 @@ async fn a1_argv_non_injection() {
     eprintln!("A1 ps -ww -o args= -p {pid}: {raw:?}");
     assert!(!raw.trim().is_empty(), "ps -ww argv must not be empty");
     let tokens: Vec<&str> = raw.split_whitespace().collect();
+    // The injection check runs before the final-argument self-check. A daemon
+    // that injects appends `--subc <path>` after the declared args, which also
+    // breaks the final-argument check. Checked in the other order, a real
+    // injection was reported as "ps line truncated" and pointed at the wrong
+    // defect. Truncation can't make this check pass wrongly: a truncated line
+    // still fails the final-argument check below.
+    assert!(
+        !tokens.iter().any(|token| token.starts_with("--subc")),
+        "protocol none must suppress --subc: {raw:?}"
+    );
     assert_eq!(
         tokens.last().copied(),
         args.last().map(String::as_str),
         "ps -ww must include final declared argument"
-    );
-    assert!(
-        !tokens.iter().any(|token| token.starts_with("--subc")),
-        "protocol none must suppress --subc: {raw:?}"
     );
     assert_eq!(
         tokens.len(),
