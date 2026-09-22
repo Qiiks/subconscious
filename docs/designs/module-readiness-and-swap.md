@@ -349,9 +349,23 @@ nothing, flip ready immediately, and look exactly like a successful warm
 swap: a cold cutover that reports itself as fine. `total_bindings` exists so
 the third row is a positive statement, not an inference from two zeros.
 
-Authority: the same as `supervisor.routes`, which already exposes the live
-route census per module. A second trust edge is not introduced for a subset
-of what that one already serves.
+Authority (corrected by the r3 review; the first version of this paragraph
+was wrong). The caller is the module itself, on its own module connection,
+and `supervisor.routes` cannot serve it: module-originated frames go through
+`is_known_module_request_op` and a dispatcher that accepts only
+`CatalogUpdate`, and `supervisor.routes` is documented as control-plane only,
+not addressable by agent-facing modules. So the query is a new
+module-originated op, `ModuleControlRequestFromModule::LiveRoots {}`, with
+no module id in the request: the daemon answers for the caller's own
+registration, so a module can see only its own routes. That scoping is the
+authority rule. It is a new, narrow trust edge, and it is a subc-protocol
+wire addition, so slice E is not daemon-only.
+
+Snapshot contract: resolve the routable endpoint and count bound and pending
+bindings under one forwarding read lock, the same linearization point
+cutover's write lock uses, so a reply describes either the incumbent before
+cutover or the candidate after it, never a mix. The reply must satisfy
+`total_bindings == sum(bound + pending) + unknown_root_bindings`.
 
 **Swap semantics.** Incumbent and candidate share a module id, so the query
 needs a rule for which one it describes. It reports the bindings of the
@@ -390,6 +404,50 @@ which budget applies. It is not an authority: the swap-token check at HELLO
 (slice C) stays the thing that proves a candidate is the one the supervisor
 minted, and nothing in the daemon trusts this variable.
 
+### r3 review corrections to B and C (binding on the slice briefs)
+
+An independent panel read r2 against the shipped code (three seats, two
+quota-exhausted). It confirmed findings 1 to 4 closed by the r2 design, and
+that an incumbent ack arriving after cutover cannot commit to the wrong
+endpoint: `commit_route_locked` requires the reservation's endpoint to equal
+the active one. It found these, all fixable inside their slice:
+
+1. **The superseded-endpoint arm is in the wrong place (blocks B as r2
+   specified it).** r2 put it in `refuse_to_end_module_connection_for_a_client`'s
+   caller in control.rs. By then `complete_pending_relay` has removed the
+   pending entry and `commit_route_locked` has consumed it. The reservation
+   indexes are removed before the endpoint check fails, and the pending
+   sender is dropped unanswered. The caller holds only a connection id and a
+   corr, so it can keep the connection alive but cannot answer the waiting
+   client or send the channel-scoped GOODBYE. The arm moves into
+   `complete_pending_relay` / `commit_route_locked`, which must detect a
+   superseded endpoint BEFORE stripping state, answer the client
+   `module_reloading` through `pending.sender`, release the reservation pair,
+   and return the abandoned target in the completion so the caller emits one
+   GOODBYE on that channel. The control.rs caller keeps only the "do not end
+   the connection" half. Test: force an incumbent ack between promotion and
+   drain; the incumbent's other routes survive, the client gets a retryable
+   refusal, the reservation is released, and the pending-to-bound transition
+   is counted once.
+2. **Registry candidate slot must cover connection-keyed lookups (B).**
+   `replace_catalog_for_connection` and `deregister_connection` search
+   registrations by connection id. With a candidate slot they must search it
+   too, or the candidate's `catalog.update(ready: true)` returns `Ok(None)`
+   silently and it never becomes ready.
+3. **Consumer attestation during overlap (C).** `spawned_consumer_authorized`
+   must accept both slots' nonces while the swap is open. Otherwise a
+   consumer identity presented by the incumbent, or a process it spawned,
+   fails `route.open` the moment the candidate is spawned.
+4. **Candidate exits need their own reap path (C).** The existing reap
+   (`classify_reaped_child_exit` into the module's snapshot, then
+   `next_crash_restart`) would both spend a restart unit and flip the
+   incumbent's state. The candidate slot gets a separate classification that
+   kills and reaps only the candidate and releases only its slot and nonce.
+5. **`SUBC_SPAWN_ROLE` must be actively absent on other spawns (C).** Spawn
+   applies arbitrary `env` entries from the module spec, so "set it only on
+   candidates" does not make it absent elsewhere. Plain spawns remove it
+   explicitly, and the variable is refused as a configured `env` key.
+
 ### What rung 3 does not do
 
 - No transparent route migration. Routes close and reopen.
@@ -420,9 +478,10 @@ minted, and nothing in the daemon trusts this variable.
        failure arms, `supervisor.swap` control op, `--swap` on the CLI,
        `overlap` in ModuleSpec + frozen on catalog.update + refusal.
     E. warm set — `Option<ProjectRootId>` on RouteBinding and the pending
-       reservation, `supervisor.live_roots` with the three-way reply, both
-       SDK surfaces. Daemon only, independent of B/C, can ship before them
-       (useful on a plain restart too).
+       reservation, module-originated `LiveRoots {}` scoped to the caller's
+       own registration, the three-way reply, the Rust module-handle call.
+       A subc-protocol minor bump (new module op). Independent of B/C, can
+       ship before them (useful on a plain restart too).
     D. aft adopts: warm the `supervisor.live_roots` set under a module-side
        budget, ready:false/true, overlap declaration. AFT's slice, in
        their repo, after A and E land.
