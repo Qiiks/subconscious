@@ -302,6 +302,77 @@ separate writer lease until cutover. That is aft's design, not this one's;
 this design only guarantees the daemon never overlaps a module that has not
 said it can be.
 
+### The warm set: which roots a candidate should load (r3, with AFT)
+
+A candidate that flips ready before loading anything has made the swap
+useless: the first route to each root lands cold. The module cannot
+answer "which roots" itself, because its persisted state lists every root it
+has ever seen, not the ones live now (AFT's side of this is
+`docs/design/subc-readiness-warmup.md` in the aft repository). The daemon
+routes every bind, so it is the only party that knows the live set exactly.
+
+**What exists, read from source.** It does not keep that set today.
+`route.open` canonicalizes the project root (`control.rs`, the
+`ProjectRootId::from_path_allowing_missing` call in `handle_route_open`),
+relays it to the module in the bind, and then drops it: `RouteBinding`
+(`forwarding.rs`) holds channels, epochs, the principal and `bound_at`, and
+no root.
+
+**Daemon obligation 1: keep the root.** Store the canonical root on
+`RouteBinding` and on the pending reservation, as the `ProjectRootId` the
+open already computed. The type is `Option` on purpose. A binding created
+before the daemon carrying this change has no root, and it must stay
+*unknown*, never become *absent* (see below).
+
+**Daemon obligation 2: the query.** A new channel-0 op:
+
+    request   supervisor.live_roots { module_id }
+    reply     LiveRoots {
+                module_id,
+                roots: [ { project_root, bound, pending } ],   // counts per root
+                unknown_root_bindings,                          // bound + pending with no stored root
+                total_bindings,
+              }
+
+The reply has to distinguish three answers, and it does so by construction.
+The shape is AFT's requirement, and it is the right one:
+
+| roots | unknown_root_bindings | meaning | candidate does |
+| --- | --- | --- | --- |
+| non-empty | any | these roots are live | warm them under the budget |
+| empty | > 0 | routes exist, roots unrecorded | warm lazily; this is NOT "nothing to warm" |
+| empty | 0, with `total_bindings == 0` | no routes at all | flip ready at once |
+
+If pre-change bindings were simply left out, "unknown" and "none" would be
+the same empty list. The first swap after the daemon cut would then warm
+nothing, flip ready immediately, and look exactly like a successful warm
+swap: a cold cutover that reports itself as fine. `total_bindings` exists so
+the third row is a positive statement, not an inference from two zeros.
+
+Authority: the same as `supervisor.routes`, which already exposes the live
+route census per module. A second trust edge is not introduced for a subset
+of what that one already serves.
+
+**Swap semantics.** Incumbent and candidate share a module id, so the query
+needs a rule for which one it describes. It reports the bindings of the
+endpoint that is routable when the query is answered. Before cutover that is
+the incumbent, which is the set that is about to move and so the one worth
+warming. The reply is a snapshot. Routes the incumbent takes after the query
+are not in it, and they warm lazily after cutover, as every root does today.
+A candidate may re-query before flipping. It has no reason to poll.
+
+**Where `module_warming` is visible.** During a swap, the candidate's
+not-ready state is invisible to callers: the incumbent stays routable until
+cutover, so nobody's `route.open` is refused while the candidate warms. The
+warm-up budget costs callers nothing in the swap case. It costs them only on
+a plain restart (no incumbent), where route.open answers `module_warming`
+for the whole budget. The SDKs retry that code only until their route-open
+retry deadline, 30 s by default. **So on a plain restart the budget must
+stay well under 30 s, or opens fail rather than wait.** The budget value
+itself is the module's, measured from per-root load times. It is a module
+constant, not daemon config, because only the module knows what one root
+costs.
+
 ### What rung 3 does not do
 
 - No transparent route migration. Routes close and reopen.
@@ -330,8 +401,13 @@ said it can be.
        ordered before the reserved gate, swap state machine with the
        failure arms, `supervisor.swap` control op, `--swap` on the CLI,
        `overlap` in ModuleSpec + frozen on catalog.update + refusal.
-    D. aft adopts: persisted-root pre-warm, ready:false/true, overlap
-       declaration. AFT's slice, in their repo, after A lands.
+    E. warm set — `Option<ProjectRootId>` on RouteBinding and the pending
+       reservation, `supervisor.live_roots` with the three-way reply, both
+       SDK surfaces. Daemon only, independent of B/C, can ship before them
+       (useful on a plain restart too).
+    D. aft adopts: warm the `supervisor.live_roots` set under a module-side
+       budget, ready:false/true, overlap declaration. AFT's slice, in
+       their repo, after A and E land.
 
 A ships alone. B and C do not ship without each other and B goes first
 because C's failure arms are tested against B's slots.
@@ -351,6 +427,12 @@ because C's failure arms are tested against B's slots.
   (iii) With `begin_module_drain` used instead of the endpoint-keyed one,
   step 5 marks the candidate draining — must red on a post-cutover
   route.open refusing `module_reloading`.
+- E: (i) with the root dropped when the binding is created, a module with
+  live routes answers `roots: []` and `unknown_root_bindings: 0`. This
+  must red on the root-known arm. (ii) With `unknown_root_bindings` folded
+  into "no bindings", a binding with no stored root makes the reply read as
+  row 3. This must red by name on the unknown-root arm, which is the
+  silent-cold-swap arm.
 - C: (i) with the failure arm removed, a candidate that never becomes
   ready leaves the incumbent drained — must red on the incumbent's
   route.closing having been sent. (ii) An unsolicited second HELLO with a
