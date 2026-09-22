@@ -8,7 +8,7 @@ use std::{
 };
 
 use serde_json::{json, Value};
-use tracing::info;
+use tracing::debug;
 
 use crate::registry::ConnectionId;
 
@@ -77,7 +77,14 @@ impl ConnectedClients {
     pub(crate) fn open(&self, connection_id: ConnectionId) -> ConnectedClientGuard {
         let previous = self.count.fetch_add(1, Ordering::SeqCst);
         let current = previous + 1;
-        info!(
+        // DEBUG, not INFO: this pair fired on every connect and disconnect and was
+        // measured at 43-74% of the daemon's own log (issue #114), burying the
+        // lines an operator opens the file for. The count itself is not lost: it
+        // is served live as `connected_clients` on server.describe (`ck daemon`),
+        // and a connection that opens a route still names its connection_id on the
+        // `route.open accepted` line, so per-connection forensics survive where
+        // they matter. Raise the filter (`CK_LOG=subc=debug`) to see every churn.
+        debug!(
             connection_id = connection_id.get(),
             connected_clients = current,
             previous_connected_clients = previous,
@@ -99,7 +106,8 @@ impl Drop for ConnectedClientGuard {
     fn drop(&mut self) {
         let previous = self.clients.count.fetch_sub(1, Ordering::SeqCst);
         let current = previous.saturating_sub(1);
-        info!(
+        // DEBUG for the same reason as the open side above.
+        debug!(
             connection_id = self.connection_id.get(),
             connected_clients = current,
             previous_connected_clients = previous,
