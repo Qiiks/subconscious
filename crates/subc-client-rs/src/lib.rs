@@ -181,8 +181,18 @@ impl fmt::Debug for RouteHandle {
             .finish_non_exhaustive()
     }
 }
-type CatalogUpdateReply = oneshot::Sender<Result<(), CatalogUpdateError>>;
-type CatalogUpdateWaiter = oneshot::Receiver<Result<(), CatalogUpdateError>>;
+/// A single read-lock snapshot of bound and pending project routes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveRootsSnapshot {
+    pub roots: Vec<subc_protocol::session::LiveRoot>,
+    pub unknown_root_bindings: u64,
+    pub total_bindings: u64,
+}
+
+type CatalogUpdateReply =
+    oneshot::Sender<Result<ModuleControlResponseToModule, CatalogUpdateError>>;
+type CatalogUpdateWaiter =
+    oneshot::Receiver<Result<ModuleControlResponseToModule, CatalogUpdateError>>;
 type CatalogUpdateRequest = (u64, mpsc::Sender<Frame>, CatalogUpdateWaiter);
 
 /// Future returned by [`serve_with_handle`] that runs the module until GOODBYE or EOF.
@@ -212,6 +222,7 @@ pub struct ModuleHandle {
 struct ModuleHandleShared {
     negotiated_ver: u8,
     supports_catalog_update: bool,
+    supports_live_roots: bool,
     connection_token: u64,
     live_routes: Mutex<HashMap<u16, RouteHandle>>,
     dropped_route_frames: AtomicU64,
@@ -240,6 +251,7 @@ impl ModuleHandle {
                     .subc_ops
                     .iter()
                     .any(|op| op == MODULE_TO_SUBC_OP_CATALOG_UPDATE),
+                supports_live_roots: ack.subc_ops.iter().any(|op| op == "supervisor.live_roots"),
                 connection_token,
                 live_routes: Mutex::new(HashMap::new()),
                 dropped_route_frames: AtomicU64::new(0),
@@ -321,7 +333,58 @@ impl ModuleHandle {
         }
 
         match timeout(CATALOG_UPDATE_TIMEOUT, rx).await {
-            Ok(Ok(result)) => result,
+            Ok(Ok(Ok(ModuleControlResponseToModule::CatalogUpdate {}))) => Ok(()),
+            Ok(Ok(Ok(_))) => Err(CatalogUpdateError::Protocol(
+                "unexpected catalog.update response".into(),
+            )),
+            Ok(Ok(Err(err))) => Err(err),
+            Ok(Err(_)) => Err(CatalogUpdateError::ConnectionClosed),
+            Err(_) => {
+                self.shared.remove_pending_catalog_update(corr);
+                Err(CatalogUpdateError::Timeout)
+            }
+        }
+    }
+
+    /// Snapshot the roots served by this module's routable endpoint.
+    pub async fn live_roots(&self) -> Result<LiveRootsSnapshot, CatalogUpdateError> {
+        if !self.shared.supports_live_roots {
+            return Err(CatalogUpdateError::NotSupported);
+        }
+        let body = serde_json::to_vec(&ModuleControlRequestFromModule::LiveRoots {})
+            .map_err(|err| CatalogUpdateError::Protocol(err.to_string()))?;
+        let (corr, writer, rx) = self.shared.begin_catalog_update()?;
+        let frame = Frame::build_with_version(
+            self.shared.negotiated_ver,
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            corr,
+            body,
+        )
+        .map_err(|err| {
+            self.shared.remove_pending_catalog_update(corr);
+            CatalogUpdateError::Protocol(err.to_string())
+        })?;
+        if writer.send(frame).await.is_err() {
+            self.shared.remove_pending_catalog_update(corr);
+            return Err(CatalogUpdateError::ConnectionClosed);
+        }
+        match timeout(CATALOG_UPDATE_TIMEOUT, rx).await {
+            Ok(Ok(Ok(ModuleControlResponseToModule::LiveRoots {
+                roots,
+                unknown_root_bindings,
+                total_bindings,
+            }))) => Ok(LiveRootsSnapshot {
+                roots,
+                unknown_root_bindings,
+                total_bindings,
+            }),
+            Ok(Ok(Ok(_))) => Err(CatalogUpdateError::Protocol(
+                "unexpected live_roots response".into(),
+            )),
+            Ok(Ok(Err(err))) => Err(err),
             Ok(Err(_)) => Err(CatalogUpdateError::ConnectionClosed),
             Err(_) => {
                 self.shared.remove_pending_catalog_update(corr);
@@ -437,14 +500,12 @@ impl ModuleHandle {
             return false;
         };
         let result = match frame.header.ty {
-            FrameType::Response => {
-                match serde_json::from_slice::<ModuleControlResponseToModule>(&frame.body) {
-                    Ok(ModuleControlResponseToModule::CatalogUpdate {}) => Ok(()),
-                    Err(err) => Err(CatalogUpdateError::Protocol(format!(
-                        "invalid catalog.update response body: {err}"
-                    ))),
-                }
-            }
+            FrameType::Response => serde_json::from_slice::<ModuleControlResponseToModule>(
+                &frame.body,
+            )
+            .map_err(|err| {
+                CatalogUpdateError::Protocol(format!("invalid module control response body: {err}"))
+            }),
             FrameType::Error => match serde_json::from_slice::<ErrorBody>(&frame.body) {
                 Ok(body) => Err(match body.code.as_str() {
                     "catalog_update_frozen_field" => CatalogUpdateError::FrozenField(body),

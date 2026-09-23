@@ -1,0 +1,12 @@
+{
+  "op": "supervisor.live_roots",
+  "roots": [
+    {
+      "bound": 2,
+      "pending": 1,
+      "project_root": "/projects/a"
+    }
+  ],
+  "total_bindings": 4,
+  "unknown_root_bindings": 1
+}

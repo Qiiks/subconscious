@@ -154,6 +154,16 @@ pub enum ModuleControlRequestFromModule {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ready: Option<bool>,
     },
+    #[serde(rename = "supervisor.live_roots")]
+    LiveRoots {},
+}
+
+/// Counts of routes for one canonical project root.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LiveRoot {
+    pub project_root: std::path::PathBuf,
+    pub bound: u64,
+    pub pending: u64,
 }
 
 /// subc's channel-0 response body for module-originated control RPCs.
@@ -162,6 +172,12 @@ pub enum ModuleControlRequestFromModule {
 pub enum ModuleControlResponseToModule {
     #[serde(rename = "catalog.update")]
     CatalogUpdate {},
+    #[serde(rename = "supervisor.live_roots")]
+    LiveRoots {
+        roots: Vec<LiveRoot>,
+        unknown_root_bindings: u64,
+        total_bindings: u64,
+    },
 }
 
 impl From<HealthReport> for ModuleControlResponse {

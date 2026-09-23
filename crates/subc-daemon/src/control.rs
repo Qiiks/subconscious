@@ -94,7 +94,8 @@ const SUBC_CONTROL_OPS: &[&str] = &[
     ops::SUPERVISOR_SPAWN_SUBSCRIBE,
 ];
 
-const MODULE_TO_SUBC_CONTROL_OPS: &[&str] = &[MODULE_TO_SUBC_OP_CATALOG_UPDATE];
+const MODULE_TO_SUBC_CONTROL_OPS: &[&str] =
+    &[MODULE_TO_SUBC_OP_CATALOG_UPDATE, "supervisor.live_roots"];
 
 const MODULE_BASELINE_CONTROL_OPS: &[&str] = &["route.bind", "route.status"];
 
@@ -1805,6 +1806,24 @@ impl ControlHandler {
                 capabilities,
                 ready,
             } => self.handle_catalog_update(connection_id, frame, provides, capabilities, ready),
+            ModuleControlRequestFromModule::LiveRoots {} => {
+                let registered = self
+                    .registry
+                    .get_module_by_connection(connection_id)
+                    .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
+                let Some(registration) = registered else {
+                    return Ok(vec![control_error_frame(&frame, "not_registered", "supervisor.live_roots requires an active module registration owned by this connection")?]);
+                };
+                let response = self
+                    .forwarding
+                    .live_roots(&registration.manifest.module_id)
+                    .map_err(RouterError::Forwarding)?;
+                Ok(vec![control_response_body_frame(
+                    &frame,
+                    &response,
+                    "ModuleControlResponseToModule::LiveRoots",
+                )?])
+            }
         }
     }
 
@@ -2551,6 +2570,7 @@ impl ControlHandler {
                 frame.header.corr,
                 &target_module_id,
                 principal.clone(),
+                Some(project_root),
                 relay_deadline,
             )
             .await
@@ -4475,6 +4495,7 @@ fn client_control_request_op(request: &ClientControlRequest) -> &'static str {
 fn module_control_request_op(request: &ModuleControlRequestFromModule) -> &'static str {
     match request {
         ModuleControlRequestFromModule::CatalogUpdate { .. } => MODULE_TO_SUBC_OP_CATALOG_UPDATE,
+        ModuleControlRequestFromModule::LiveRoots {} => "supervisor.live_roots",
     }
 }
 
@@ -6879,6 +6900,243 @@ mod tests {
         let expected: Value =
             serde_json::from_str(&std::fs::read_to_string(golden_path).unwrap()).unwrap();
         assert_eq!(actual, expected);
+    }
+
+    async fn query_live_roots(
+        handler: &ControlHandler,
+        module_ctx: &RouteCtx,
+    ) -> ModuleControlResponseToModule {
+        let body = serde_json::to_vec(&ModuleControlRequestFromModule::LiveRoots {}).unwrap();
+        let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 900, body).unwrap();
+        let response = handler
+            .handle_control_frame(module_ctx, frame)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        serde_json::from_slice(&response.body).unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supervisor_live_roots_root_known_arm_counts_bound_and_pending_from_real_handler() {
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let handler = ControlHandler::with_forwarding(registry, forwarding);
+        let (target_ctx, mut target_rx) = route_ctx(ConnectionId::new(301));
+        handler
+            .handle_control_frame(&target_ctx, hello_frame("target", PROTOCOL_VERSION, 1))
+            .await
+            .unwrap();
+        let root = unique_project_root("live-roots-known");
+        let path = ProjectRootId::from_path_allowing_missing(root.path())
+            .unwrap()
+            .as_path()
+            .to_path_buf();
+        let (client_ctx, mut client_rx) = route_ctx(ConnectionId::new(302));
+        let open_handler = handler.clone();
+        let opened = tokio::spawn(async move {
+            open_handler
+                .handle_control_frame(&client_ctx, route_open_frame(2, "target", root))
+                .await
+                .unwrap()
+        });
+        let bind = tokio::time::timeout(Duration::from_secs(5), target_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        handler
+            .handle_control_frame(&target_ctx, route_bind_ack(bind.header.corr))
+            .await
+            .unwrap();
+        assert!(opened.await.unwrap().is_empty());
+        let _ = client_rx.recv().await.unwrap();
+
+        let root = unique_project_root("live-roots-pending");
+        let pending_path = ProjectRootId::from_path_allowing_missing(root.path())
+            .unwrap()
+            .as_path()
+            .to_path_buf();
+        let (client_ctx, _client_rx) = route_ctx(ConnectionId::new(303));
+        let open_handler = handler.clone();
+        let pending = tokio::spawn(async move {
+            open_handler
+                .handle_control_frame(&client_ctx, route_open_frame(3, "target", root))
+                .await
+                .unwrap()
+        });
+        let pending_bind = tokio::time::timeout(Duration::from_secs(5), target_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let actual = query_live_roots(&handler, &target_ctx).await;
+        let ModuleControlResponseToModule::LiveRoots {
+            roots,
+            unknown_root_bindings,
+            total_bindings,
+        } = actual
+        else {
+            panic!("expected live roots")
+        };
+        assert_eq!(total_bindings, 2, "root-known arm must count live routes");
+        assert_eq!(unknown_root_bindings, 0);
+        assert_eq!(
+            roots.len(),
+            2,
+            "root-known arm must retain each canonical root"
+        );
+        assert_eq!(
+            total_bindings,
+            roots.iter().map(|r| r.bound + r.pending).sum::<u64>() + unknown_root_bindings
+        );
+        let counts = roots
+            .iter()
+            .map(|root| (root.project_root.clone(), root.bound, root.pending))
+            .collect::<Vec<_>>();
+        let mut expected = vec![(path, 1, 0), (pending_path, 0, 1)];
+        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            counts, expected,
+            "roots must sort by path and count pending separately"
+        );
+        handler
+            .handle_control_frame(&target_ctx, route_bind_ack(pending_bind.header.corr))
+            .await
+            .unwrap();
+        assert!(pending.await.unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supervisor_live_roots_unknown_root_arm_is_not_no_bindings() {
+        let forwarding = Arc::new(ForwardingTable::default());
+        let handler =
+            ControlHandler::with_forwarding(Arc::new(Registry::default()), Arc::clone(&forwarding));
+        let (target_ctx, _target_rx) = route_ctx(ConnectionId::new(311));
+        handler
+            .handle_control_frame(&target_ctx, hello_frame("target", PROTOCOL_VERSION, 1))
+            .await
+            .unwrap();
+        let (client_ctx, _client_rx) = route_ctx(ConnectionId::new(312));
+        let pending = forwarding
+            .begin_route_bind_relay_for_test(
+                client_ctx.connection_id,
+                client_ctx.egress.clone(),
+                2,
+                "target",
+            )
+            .unwrap();
+        forwarding
+            .complete_pending_relay(
+                target_ctx.connection_id,
+                pending.corr,
+                RouteBindRelayOutcome::Accepted,
+            )
+            .unwrap();
+        let actual = query_live_roots(&handler, &target_ctx).await;
+        let ModuleControlResponseToModule::LiveRoots {
+            roots,
+            unknown_root_bindings,
+            total_bindings,
+        } = actual
+        else {
+            panic!("expected live roots")
+        };
+        assert!(roots.is_empty(), "unknown-root arm must not invent a root");
+        assert_eq!(
+            unknown_root_bindings, 1,
+            "unknown-root arm must not read as no bindings"
+        );
+        assert_eq!(total_bindings, 1, "unknown-root arm has a live binding");
+        assert_eq!(
+            total_bindings,
+            roots.iter().map(|r| r.bound + r.pending).sum::<u64>() + unknown_root_bindings
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supervisor_live_roots_cross_module_scope_uses_requesting_connection() {
+        let handler = ControlHandler::with_forwarding(
+            Arc::new(Registry::default()),
+            Arc::new(ForwardingTable::default()),
+        );
+        let (first_ctx, _first_rx) = route_ctx(ConnectionId::new(315));
+        let (second_ctx, mut second_rx) = route_ctx(ConnectionId::new(316));
+        handler
+            .handle_control_frame(&first_ctx, hello_frame("first", PROTOCOL_VERSION, 1))
+            .await
+            .unwrap();
+        handler
+            .handle_control_frame(&second_ctx, hello_frame("second", PROTOCOL_VERSION, 2))
+            .await
+            .unwrap();
+        let root = unique_project_root("second-only");
+        let (client_ctx, _client_rx) = route_ctx(ConnectionId::new(317));
+        let cloned = handler.clone();
+        let open = tokio::spawn(async move {
+            cloned
+                .handle_control_frame(&client_ctx, route_open_frame(3, "second", root))
+                .await
+                .unwrap()
+        });
+        let bind = tokio::time::timeout(Duration::from_secs(5), second_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let first = query_live_roots(&handler, &first_ctx).await;
+        let second = query_live_roots(&handler, &second_ctx).await;
+        assert!(
+            matches!(
+                first,
+                ModuleControlResponseToModule::LiveRoots {
+                    total_bindings: 0,
+                    ..
+                }
+            ),
+            "cross-module scope must not expose another module's roots"
+        );
+        assert!(
+            matches!(
+                second,
+                ModuleControlResponseToModule::LiveRoots {
+                    total_bindings: 1,
+                    ..
+                }
+            ),
+            "second module must see its pending route"
+        );
+        handler
+            .handle_control_frame(&second_ctx, route_bind_ack(bind.header.corr))
+            .await
+            .unwrap();
+        assert!(open.await.unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supervisor_live_roots_no_bindings_arm_is_empty() {
+        let handler = ControlHandler::with_forwarding(
+            Arc::new(Registry::default()),
+            Arc::new(ForwardingTable::default()),
+        );
+        let (target_ctx, _target_rx) = route_ctx(ConnectionId::new(321));
+        handler
+            .handle_control_frame(&target_ctx, hello_frame("target", PROTOCOL_VERSION, 1))
+            .await
+            .unwrap();
+        let actual = query_live_roots(&handler, &target_ctx).await;
+        let ModuleControlResponseToModule::LiveRoots {
+            roots,
+            unknown_root_bindings,
+            total_bindings,
+        } = actual
+        else {
+            panic!("expected live roots")
+        };
+        assert!(roots.is_empty());
+        assert_eq!(unknown_root_bindings, 0);
+        assert_eq!(total_bindings, 0);
+        assert_eq!(
+            total_bindings,
+            roots.iter().map(|r| r.bound + r.pending).sum::<u64>() + unknown_root_bindings
+        );
     }
 
     /// Read the vendored fed corpus rather than hand-building a package.

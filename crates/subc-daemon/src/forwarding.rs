@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     error::Error,
     fmt,
     sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard},
@@ -8,8 +8,9 @@ use std::{
 
 use subc_control::{ClientControlResponse, RouteCloseReason};
 use subc_protocol::{
-    manifest::Concurrency, session::ModuleControlResponse, ErrorBody, Flags, FrameType, Principal,
-    Priority,
+    manifest::Concurrency,
+    session::{LiveRoot, ModuleControlResponse, ModuleControlResponseToModule},
+    ErrorBody, Flags, FrameType, Principal, Priority,
 };
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::time::Instant;
@@ -20,7 +21,7 @@ use crate::{
     observability::DaemonCounters,
     registry::ConnectionId,
     router::FrameSink,
-    Frame,
+    Frame, ProjectRootId,
 };
 
 /// Default per-channel request-credit window for modules that schedule internally.
@@ -72,6 +73,7 @@ pub(crate) struct RouteBinding {
     pub module_channel: u16,
     pub module_epoch: u32,
     pub principal: Principal,
+    pub project_root: Option<ProjectRootId>,
     pub bound_at: Instant,
     pub flow: Arc<ChannelFlow>,
 }
@@ -240,12 +242,13 @@ struct HealthProbeTombstone {
     expires_at: Instant,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct RouteReservation {
     client_key: ClientRouteKey,
     module_key: ModuleRouteKey,
     client_epoch: u32,
     module_epoch: u32,
+    project_root: Option<ProjectRootId>,
 }
 
 #[derive(Debug)]
@@ -481,6 +484,7 @@ impl ForwardingTable {
         client_corr: u64,
         module_id: &str,
         principal: Principal,
+        project_root: Option<ProjectRootId>,
         deadline: Instant,
     ) -> Result<PendingRouteBindRelay, ForwardingError> {
         // Reserve egress capacity before taking the forwarding lock. The permit is
@@ -500,6 +504,7 @@ impl ForwardingTable {
             client_corr,
             module_id,
             principal,
+            project_root,
             deadline,
             client_permit,
         )
@@ -526,6 +531,7 @@ impl ForwardingTable {
             client_corr,
             module_id,
             Principal::Direct,
+            None,
             Instant::now() + std::time::Duration::from_secs(60),
             permit,
         )
@@ -650,6 +656,7 @@ impl ForwardingTable {
         client_corr: u64,
         expected_module_id: &str,
         principal: Principal,
+        project_root: Option<ProjectRootId>,
         deadline: Instant,
         client_permit: mpsc::OwnedPermit<crate::router::OutboundFrame>,
     ) -> Result<PendingRouteBindRelay, ForwardingError> {
@@ -707,6 +714,7 @@ impl ForwardingTable {
             module_key,
             client_epoch,
             module_epoch,
+            project_root,
         };
         let response_body = serde_json::to_vec(&ClientControlResponse::RouteOpen {
             route_channel: client_channel,
@@ -1513,6 +1521,61 @@ impl ForwardingTable {
             .collect())
     }
 
+    /// Snapshot only the endpoint currently routable under this module id.
+    pub(crate) fn live_roots(
+        &self,
+        module_id: &str,
+    ) -> Result<ModuleControlResponseToModule, ForwardingError> {
+        let inner = self.read_inner()?;
+        let endpoint = inner
+            .modules_by_id
+            .get(module_id)
+            .map(|module| module.endpoint);
+        let mut roots = BTreeMap::new();
+        let mut unknown_root_bindings = 0;
+        let mut total_bindings = 0;
+        if let Some(endpoint) = endpoint {
+            for binding in inner
+                .module_to_client
+                .values()
+                .filter(|binding| binding.module_endpoint == endpoint)
+            {
+                total_bindings += 1;
+                if let Some(root) = &binding.project_root {
+                    let entry = roots.entry(root.as_path().to_path_buf()).or_insert((0, 0));
+                    entry.0 += 1;
+                } else {
+                    unknown_root_bindings += 1;
+                }
+            }
+            for pending in inner
+                .pending_relays
+                .values()
+                .filter(|pending| pending.reservation.module_key.endpoint == endpoint)
+            {
+                total_bindings += 1;
+                if let Some(root) = &pending.reservation.project_root {
+                    let entry = roots.entry(root.as_path().to_path_buf()).or_insert((0, 0));
+                    entry.1 += 1;
+                } else {
+                    unknown_root_bindings += 1;
+                }
+            }
+        }
+        Ok(ModuleControlResponseToModule::LiveRoots {
+            roots: roots
+                .into_iter()
+                .map(|(project_root, (bound, pending))| LiveRoot {
+                    project_root,
+                    bound,
+                    pending,
+                })
+                .collect(),
+            unknown_root_bindings,
+            total_bindings,
+        })
+    }
+
     /// True if this connection already owns committed or reserved CLIENT routes.
     /// A module registers (HELLO) before serving and never opens client routes, so
     /// a connection that has client routes must not also become a module endpoint
@@ -1927,6 +1990,7 @@ fn commit_route_locked(
         module_channel: reservation.module_key.channel,
         module_epoch: reservation.module_epoch,
         principal: pending.principal,
+        project_root: reservation.project_root.clone(),
         bound_at: Instant::now(),
         flow: Arc::new(ChannelFlow::new(window_for(&module.concurrency))),
     });

@@ -158,6 +158,7 @@ pub async fn build_bench_forwarding_setup(
                     route_index as u64 + 1,
                     &module_id,
                     Principal::Direct,
+                    None,
                     tokio::time::Instant::now() + std::time::Duration::from_secs(30),
                 )
                 .await

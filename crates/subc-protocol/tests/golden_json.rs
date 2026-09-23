@@ -145,6 +145,22 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
         &ModuleControlResponseToModule::CatalogUpdate {},
     );
     assert_golden(
+        "module_control_request_from_module_live_roots",
+        &ModuleControlRequestFromModule::LiveRoots {},
+    );
+    assert_golden(
+        "module_control_response_to_module_live_roots",
+        &ModuleControlResponseToModule::LiveRoots {
+            roots: vec![subc_protocol::session::LiveRoot {
+                project_root: std::path::PathBuf::from("/projects/a"),
+                bound: 2,
+                pending: 1,
+            }],
+            unknown_root_bindings: 1,
+            total_bindings: 4,
+        },
+    );
+    assert_golden(
         "tool_with_description",
         &Tool {
             name: "memory.write".to_string(),
