@@ -3914,6 +3914,7 @@ fn stub_spec(module_id: &str, events_path: &Path, extra_env: &[(&str, &str)]) ->
         reserved: false,
         reserved_prefixes: Vec::new(),
         protocol: ModuleProtocol::Subc,
+        overlap: Default::default(),
     }
 }
 
@@ -3937,6 +3938,7 @@ fn mcp_module_spec(
         reserved: false,
         reserved_prefixes: Vec::new(),
         protocol: ModuleProtocol::Subc,
+        overlap: Default::default(),
     }
 }
 

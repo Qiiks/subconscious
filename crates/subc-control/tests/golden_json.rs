@@ -207,6 +207,20 @@ fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
             },
         ),
         (
+            "client_control_request_supervisor_swap",
+            ClientControlRequest::SupervisorSwap {
+                module_id: "aft-tools".to_string(),
+                ready_timeout_ms: None,
+            },
+        ),
+        (
+            "client_control_request_supervisor_swap_ready_timeout",
+            ClientControlRequest::SupervisorSwap {
+                module_id: "aft-tools".to_string(),
+                ready_timeout_ms: Some(90_000),
+            },
+        ),
+        (
             "client_control_request_supervisor_reload",
             ClientControlRequest::SupervisorReload {
                 module_id: "aft-tools".to_string(),

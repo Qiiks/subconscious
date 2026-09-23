@@ -192,13 +192,6 @@ pub(crate) enum RouteBindRelayOutcome {
 }
 
 /// What [`ForwardingTable::cutover_candidate`] did.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "blue/green swap is driven by the supervisor's swap state machine, which is not wired yet; until then only tests reach it"
-    )
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ForwardingCutover {
     /// The endpoint now in the active slot (the former candidate).
@@ -516,13 +509,6 @@ impl ForwardingTable {
     /// is still true. The breaker is reset at cutover instead, when the process
     /// behind the name actually changes. A second candidate for the same id is
     /// refused.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "blue/green swap is driven by the supervisor's swap state machine, which is not wired yet; until then only tests reach it"
-        )
-    )]
     pub(crate) fn register_candidate_module_connection(
         &self,
         connection_id: ConnectionId,
@@ -582,13 +568,6 @@ impl ForwardingTable {
     /// where they are until it is drained with [`Self::begin_endpoint_drain`],
     /// using the incumbent endpoint this returns. Returns `Ok(None)` when there
     /// is no candidate for the id.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "blue/green swap is driven by the supervisor's swap state machine, which is not wired yet; until then only tests reach it"
-        )
-    )]
     pub(crate) fn cutover_candidate(
         &self,
         module_id: &str,
@@ -733,6 +712,42 @@ impl ForwardingTable {
         )
     }
 
+    /// A health probe addressed to one endpoint, in whichever slot it is.
+    ///
+    /// Every other control RPC resolves the id's ACTIVE endpoint, which is how
+    /// a swap candidate (not active until cutover) and a superseded incumbent
+    /// (not active after it) are unreachable by them. A swap needs to probe
+    /// exactly those two: the candidate before promoting it, and the incumbent
+    /// for its busy gauges while it drains.
+    pub(crate) fn begin_endpoint_health_probe_rpc_for(
+        &self,
+        endpoint: ModuleEndpointId,
+        expected_op: &str,
+        probe_started_at: Instant,
+        deadline: Instant,
+    ) -> Result<PendingModuleControlRpc, ForwardingError> {
+        let inner = self.write_inner()?;
+        let module = module_connection_for_endpoint_locked(&inner, endpoint)
+            .cloned()
+            .ok_or(ForwardingError::NoModuleConnection)?;
+        let module_id = inner
+            .module_id_by_endpoint
+            .get(&endpoint)
+            .cloned()
+            .unwrap_or_default();
+        // A draining incumbent is exactly what this probes for busy gauges, so
+        // draining is allowed, as it is for the by-id drain probe.
+        self.begin_control_rpc_locked(
+            inner,
+            &module_id,
+            module,
+            expected_op,
+            deadline,
+            Some(probe_started_at),
+            true,
+        )
+    }
+
     fn begin_module_control_rpc_inner(
         &self,
         module_id: &str,
@@ -741,12 +756,34 @@ impl ForwardingTable {
         health_probe_started_at: Option<Instant>,
         allow_draining: bool,
     ) -> Result<PendingModuleControlRpc, ForwardingError> {
-        let mut inner = self.write_inner()?;
+        let inner = self.write_inner()?;
         let module = inner
             .modules_by_id
             .get(module_id)
             .cloned()
             .ok_or(ForwardingError::NoModuleConnection)?;
+        self.begin_control_rpc_locked(
+            inner,
+            module_id,
+            module,
+            expected_op,
+            deadline,
+            health_probe_started_at,
+            allow_draining,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn begin_control_rpc_locked(
+        &self,
+        mut inner: RwLockWriteGuard<'_, ForwardingInner>,
+        module_id: &str,
+        module: ModuleConnection,
+        expected_op: &str,
+        deadline: Instant,
+        health_probe_started_at: Option<Instant>,
+        allow_draining: bool,
+    ) -> Result<PendingModuleControlRpc, ForwardingError> {
         if !allow_draining && inner.draining_endpoints.contains_key(&module.endpoint) {
             return Err(ForwardingError::ModuleReloading {
                 module_id: module_id.to_string(),
@@ -1611,13 +1648,6 @@ impl ForwardingTable {
     /// endpoint is captured by `cutover_candidate`, and resolving it by module id
     /// instead would find the promoted candidate and leave neither process
     /// routable. Returns `Ok(None)` when the endpoint is no longer registered.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "blue/green swap is driven by the supervisor's swap state machine, which is not wired yet; until then only tests reach it"
-        )
-    )]
     pub(crate) fn begin_endpoint_drain(
         &self,
         endpoint: ModuleEndpointId,

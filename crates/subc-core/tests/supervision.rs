@@ -229,6 +229,7 @@ async fn failed_spawn_during_enable_allows_a_later_retry() {
                 reserved: false,
                 reserved_prefixes: Vec::new(),
                 protocol: ModuleProtocol::Subc,
+                overlap: Default::default(),
             },
             false,
         )
@@ -782,6 +783,7 @@ fn stub_spec<'a>(
         reserved: false,
         reserved_prefixes: Vec::new(),
         protocol: ModuleProtocol::Subc,
+        overlap: Default::default(),
     }
 }
 
@@ -827,6 +829,7 @@ async fn a_dead_module_leaves_its_stderr_readable_from_the_supervisor() {
             reserved: false,
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
         })
         .unwrap();
 
@@ -883,6 +886,7 @@ async fn a_silent_module_reports_captured_and_empty_rather_than_uncaptured() {
             reserved: false,
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
         })
         .unwrap();
 
@@ -957,6 +961,7 @@ async fn a_supervised_module_inherits_the_parent_environment() {
             reserved: false,
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
         })
         .unwrap();
 
@@ -1004,6 +1009,7 @@ async fn stderr_from_before_a_restart_survives_with_a_marked_boundary() {
             reserved: false,
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
         })
         .unwrap();
 
@@ -1070,6 +1076,7 @@ async fn a_wedged_old_stderr_pump_is_stopped_before_the_next_restart_boundary() 
             reserved: false,
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
         })
         .unwrap();
 
@@ -1126,6 +1133,7 @@ async fn child_stdout_and_stderr_reach_the_capture_file_while_only_stderr_reache
             reserved: false,
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
         })
         .unwrap();
 
@@ -1189,6 +1197,7 @@ async fn concurrent_child_pipes_never_tear_a_line_in_the_capture_file() {
             reserved: false,
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
         })
         .unwrap();
 

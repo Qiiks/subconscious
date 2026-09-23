@@ -14,7 +14,10 @@ use subc_control::ModuleProtocol;
 use subc_jsonc::jsonc_to_json;
 use subc_protocol::manifest::is_valid_capability_identifier;
 
-use crate::{HealthAction, HealthConfig, ModuleSpec, RestartPolicy};
+use crate::{
+    supervise::{ModuleOverlap, SUBC_SPAWN_ROLE_ENV},
+    HealthAction, HealthConfig, ModuleSpec, RestartPolicy,
+};
 
 const DAEMON_CONFIG_RELATIVE_PATH: &str = "cortexkit/subc.jsonc";
 const SUPPORTED_CONFIG_VERSION: u32 = 1;
@@ -245,6 +248,9 @@ pub struct ConfiguredModule {
     /// Which wire protocol this module speaks, as declared. Absent in config
     /// means `Subc`, which is what every module written before this key meant.
     pub protocol: ModuleProtocol,
+    /// Whether a second process of this module may run beside the first, which
+    /// a blue/green swap does. Absent in config means exclusive.
+    pub overlap: ModuleOverlap,
     pub health: HealthConfig,
     /// Effective drain budget (ms) for this module's teardown, already resolved
     /// against the daemon-wide default at parse time. `None` = built-in default.
@@ -310,6 +316,7 @@ impl ConfiguredModule {
             reserved: self.reserved,
             reserved_prefixes: self.reserved_prefixes.clone(),
             protocol: self.protocol,
+            overlap: self.overlap,
         }
     }
 }
@@ -392,6 +399,9 @@ struct RawModuleConfig {
     /// typed, instead of a serde variant error that names neither.
     #[serde(default)]
     protocol: Option<String>,
+    /// Read as a raw string for the same reason as `protocol`.
+    #[serde(default)]
+    overlap: Option<String>,
     #[serde(default)]
     health: Option<RawHealthConfig>,
     #[serde(default)]
@@ -695,6 +705,19 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
                 None => default_route_bind_relay_timeout_ms,
             };
             let protocol = parse_module_protocol(module.protocol.as_deref(), path, &module_id)?;
+            let overlap = parse_module_overlap(module.overlap.as_deref(), path, &module_id)?;
+            // The spawn role is set by the supervisor on a swap candidate and
+            // nowhere else; a configured value would put the long swap warm-up
+            // budget on every plain restart, where callers wait on it.
+            if module.env.contains_key(SUBC_SPAWN_ROLE_ENV) {
+                return Err(DaemonConfigError::InvalidValue {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "module '{module_id}' sets {SUBC_SPAWN_ROLE_ENV} in env; that variable is set by the supervisor on a swap candidate only and cannot be configured",
+                        module_id = module_id.escape_debug()
+                    ),
+                });
+            }
             // A reserved module is one only the daemon-spawned process may
             // REGISTER as, enforced by matching a launch nonce in its HELLO. A
             // module that speaks no subc wire sends no HELLO, so the gate has
@@ -728,6 +751,7 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
                 reserved: module.reserved,
                 reserved_prefixes: module.reserved_prefixes,
                 protocol,
+                overlap,
                 health,
                 // Per-module wins; the daemon-wide value is the fallback. `0` is
                 // legitimate ("never wait"), so this is `.or`, not `filter+or`.
@@ -898,6 +922,28 @@ fn parse_module_protocol(
             message: format!(
                 "module '{module_id}' declares protocol {other:?}; supported values are \
                  \"subc\" (the default when the key is absent) and \"none\"",
+                module_id = module_id.escape_debug(),
+            ),
+        }),
+    }
+}
+
+/// Resolve a module's declared `overlap` key. Absent means `"exclusive"`,
+/// and an unknown value is refused rather than read as either: a typo that
+/// became `"safe"` would let a swap run two processes on a single-writer store.
+fn parse_module_overlap(
+    raw: Option<&str>,
+    path: &Path,
+    module_id: &str,
+) -> Result<ModuleOverlap, DaemonConfigError> {
+    match raw {
+        None | Some("exclusive") => Ok(ModuleOverlap::Exclusive),
+        Some("safe") => Ok(ModuleOverlap::Safe),
+        Some(other) => Err(DaemonConfigError::InvalidValue {
+            path: path.to_path_buf(),
+            message: format!(
+                "module '{module_id}' declares overlap {other:?}; supported values are \
+                 \"exclusive\" (the default when the key is absent) and \"safe\"",
                 module_id = module_id.escape_debug(),
             ),
         }),
@@ -2119,6 +2165,52 @@ mod tests {
         // parsing it into a field nothing reads would leave every behaviour
         // gated on it unreachable.
         assert_eq!(none.module_spec().protocol, ModuleProtocol::None);
+    }
+
+    /// `overlap` defaults to exclusive, `"safe"` opts in and reaches the spec
+    /// the supervisor is handed, and anything else is refused rather than read
+    /// as either value.
+    #[test]
+    fn overlap_defaults_to_exclusive_and_only_safe_opts_in() {
+        let parse = |module_body: &str| {
+            parse_doc(
+                &format!(
+                    r#"{{
+                      "version": 1,
+                      "modules": {{ "aft": {{ "program": "aft"{module_body} }} }}
+                    }}"#
+                ),
+                Path::new("subc.jsonc"),
+            )
+        };
+
+        let absent = parse("").unwrap().modules.remove(0);
+        assert_eq!(absent.overlap, ModuleOverlap::Exclusive);
+        assert_eq!(absent.module_spec().overlap, ModuleOverlap::Exclusive);
+        let safe = parse(r#", "overlap": "safe""#).unwrap().modules.remove(0);
+        assert_eq!(safe.module_spec().overlap, ModuleOverlap::Safe);
+        let typo = parse(r#", "overlap": "sfae""#).expect_err("an unknown overlap is refused");
+        assert!(typo.to_string().contains("sfae"), "{typo}");
+    }
+
+    /// The spawn role is the supervisor's to set on a swap candidate. A
+    /// configured value would reach every plain spawn and make the module pick
+    /// its long swap warm-up budget while callers wait on a restart.
+    #[test]
+    fn the_spawn_role_is_refused_as_a_configured_env_key() {
+        let error = parse_doc(
+            r#"{
+              "version": 1,
+              "modules": { "aft": { "program": "aft", "env": { "SUBC_SPAWN_ROLE": "swap_candidate" } } }
+            }"#,
+            Path::new("subc.jsonc"),
+        )
+        .expect_err("SUBC_SPAWN_ROLE must not be configurable");
+        assert!(
+            matches!(error, DaemonConfigError::InvalidValue { .. }),
+            "expected InvalidValue, got {error:?}"
+        );
+        assert!(error.to_string().contains("SUBC_SPAWN_ROLE"), "{error}");
     }
 
     /// An unusable value is refused WITH THE VALUE IN THE MESSAGE. Falling back

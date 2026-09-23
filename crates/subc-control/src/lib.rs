@@ -101,6 +101,7 @@ pub mod ops {
     pub const ROUTE_CLOSED: &str = "route.closed";
     pub const SUPERVISOR_LIST: &str = "supervisor.list";
     pub const SUPERVISOR_RESTART: &str = "supervisor.restart";
+    pub const SUPERVISOR_SWAP: &str = "supervisor.swap";
     pub const SUPERVISOR_RELOAD: &str = "supervisor.reload";
     pub const SUPERVISOR_RESCAN: &str = "supervisor.rescan";
     pub const SUPERVISOR_RELEASE_RESERVED: &str = "supervisor.release_reserved";
@@ -193,6 +194,28 @@ pub enum ClientControlRequest {
         /// for (the CLI only sends it when a flag is passed).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         drain_timeout_ms: Option<u64>,
+    },
+    /// Blue/green restart: start a replacement beside the running process, keep
+    /// routing to the running one until the replacement declares itself ready,
+    /// then move new routes over and drain the old process.
+    ///
+    /// Refused before anything is spawned unless the module's daemon config
+    /// declares `overlap: "safe"`: two processes on one single-writer store is
+    /// a data hazard, so the default is exclusive. Answered once the swap has
+    /// either cut over (the old process is still draining) or failed; a failure
+    /// leaves the old process serving and undrained, and names the arm in
+    /// `ErrorBody.detail`.
+    ///
+    /// A new op rather than a flag on `supervisor.restart`: a daemon that
+    /// predates swap rejects an unknown op, whereas an unknown field could be
+    /// dropped and turned into a plain restart.
+    #[serde(rename = "supervisor.swap")]
+    SupervisorSwap {
+        module_id: String,
+        /// How long the replacement may take to register and declare itself
+        /// ready before the swap is abandoned. Absent: the daemon default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ready_timeout_ms: Option<u64>,
     },
     #[serde(rename = "supervisor.reload")]
     SupervisorReload { module_id: String },

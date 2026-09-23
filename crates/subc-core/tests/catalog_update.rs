@@ -414,6 +414,7 @@ async fn declared_not_ready_and_supervised_absence_are_observably_distinct() {
             reserved: false,
             reserved_prefixes: Vec::new(),
             protocol: subc_control::ModuleProtocol::Subc,
+            overlap: Default::default(),
         })
         .unwrap();
     wait_for_path(&absent_ready).await;
@@ -920,6 +921,7 @@ async fn spawn_ready_stub(
             reserved: false,
             reserved_prefixes: Vec::new(),
             protocol: subc_control::ModuleProtocol::Subc,
+            overlap: Default::default(),
         })
         .unwrap();
     wait_for_registration_ready(server, module_id, false).await;

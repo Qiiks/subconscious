@@ -48,6 +48,9 @@ use crate::{
     Frame, FrameSink, Registry,
 };
 
+#[path = "supervise_swap.rs"]
+mod swap;
+
 /// Command-line flag used by supervised modules to find subc.
 ///
 /// subc launches module-mode children as `<module> --subc <connection-file-path>`.
@@ -82,6 +85,8 @@ const SPAWN_SUBSCRIBER_BUFFER: usize = SPAWN_EVENT_RING_CAPACITY + 1;
 
 struct SupervisedChild {
     child: Child,
+    /// The name of this process's cgroup: the module id, or for a swap
+    /// candidate its slot key (see `swap::swap_slot_key`).
     #[cfg(target_os = "linux")]
     module_id: String,
     #[cfg(target_os = "linux")]
@@ -217,7 +222,55 @@ pub struct ModuleSpec {
     /// it, and a secret in the environment of a process that does not need it is
     /// a leak surface for no benefit.
     pub protocol: ModuleProtocol,
+    /// Whether two processes of this module may run at once, which is what a
+    /// blue/green swap does for the length of its overlap. Declared in daemon
+    /// config because the daemon must be able to answer it while the module is
+    /// down, and so a module cannot talk itself into it after registering.
+    pub overlap: ModuleOverlap,
 }
+
+/// Whether a module tolerates a second process of itself running alongside.
+///
+/// Most modules are single-writer on their store (a WAL, a capture log, a
+/// resident index behind a writer barrier), and two processes on one store
+/// corrupt it. So a swap, which overlaps the old and new process by design,
+/// is refused unless the module's config opts in with `overlap: "safe"`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ModuleOverlap {
+    /// Never run two processes of this module at once. The default.
+    #[default]
+    Exclusive,
+    /// The module has said a second process of itself is harmless for the
+    /// length of a swap.
+    Safe,
+}
+
+impl ModuleOverlap {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Exclusive => "exclusive",
+            Self::Safe => "safe",
+        }
+    }
+}
+
+/// Environment variable telling a spawned module which case it was started
+/// for, before it sends HELLO. Only a swap candidate carries it, as
+/// [`SPAWN_ROLE_SWAP_CANDIDATE`]; every other spawn has it removed.
+///
+/// It chooses a warm-up budget, nothing else: a swap candidate can warm for
+/// longer because nobody waits on it, while a plain restart must flip ready
+/// quickly because callers see `module_warming` until it does. Absence means
+/// plain restart, the safe reading. The daemon trusts nothing about it; the
+/// candidate is proven by its launch nonce at HELLO.
+pub const SUBC_SPAWN_ROLE_ENV: &str = "SUBC_SPAWN_ROLE";
+/// The one value of [`SUBC_SPAWN_ROLE_ENV`] the daemon sets.
+pub const SPAWN_ROLE_SWAP_CANDIDATE: &str = "swap_candidate";
+/// How long a swap waits for its candidate to register and declare itself
+/// ready when the operator does not say. A module warming as a swap candidate
+/// may take up to 90 s (aft's ceiling, the largest in the fleet), so the
+/// daemon allows that plus time to start the process and send HELLO.
+pub const DEFAULT_SWAP_READY_TIMEOUT: Duration = Duration::from_secs(100);
 
 /// Bounded restart policy for crash exits.
 ///
@@ -583,6 +636,11 @@ struct SupervisorSnapshot {
     deliberate_severance: Option<ProcessIdentity>,
     last_exit: Option<ExitReport>,
     health: ModuleHealthStatus,
+    /// Whether the current process was started as a swap candidate and so
+    /// uses the alternate slot key for its cgroup and capture file. The next
+    /// swap's candidate takes the other key, so the two processes of a swap
+    /// never share either. A plain spawn always uses the primary key.
+    in_alternate_slot: bool,
 }
 
 impl SupervisorSnapshot {
@@ -668,6 +726,7 @@ impl SupervisorSnapshot {
             deliberate_severance: None,
             last_exit: None,
             health: ModuleHealthStatus::default(),
+            in_alternate_slot: false,
         }
     }
 }
@@ -790,6 +849,39 @@ impl SpawnEventFeed {
             module_id.to_string(),
             live.spawn_generation,
             live.pid,
+            exit_code,
+            exit_signal,
+        );
+    }
+
+    /// Report the exit of a process that a swap has already replaced.
+    ///
+    /// `emit_exited` removes the module's live entry, which after a swap's
+    /// cutover describes the promoted candidate, not the old process now
+    /// exiting. This emits the old generation's exit and leaves the live entry
+    /// alone unless it still names that generation.
+    fn emit_superseded_exited(
+        &self,
+        module_id: &str,
+        spawn_generation: u64,
+        pid: u32,
+        exit_code: Option<i32>,
+        exit_signal: Option<i32>,
+    ) {
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if state
+            .live
+            .get(module_id)
+            .is_some_and(|live| live.spawn_generation == spawn_generation)
+        {
+            state.live.remove(module_id);
+        }
+        Self::emit_locked(
+            &mut state,
+            SpawnEventKind::Exited,
+            module_id.to_string(),
+            spawn_generation,
+            pid,
             exit_code,
             exit_signal,
         );
@@ -1104,10 +1196,47 @@ pub struct SupervisorHandle {
     /// accidental collisions and lower-trust processes from squatting protected
     /// namespaces.
     reserved_prefix_owners: Arc<Mutex<HashMap<String, String>>>,
+    /// Blue/green swaps in progress, by module id. An entry exists from just
+    /// before the candidate process is spawned until the swap has failed, or
+    /// has cut over and the old process is gone. While it exists, HELLO for the
+    /// id is gated on the swap token (see [`Self::swap_hello_admission`]) and
+    /// consumer attestation accepts both processes' nonces.
+    swaps: Arc<Mutex<HashMap<String, OpenSwap>>>,
     /// Serializes module-set reconciliation with operator lifecycle commands. Without
     /// this daemon-wide ordering, a rescan could retire or update a module while a
     /// concurrent reload still held its old handle and launch specification.
     operation_lock: Arc<AsyncMutex<()>>,
+}
+
+/// The nonces of one open swap.
+#[derive(Debug, Clone)]
+struct OpenSwap {
+    /// The launch nonce minted for the candidate process. It is the swap
+    /// token: the only thing that admits a HELLO into the candidate slot.
+    candidate_nonce: String,
+    /// The incumbent's launch nonce, captured when the swap opened. It is kept
+    /// here because cutover moves the module's recorded spawn nonce to the
+    /// candidate while the incumbent is still draining and its consumers are
+    /// still attesting with this one.
+    incumbent_nonce: Option<String>,
+    /// Set once a HELLO has been admitted with the swap token, so the token
+    /// admits one registration and cannot be replayed after cutover empties
+    /// the candidate slot.
+    candidate_admitted: bool,
+}
+
+/// What the swap gate says about a HELLO. See
+/// [`SupervisorHandle::swap_hello_admission`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SwapHelloAdmission {
+    /// No swap is open for the id (or the HELLO carries the incumbent's own
+    /// nonce); the ordinary gates decide.
+    NotSwapping,
+    /// The HELLO carries the swap token: register it into the candidate slot.
+    Candidate,
+    /// A swap is open and the HELLO carries a nonce the supervisor did not
+    /// mint for this id, no nonce, or a token already used.
+    Refused,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1283,6 +1412,9 @@ impl SupervisorHandle {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .get(&owner_module_id)
                 .is_some_and(|expected| constant_time_eq(expected.as_bytes(), presented.as_bytes()))
+                // While the owner is being swapped, children started by
+                // either of its two processes hold that process's nonce.
+                || self.swap_nonce_matches(&owner_module_id, presented)
         });
         if authorized {
             None
@@ -1306,9 +1438,147 @@ impl SupervisorHandle {
             .spawn_nonces
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        nonces
+        let current = nonces
             .get(module_id)
-            .is_some_and(|expected| constant_time_eq(expected.as_bytes(), presented.as_bytes()))
+            .is_some_and(|expected| constant_time_eq(expected.as_bytes(), presented.as_bytes()));
+        drop(nonces);
+        // During a swap two processes of the module are alive, and a consumer
+        // started by either one presents that process's nonce. Accepting only
+        // the recorded one would fail the incumbent's consumers for the whole
+        // overlap once cutover moves the record to the candidate.
+        current || self.swap_nonce_matches(module_id, presented)
+    }
+
+    /// Whether `presented` is either nonce of an open swap for `module_id`.
+    fn swap_nonce_matches(&self, module_id: &str, presented: &str) -> bool {
+        let swaps = self
+            .swaps
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        swaps.get(module_id).is_some_and(|swap| {
+            constant_time_eq(swap.candidate_nonce.as_bytes(), presented.as_bytes())
+                || swap.incumbent_nonce.as_deref().is_some_and(|incumbent| {
+                    constant_time_eq(incumbent.as_bytes(), presented.as_bytes())
+                })
+        })
+    }
+
+    /// Open a swap for `module_id` with the candidate's freshly minted nonce.
+    /// Called before the candidate process exists.
+    pub(crate) fn open_swap(&self, module_id: &str, candidate_nonce: String) {
+        let incumbent_nonce = self
+            .spawn_nonces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(module_id)
+            .cloned();
+        self.swaps
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                module_id.to_string(),
+                OpenSwap {
+                    candidate_nonce,
+                    incumbent_nonce,
+                    candidate_admitted: false,
+                },
+            );
+    }
+
+    /// Close the swap for `module_id`, releasing whichever nonce is no longer
+    /// the module's recorded one.
+    pub(crate) fn close_swap(&self, module_id: &str) {
+        self.swaps
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(module_id);
+    }
+
+    /// Whether a swap is open for `module_id`.
+    pub(crate) fn swap_open(&self, module_id: &str) -> bool {
+        self.swaps
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(module_id)
+    }
+
+    /// Make the candidate's nonce the module's recorded spawn nonce, as a plain
+    /// respawn would, once cutover has made the candidate the module's process.
+    /// The swap stays open so the incumbent's nonce keeps attesting until the
+    /// incumbent has drained and exited.
+    fn promote_swap_nonce(&self, module_id: &str, reserved: bool) {
+        let candidate_nonce = self
+            .swaps
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(module_id)
+            .map(|swap| swap.candidate_nonce.clone());
+        let Some(nonce) = candidate_nonce else {
+            return;
+        };
+        self.set_spawn_nonce(module_id, nonce.clone());
+        if reserved {
+            self.set_reserved_nonce(module_id, nonce);
+        }
+    }
+
+    /// The swap gate for a HELLO claiming `module_id`.
+    ///
+    /// This runs BEFORE the reserved-module gate. A reserved module's candidate
+    /// presents the candidate nonce, which the reserved gate (holding the
+    /// incumbent's nonce) would refuse as `reserved_module` before swap
+    /// admission was ever reached. And it applies to unreserved ids too: for an
+    /// unreserved id the only thing that ever stopped a second process claiming
+    /// a live id was the `duplicate_module_id` refusal, which is exactly the
+    /// refusal a swap lifts for its candidate.
+    ///
+    /// The incumbent's own nonce falls through to the ordinary gates, which
+    /// treat it as they always have (a live incumbent is refused as a
+    /// duplicate). Anything else while a swap is open is refused, including an
+    /// absent nonce.
+    pub(crate) fn swap_hello_admission(
+        &self,
+        module_id: &str,
+        presented: Option<&str>,
+    ) -> SwapHelloAdmission {
+        let swaps = self
+            .swaps
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(swap) = swaps.get(module_id) else {
+            return SwapHelloAdmission::NotSwapping;
+        };
+        let Some(presented) = presented else {
+            return SwapHelloAdmission::Refused;
+        };
+        if constant_time_eq(swap.candidate_nonce.as_bytes(), presented.as_bytes()) {
+            return if swap.candidate_admitted {
+                SwapHelloAdmission::Refused
+            } else {
+                SwapHelloAdmission::Candidate
+            };
+        }
+        if swap
+            .incumbent_nonce
+            .as_deref()
+            .is_some_and(|incumbent| constant_time_eq(incumbent.as_bytes(), presented.as_bytes()))
+        {
+            return SwapHelloAdmission::NotSwapping;
+        }
+        SwapHelloAdmission::Refused
+    }
+
+    /// Record that the swap token has registered a candidate, so it admits no
+    /// second HELLO.
+    pub(crate) fn mark_swap_candidate_admitted(&self, module_id: &str) {
+        if let Some(swap) = self
+            .swaps
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_mut(module_id)
+        {
+            swap.candidate_admitted = true;
+        }
     }
 
     /// Test/support lookup for the current launch nonce of a supervised spawn.
@@ -1400,6 +1670,7 @@ impl SupervisorHandle {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(module_id);
+        self.close_swap(module_id);
         let mut reserved_nonces = self
             .reserved_nonces
             .lock()
@@ -1580,6 +1851,7 @@ impl Supervisor {
                     endpoint,
                     deadline,
                     &gauges,
+                    DrainScope::Active,
                 )
                 .await
             });
@@ -2234,6 +2506,27 @@ impl SupervisedModule {
         })?
     }
 
+    /// Blue/green restart: see [`SupervisorCommand::Swap`] and the
+    /// `supervisor_swap` module. Returns once the swap has cut over (the old
+    /// process then drains in the background of the supervise loop) or has
+    /// failed, leaving the old process serving.
+    pub async fn swap(&self, ready_timeout: Option<Duration>) -> Result<(), SuperviseError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.inner
+            .commands
+            .send(SupervisorCommand::Swap {
+                ready_timeout,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| SuperviseError::CommandClosed {
+                module_id: self.inner.module_id.clone(),
+            })?;
+        reply_rx.await.map_err(|_| SuperviseError::CommandClosed {
+            module_id: self.inner.module_id.clone(),
+        })?
+    }
+
     pub async fn reload(&self) -> Result<(), SuperviseError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.inner
@@ -2290,6 +2583,24 @@ impl SupervisedModule {
                     module_id: Some(self.inner.module_id.clone()),
                 })?;
         Ok((configuration.spec.clone(), configuration.health))
+    }
+
+    /// Replace this module's launch spec, keeping its health and drain policy,
+    /// the way a rescan does for a changed config entry. The running process is
+    /// untouched; the next spawn (a restart, or a swap's candidate) uses it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn update_spec_for_test(&self, spec: ModuleSpec) -> Result<(), SuperviseError> {
+        let (_, health) = self.configuration()?;
+        let drain_timeout_ms = u64::try_from(
+            self.inner
+                .effective_drain_timeout
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_millis(),
+        )
+        .ok();
+        self.update_configuration(spec, health, drain_timeout_ms)
+            .await
     }
 
     pub(crate) async fn update_configuration(
@@ -2380,6 +2691,13 @@ enum SupervisorCommand {
         drain_timeout_ms: Option<u64>,
         reply: oneshot::Sender<()>,
     },
+    Swap {
+        /// How long the candidate may take to register and declare itself
+        /// ready. `None` uses [`DEFAULT_SWAP_READY_TIMEOUT`].
+        ready_timeout: Option<Duration>,
+        /// Answered at cutover or failure; the incumbent's drain follows.
+        reply: oneshot::Sender<Result<(), SuperviseError>>,
+    },
 }
 
 #[derive(Debug)]
@@ -2436,6 +2754,86 @@ pub enum SuperviseError {
     CommandClosed {
         module_id: String,
     },
+    /// A swap was refused before anything was spawned.
+    SwapRefused {
+        module_id: String,
+        reason: SwapRefusal,
+    },
+    /// A swap spawned a candidate and gave up on it. The candidate has been
+    /// killed and its slot freed; the incumbent was left serving and was never
+    /// drained, except in the one `CutoverLost` case described on that arm.
+    SwapFailed {
+        module_id: String,
+        arm: SwapFailureArm,
+        detail: String,
+        /// How the candidate exited, when it exited on its own before the
+        /// supervisor gave up on it.
+        candidate_exit: Option<ExitReport>,
+    },
+}
+
+/// Why a swap was refused before a candidate was spawned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwapRefusal {
+    /// The module's config does not declare `overlap: "safe"`.
+    OverlapExclusive,
+    /// The module is not registered, so there is no incumbent to keep serving
+    /// and nothing a swap would improve on; a plain restart is the tool.
+    NotRegistered,
+    /// The module does not speak the subc wire, so a candidate could never
+    /// register or declare itself ready.
+    ProtocolNone,
+    /// The supervisor lacks the forwarding table (to cut routes over) or the
+    /// shared handle (to admit the candidate's HELLO) that a swap needs.
+    NotConfigured,
+    /// A swap is already open for this module.
+    AlreadySwapping,
+}
+
+impl SwapRefusal {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OverlapExclusive => "overlap_exclusive",
+            Self::NotRegistered => "not_registered",
+            Self::ProtocolNone => "protocol_none",
+            Self::NotConfigured => "not_configured",
+            Self::AlreadySwapping => "already_swapping",
+        }
+    }
+}
+
+/// Which failure arm ended a swap. Every arm but one leaves the incumbent
+/// serving and undrained; see `CutoverLost`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwapFailureArm {
+    /// The candidate process could not be started.
+    SpawnFailed,
+    /// The candidate did not register within the readiness budget.
+    NeverRegistered,
+    /// The candidate registered but did not declare itself ready in time.
+    NeverReady,
+    /// The candidate exited before cutover.
+    CandidateExited,
+    /// The candidate declared itself ready but failed its health probe.
+    CandidateUnhealthy,
+    /// The candidate's connection closed at the moment of cutover. If it
+    /// closed before forwarding moved, the incumbent is untouched. If it closed
+    /// between the forwarding and registry halves of cutover, forwarding can no
+    /// longer route to the incumbent, so the module is restarted plainly.
+    CutoverLost,
+}
+
+impl SwapFailureArm {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SpawnFailed => "spawn_failed",
+            Self::NeverRegistered => "never_registered",
+            Self::NeverReady => "never_ready",
+            Self::CandidateExited => "candidate_exited",
+            Self::CandidateUnhealthy => "candidate_unhealthy",
+            Self::CutoverLost => "cutover_lost",
+        }
+    }
 }
 
 impl fmt::Display for SuperviseError {
@@ -2509,6 +2907,37 @@ impl fmt::Display for SuperviseError {
                     "supervisor command channel for module '{module_id}' is closed"
                 )
             }
+            Self::SwapRefused { module_id, reason } => match reason {
+                SwapRefusal::OverlapExclusive => write!(
+                    f,
+                    "module '{module_id}' is declared overlap: \"exclusive\" (the default): two processes of it must not run at once, so it cannot be swapped; use a plain restart, or declare overlap: \"safe\" in its config if it really tolerates a second process"
+                ),
+                SwapRefusal::NotRegistered => write!(
+                    f,
+                    "module '{module_id}' is not registered, so there is no serving process to keep while a replacement warms; use a plain restart"
+                ),
+                SwapRefusal::ProtocolNone => write!(
+                    f,
+                    "module '{module_id}' is protocol: \"none\" and never registers, so a swap could never see its replacement become ready; use a plain restart"
+                ),
+                SwapRefusal::NotConfigured => write!(
+                    f,
+                    "module '{module_id}' cannot be swapped: the supervisor was built without the forwarding table or shared handle a swap needs"
+                ),
+                SwapRefusal::AlreadySwapping => {
+                    write!(f, "module '{module_id}' is already being swapped")
+                }
+            },
+            Self::SwapFailed {
+                module_id,
+                arm,
+                detail,
+                ..
+            } => write!(
+                f,
+                "swap of module '{module_id}' failed ({}): {detail}; the running process was left serving",
+                arm.as_str()
+            ),
         }
     }
 }
@@ -2529,7 +2958,9 @@ impl Error for SuperviseError {
             | Self::ReloadFailed { .. }
             | Self::RegistrationStillActive { .. }
             | Self::StatePoisoned { .. }
-            | Self::CommandClosed { .. } => None,
+            | Self::CommandClosed { .. }
+            | Self::SwapRefused { .. }
+            | Self::SwapFailed { .. } => None,
         }
     }
 }
@@ -2845,6 +3276,50 @@ async fn probe_module_health(
         // ask. That is the module being absent, not slow.
         HealthProbeError::lane_dead(format!("failed to begin health.check RPC: {err}"))
     })?;
+    await_health_probe(forwarding, pending, deadline, runtime.health.deadline).await
+}
+
+/// [`probe_module_health`] for one endpoint rather than the id's active one.
+///
+/// A swap probes two processes that no by-id lookup reaches: its candidate
+/// before cutover, and its superseded incumbent (for busy gauges) while the
+/// incumbent drains. `deadline_cap` bounds the probe the way a drain deadline
+/// bounds the by-id drain probe.
+async fn probe_endpoint_health(
+    endpoint: crate::ModuleEndpointId,
+    runtime: &SupervisorRuntimeConfig,
+    deadline_cap: Option<Instant>,
+) -> Result<HealthReport, HealthProbeError> {
+    let Some(forwarding) = runtime.forwarding.as_ref() else {
+        return Err(HealthProbeError::misconfigured(
+            "supervisor was not configured with a forwarding table",
+        ));
+    };
+    let probe_started_at = Instant::now();
+    let mut deadline = probe_started_at + runtime.health.deadline;
+    if let Some(cap) = deadline_cap {
+        deadline = deadline.min(cap);
+    }
+    let pending = forwarding
+        .begin_endpoint_health_probe_rpc_for(
+            endpoint,
+            MODULE_CONTROL_OP_HEALTH_CHECK,
+            probe_started_at,
+            deadline,
+        )
+        .map_err(|err| {
+            HealthProbeError::lane_dead(format!("failed to begin health.check RPC: {err}"))
+        })?;
+    await_health_probe(forwarding, pending, deadline, runtime.health.deadline).await
+}
+
+/// Send a begun health probe and classify its answer.
+async fn await_health_probe(
+    forwarding: &ForwardingTable,
+    pending: PendingModuleControlRpc,
+    deadline: Instant,
+    probe_budget: Duration,
+) -> Result<HealthReport, HealthProbeError> {
     let PendingModuleControlRpc {
         endpoint,
         module_sink,
@@ -2929,8 +3404,7 @@ async fn probe_module_health(
         Err(_) => {
             let _ = forwarding.tombstone_health_probe_rpc(endpoint, corr);
             Err(HealthProbeError::no_answer(format!(
-                "module did not answer health.check within {:?}",
-                runtime.health.deadline
+                "module did not answer health.check within {probe_budget:?}"
             )))
         }
     }
@@ -3346,6 +3820,7 @@ mod tests {
             reserved: false,
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
         });
 
         assert!(
@@ -3394,6 +3869,7 @@ mod tests {
             reserved: false,
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
         };
 
         let result = set_child_enabled(
@@ -3427,6 +3903,7 @@ mod tests {
             reserved: false,
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
         };
 
         let result = handle_reload_spawn_failure(
@@ -3457,6 +3934,7 @@ mod tests {
                 reserved: false,
                 reserved_prefixes: Vec::new(),
                 protocol: ModuleProtocol::Subc,
+                overlap: Default::default(),
             },
             supervisor.runtime_config(),
             Arc::clone(&snapshot),
@@ -3492,6 +3970,7 @@ mod tests {
             reserved: false,
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
         };
         let module = supervisor.supervised_module(
             initial.clone(),
@@ -3912,6 +4391,23 @@ async fn handle_supervisor_command(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = runtime.drain_timeout;
             let _ = reply.send(());
+            true
+        }
+        SupervisorCommand::Swap {
+            ready_timeout,
+            reply,
+        } => {
+            swap::run_swap(
+                spec,
+                runtime,
+                registry,
+                process_liveness,
+                snapshot,
+                child,
+                ready_timeout.unwrap_or(DEFAULT_SWAP_READY_TIMEOUT),
+                reply,
+            )
+            .await;
             true
         }
     }
@@ -4507,11 +5003,39 @@ fn untrack_if_registration_released(
 /// nonce. A `protocol: "none"` module gets neither, because it cannot use
 /// either and the argument would stop a stock binary from starting at all.
 /// `SUBC_MODULE_ID` is set on every path since an unread variable is inert.
+///
+/// The plain-spawn form, kept for the tests that assert its plan; spawns go
+/// through [`apply_wire_spawn_args_for_role`].
+#[cfg(test)]
 fn apply_wire_spawn_args(
     command: &mut Command,
     spec: &ModuleSpec,
     connection_file_path: Option<&std::path::Path>,
     handle: Option<&SupervisorHandle>,
+) -> Result<(), SuperviseError> {
+    apply_wire_spawn_args_for_role(
+        command,
+        spec,
+        connection_file_path,
+        handle,
+        SpawnRole::Plain,
+    )
+}
+
+/// [`apply_wire_spawn_args`] for either slot.
+///
+/// A plain spawn's nonce replaces the module's recorded spawn (and reserved)
+/// nonce, as every respawn always has. A swap candidate's nonce must leave
+/// those alone, because the incumbent is still serving and its consumers still
+/// attest with its nonce; it is recorded as the open swap's candidate token
+/// instead, and the recording happens before the process exists so its HELLO
+/// can never arrive ahead of it.
+fn apply_wire_spawn_args_for_role(
+    command: &mut Command,
+    spec: &ModuleSpec,
+    connection_file_path: Option<&std::path::Path>,
+    handle: Option<&SupervisorHandle>,
+    role: SpawnRole,
 ) -> Result<(), SuperviseError> {
     command.env(SUBC_MODULE_ID_ENV, &spec.module_id);
     if spec.protocol == ModuleProtocol::None {
@@ -4526,9 +5050,14 @@ fn apply_wire_spawn_args(
     // for HELLO id-squatting protection. A respawn rotates both records.
     let nonce = generate_launch_nonce()?;
     if let Some(handle) = handle {
-        handle.set_spawn_nonce(&spec.module_id, nonce.clone());
-        if spec.reserved {
-            handle.set_reserved_nonce(&spec.module_id, nonce.clone());
+        match role {
+            SpawnRole::Plain => {
+                handle.set_spawn_nonce(&spec.module_id, nonce.clone());
+                if spec.reserved {
+                    handle.set_reserved_nonce(&spec.module_id, nonce.clone());
+                }
+            }
+            SpawnRole::SwapCandidate => handle.open_swap(&spec.module_id, nonce.clone()),
         }
     }
     command.env(SUBC_LAUNCH_NONCE_ENV, nonce);
@@ -4537,6 +5066,13 @@ fn apply_wire_spawn_args(
 
 fn apply_child_env(command: &mut Command, spec: &ModuleSpec) {
     command.env_remove(CK_LOG_ENV);
+    // The spawn role is the supervisor's to set, and only on a swap candidate
+    // (see `apply_spawn_role`). Removing it here, rather than just not setting
+    // it, is what makes it absent on a plain spawn: the daemon's own
+    // environment could carry it, and so could a spec built outside daemon
+    // config (config refuses it as an `env` key). A module reading it on a
+    // plain restart would pick the long swap budget and leave callers waiting.
+    command.env_remove(SUBC_SPAWN_ROLE_ENV);
     for (key, value) in &spec.env {
         // cortexkit-log currently exposes retention only as a Rust struct, not
         // environment names. These values are daemon-private sink metadata and
@@ -4544,10 +5080,27 @@ fn apply_child_env(command: &mut Command, spec: &ModuleSpec) {
         if matches!(
             key.as_str(),
             CAPTURE_MAX_FILE_MB_ENV | CAPTURE_KEEP_ENV | CAPTURE_MAX_AGE_DAYS_ENV
-        ) {
+        ) || key == SUBC_SPAWN_ROLE_ENV
+        {
             continue;
         }
         command.env(key, value);
+    }
+}
+
+/// Which slot a spawn fills: the module's ordinary one, or the candidate slot
+/// of a blue/green swap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpawnRole {
+    Plain,
+    SwapCandidate,
+}
+
+/// Set the spawn role for a swap candidate. A plain spawn gets nothing here;
+/// `apply_child_env` has already removed the variable for every spawn.
+fn apply_spawn_role(command: &mut Command, role: SpawnRole) {
+    if role == SpawnRole::SwapCandidate {
+        command.env(SUBC_SPAWN_ROLE_ENV, SPAWN_ROLE_SWAP_CANDIDATE);
     }
 }
 
@@ -4558,6 +5111,38 @@ fn spawn_child(
     ring: &Arc<Mutex<StderrRing>>,
     capture_logs_dir: Option<&std::path::Path>,
     #[cfg(target_os = "linux")] cgroup_placement: Option<&subc_cgroup::Placement>,
+) -> Result<SupervisedChild, SuperviseError> {
+    spawn_child_in_slot(
+        spec,
+        connection_file_path,
+        handle,
+        ring,
+        capture_logs_dir,
+        #[cfg(target_os = "linux")]
+        cgroup_placement,
+        SpawnRole::Plain,
+        &spec.module_id,
+    )
+}
+
+/// Spawn one process of `spec` into a slot.
+///
+/// `slot_key` names the process's cgroup and its stderr capture file. A plain
+/// spawn uses the bare module id, as it always has. A swap candidate needs a
+/// different key from the process it is replacing, which is still alive: with
+/// the same key it would join the incumbent's cgroup (one kill domain, so
+/// killing a failed candidate could take the incumbent) and interleave into its
+/// capture file. See `swap::swap_slot_key`.
+#[allow(clippy::too_many_arguments)]
+fn spawn_child_in_slot(
+    spec: &ModuleSpec,
+    connection_file_path: Option<&std::path::Path>,
+    handle: Option<&SupervisorHandle>,
+    ring: &Arc<Mutex<StderrRing>>,
+    capture_logs_dir: Option<&std::path::Path>,
+    #[cfg(target_os = "linux")] cgroup_placement: Option<&subc_cgroup::Placement>,
+    role: SpawnRole,
+    slot_key: &str,
 ) -> Result<SupervisedChild, SuperviseError> {
     let mut command = Command::new(&spec.program);
     command.args(&spec.args);
@@ -4591,11 +5176,12 @@ fn spawn_child(
     // resolved CK_LOG into `spec.env`, which is applied below and therefore
     // wins over anything ambient.
     apply_child_env(&mut command, spec);
-    apply_wire_spawn_args(&mut command, spec, connection_file_path, handle)?;
+    apply_spawn_role(&mut command, role);
+    apply_wire_spawn_args_for_role(&mut command, spec, connection_file_path, handle, role)?;
 
     #[cfg(target_os = "linux")]
     let cgroup_path = cgroup_placement
-        .map(|placement| placement.module_path(&spec.module_id))
+        .map(|placement| placement.module_path(slot_key))
         .transpose()
         .map_err(|source| SuperviseError::Cgroup {
             module_id: spec.module_id.clone(),
@@ -4607,14 +5193,14 @@ fn spawn_child(
     if let Some(path) = &cgroup_path {
         if let Err(error) = apply_cgroup_placement(&mut command, spec, path) {
             if let Some(placement) = cgroup_placement {
-                remove_module_cgroup(placement, &spec.module_id);
+                remove_module_cgroup(placement, slot_key);
             }
             return Err(error);
         }
     }
 
     let output_sink = if let Some(logs_dir) = capture_logs_dir {
-        let path = logs_dir.join(format!("{}.stderr.log", spec.module_id));
+        let path = logs_dir.join(format!("{slot_key}.stderr.log"));
         match ChildOutputSink::open(&path, capture_retention(spec)) {
             Ok(sink) => sink,
             Err(error) => {
@@ -4639,7 +5225,7 @@ fn spawn_child(
         Err(source) => {
             #[cfg(target_os = "linux")]
             if let Some(placement) = cgroup_placement {
-                remove_module_cgroup(placement, &spec.module_id);
+                remove_module_cgroup(placement, slot_key);
             }
             return Err(SuperviseError::Spawn {
                 program: spec.program.clone(),
@@ -4698,7 +5284,7 @@ fn spawn_child(
     Ok(SupervisedChild {
         child,
         #[cfg(target_os = "linux")]
-        module_id: spec.module_id.clone(),
+        module_id: slot_key.to_string(),
         #[cfg(target_os = "linux")]
         cgroup_placement: cgroup_placement.cloned(),
         stdout_pump,
@@ -4847,10 +5433,31 @@ fn declared_busy_gauges(
     registry: &Registry,
     module_id: &str,
 ) -> Result<Vec<String>, SuperviseError> {
-    let Some(registration) = registry
-        .get_module(module_id)
-        .map_err(SuperviseError::Registry)?
-    else {
+    busy_gauges_of(
+        registry
+            .get_module(module_id)
+            .map_err(SuperviseError::Registry)?,
+    )
+}
+
+/// [`declared_busy_gauges`] for the registration a connection holds, in any
+/// slot: after cutover the incumbent is no longer the id's active
+/// registration, and its own manifest is the one that names its gauges.
+fn declared_busy_gauges_for_connection(
+    registry: &Registry,
+    connection_id: ConnectionId,
+) -> Result<Vec<String>, SuperviseError> {
+    busy_gauges_of(
+        registry
+            .get_module_by_connection(connection_id)
+            .map_err(SuperviseError::Registry)?,
+    )
+}
+
+fn busy_gauges_of(
+    registration: Option<crate::registry::ModuleRegistration>,
+) -> Result<Vec<String>, SuperviseError> {
+    let Some(registration) = registration else {
         return Ok(Vec::new());
     };
     let Some(self_signals) = registration.manifest.self_signals else {
@@ -4876,6 +5483,10 @@ fn declared_busy_gauges(
     Ok(gauges)
 }
 
+/// Wait for `endpoint` to have nothing in flight and, when the module declares
+/// busy gauges, for a health probe to report them quiet. The probe is addressed
+/// by `scope`: a swap's superseded incumbent must be asked about its own
+/// gauges, and by module id the probe would reach the promoted candidate.
 async fn wait_for_forwarding_quiescence(
     forwarding: &ForwardingTable,
     module_id: &str,
@@ -4883,6 +5494,7 @@ async fn wait_for_forwarding_quiescence(
     endpoint: crate::ModuleEndpointId,
     deadline: Instant,
     busy_gauges: &[String],
+    scope: DrainScope,
 ) -> Result<bool, SuperviseError> {
     let mut gauges_quiescent = busy_gauges.is_empty();
     let mut next_probe_at = Instant::now();
@@ -4891,7 +5503,13 @@ async fn wait_for_forwarding_quiescence(
     loop {
         let now = Instant::now();
         if !busy_gauges.is_empty() && now >= next_probe_at && now < deadline {
-            gauges_quiescent = match probe_module_health(module_id, runtime, Some(deadline)).await {
+            let report = match scope {
+                DrainScope::Active => probe_module_health(module_id, runtime, Some(deadline)).await,
+                DrainScope::Endpoint(endpoint) => {
+                    probe_endpoint_health(endpoint, runtime, Some(deadline)).await
+                }
+            };
+            gauges_quiescent = match report {
                 Ok(report) => match busy_gauge_observation(report.metrics.as_ref(), busy_gauges) {
                     BusyGaugeObservation::Quiescent => true,
                     BusyGaugeObservation::Busy => false,
@@ -5096,6 +5714,20 @@ struct ForwardingDrainContext<'a> {
     spec: &'a ModuleSpec,
     runtime: &'a SupervisorRuntimeConfig,
     registry: &'a Registry,
+    scope: DrainScope,
+}
+
+/// Which process a forwarding drain addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainScope {
+    /// Whatever endpoint is active for the module id: every plain stop,
+    /// restart and reload. Also moves the module's state to `Draining`.
+    Active,
+    /// One specific endpoint: a swap's incumbent after cutover. Draining it by
+    /// module id would resolve to the promoted candidate and leave neither
+    /// process routable. The module's state is left alone, since the promoted
+    /// candidate is what it describes and that process is running.
+    Endpoint(crate::ModuleEndpointId),
 }
 
 async fn begin_forwarding_drain(
@@ -5119,6 +5751,7 @@ async fn begin_forwarding_drain(
             spec,
             runtime,
             registry,
+            scope: DrainScope::Active,
         },
         snapshot,
         enabled,
@@ -5170,6 +5803,7 @@ async fn begin_forwarding_drain_with_timeout(
             spec,
             runtime,
             registry,
+            scope: DrainScope::Active,
         },
         snapshot,
         enabled,
@@ -5191,6 +5825,7 @@ async fn begin_forwarding_drain_with(
         spec,
         runtime,
         registry,
+        scope,
     } = context;
     debug_assert_ne!(reason, RouteCloseReason::Crash);
     let terminal = matches!(reason, RouteCloseReason::Disable);
@@ -5198,19 +5833,28 @@ async fn begin_forwarding_drain_with(
     let drain_deadline = drain_started_at + drain_timeout;
     let deadline_ms =
         unix_ms_now().saturating_add(u64::try_from(drain_timeout.as_millis()).unwrap_or(u64::MAX));
-    let busy_gauges = declared_busy_gauges(registry, &spec.module_id)?;
+    let busy_gauges = match scope {
+        DrainScope::Active => declared_busy_gauges(registry, &spec.module_id)?,
+        DrainScope::Endpoint(endpoint) => {
+            declared_busy_gauges_for_connection(registry, endpoint.connection_id)?
+        }
+    };
 
     // Admission gate first: route.open/commit and route REQUEST admission are closed
     // before the first quiescence check, so the outstanding count can only fall.
-    let drain_target = forwarding
-        .begin_module_drain(&spec.module_id, reason)
-        .map_err(SuperviseError::Forwarding)?;
-    update_snapshot(snapshot, Some(&spec.module_id), |state| {
-        state.state = ModuleState::Draining;
-        if let Some(enabled) = enabled {
-            state.enabled = enabled;
-        }
-    })?;
+    let drain_target = match scope {
+        DrainScope::Active => forwarding.begin_module_drain(&spec.module_id, reason),
+        DrainScope::Endpoint(endpoint) => forwarding.begin_endpoint_drain(endpoint, reason),
+    }
+    .map_err(SuperviseError::Forwarding)?;
+    if scope == DrainScope::Active {
+        update_snapshot(snapshot, Some(&spec.module_id), |state| {
+            state.state = ModuleState::Draining;
+            if let Some(enabled) = enabled {
+                state.enabled = enabled;
+            }
+        })?;
+    }
 
     if let Some(target) = drain_target.as_ref() {
         send_module_draining(&spec.module_id, reason, deadline_ms, target);
@@ -5240,6 +5884,7 @@ async fn begin_forwarding_drain_with(
             target.endpoint,
             drain_deadline,
             &busy_gauges,
+            scope,
         )
         .await;
         let drained = drained_after_quiescence_wait(&wait_result);
@@ -5954,6 +6599,9 @@ fn set_running(
         module_id: Some(module_id.to_string()),
     })?;
     state.spawn_generation = spawn_events.emit_spawned(module_id, child.pid, child.spawned_at_ms);
+    // Every caller of this is a plain spawn, which always uses the primary key;
+    // a promoted swap candidate sets the flag itself after this returns.
+    state.in_alternate_slot = false;
     state.state = ModuleState::Running;
     state.enabled = true;
     state.process_alive = true;
@@ -6132,6 +6780,7 @@ mod terminal_history_tests {
             reserved: true,
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
         });
         assert!(
             supervisor
@@ -6155,6 +6804,7 @@ mod terminal_history_tests {
             reserved: true,
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
         });
         assert!(supervisor
             .reserved_hello_rejection("never-spawned", Some("minted"))
@@ -6331,6 +6981,7 @@ mod terminal_history_tests {
                 reserved: false,
                 reserved_prefixes: Vec::new(),
                 protocol: ModuleProtocol::Subc,
+                overlap: Default::default(),
             })
             .unwrap();
         update_snapshot(
@@ -6359,6 +7010,7 @@ mod terminal_history_tests {
             reserved: false,
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
         });
 
         assert!(
@@ -6444,6 +7096,7 @@ mod terminal_history_tests {
                 reserved: false,
                 reserved_prefixes: Vec::new(),
                 protocol: ModuleProtocol::Subc,
+                overlap: Default::default(),
             })
             .unwrap();
 
@@ -6491,6 +7144,7 @@ mod terminal_history_tests {
                 reserved: false,
                 reserved_prefixes: Vec::new(),
                 protocol: ModuleProtocol::Subc,
+                overlap: Default::default(),
             })
             .unwrap();
 
@@ -6545,6 +7199,7 @@ mod terminal_history_tests {
             reserved: false,
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
         };
 
         let crash_snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
@@ -6634,6 +7289,7 @@ mod terminal_history_tests {
             reserved: false,
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
         };
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
         let process = ProcessIdentity {
@@ -6686,6 +7342,7 @@ mod terminal_history_tests {
             reserved: false,
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
         };
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
 
@@ -6730,6 +7387,7 @@ mod terminal_history_tests {
             reserved: false,
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
         }
     }
 
@@ -6994,6 +7652,7 @@ mod terminal_history_tests {
             reserved: false,
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
         };
         let mut child = spawn_and_mark_running(&spec, &runtime, &snapshot).unwrap();
         let process = ProcessIdentity {
@@ -7055,6 +7714,7 @@ mod terminal_history_tests {
             reserved: false,
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
         };
         let child = spawn_and_mark_running(&spec, &runtime, &snapshot).unwrap();
 
@@ -7274,6 +7934,7 @@ mod health_tombstone_tests {
             reserved: false,
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
         };
         let module = supervisor
             .supervise_configured(spec.clone(), false)
@@ -7434,8 +8095,9 @@ mod health_tombstone_tests {
 #[cfg(test)]
 mod child_env_tests {
     use super::{
-        apply_child_env, apply_wire_spawn_args, ModuleProtocol, ModuleSpec, SupervisorHandle,
-        SUBC_ARG, SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV,
+        apply_child_env, apply_spawn_role, apply_wire_spawn_args, ModuleProtocol, ModuleSpec,
+        SpawnRole, SupervisorHandle, SPAWN_ROLE_SWAP_CANDIDATE, SUBC_ARG, SUBC_LAUNCH_NONCE_ENV,
+        SUBC_MODULE_ID_ENV, SUBC_SPAWN_ROLE_ENV,
     };
     use std::{ffi::OsStr, path::PathBuf};
     use tokio::process::Command;
@@ -7449,6 +8111,7 @@ mod child_env_tests {
             reserved: false,
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
         }
     }
 
@@ -7567,6 +8230,48 @@ mod child_env_tests {
             .get_envs()
             .any(|(key, value)| key == OsStr::new(SUBC_LAUNCH_NONCE_ENV) && value.is_some()));
         assert!(handle.spawn_nonce(&wire_spec.module_id).is_some());
+    }
+
+    /// A plain spawn EXPLICITLY REMOVES the spawn role, even when the module's
+    /// spec tries to set it; only a swap candidate carries it.
+    ///
+    /// "Set it only on candidates" is not enough, because spawn applies the
+    /// spec's env verbatim and the daemon's own environment is inherited: either
+    /// could hand a plain restart the swap role, and a module reading it would
+    /// warm on its long swap budget while callers wait. Asserted as an explicit
+    /// removal (`(key, None)`), not mere absence, for the reason the `CK_LOG`
+    /// test above gives.
+    #[test]
+    fn plain_spawn_removes_the_spawn_role_even_when_the_spec_sets_it() {
+        let role = |command: &Command| {
+            command
+                .as_std()
+                .get_envs()
+                .filter(|(key, _)| *key == OsStr::new(SUBC_SPAWN_ROLE_ENV))
+                .last()
+                .map(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+        };
+        let forged = spec(vec![(
+            SUBC_SPAWN_ROLE_ENV.to_string(),
+            SPAWN_ROLE_SWAP_CANDIDATE.to_string(),
+        )]);
+
+        let mut plain = Command::new("/nonexistent");
+        apply_child_env(&mut plain, &forged);
+        apply_spawn_role(&mut plain, SpawnRole::Plain);
+        assert_eq!(
+            role(&plain),
+            Some(None),
+            "a plain spawn must remove SUBC_SPAWN_ROLE, whatever the spec says"
+        );
+
+        let mut candidate = Command::new("/nonexistent");
+        apply_child_env(&mut candidate, &spec(Vec::new()));
+        apply_spawn_role(&mut candidate, SpawnRole::SwapCandidate);
+        assert_eq!(
+            role(&candidate),
+            Some(Some(SPAWN_ROLE_SWAP_CANDIDATE.to_string()))
+        );
     }
 
     /// Daemon-private capture retention keys never reach the child.
@@ -7731,6 +8436,7 @@ mod cgroup_placement_tests {
                 reserved: false,
                 reserved_prefixes: Vec::new(),
                 protocol: ModuleProtocol::Subc,
+                overlap: Default::default(),
             },
             path,
         )

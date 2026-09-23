@@ -364,7 +364,7 @@ const MODULE_HELP: &str = "ck module — inspect and control supervised modules\
     --tag <tag>             show one canonical tag
     --level <level>         show this level and more severe levels
     --lane <source>         select module, stderr, daemon, or a harness lane
-  ck module stderr <id>     retained stderr for a module (-n <count> to limit)\n  ck module terminals <id>  retained terminal exits for a module\n  ck module restart <id>    drain-restart a module\n    --now                   restart without waiting for in-flight requests\n    --drain-ms <n>          wait up to <n> ms for in-flight requests (this restart only)\n  ck module stop <id>       disable and stop a module (persists until start)\n  ck module start <id>      enable and spawn a module\n  ck module rescan          re-read subc.jsonc and reconcile the module set\n  ck module rescan --dry-run  show what a rescan would change, without changing it\n  ck module release <id>    forget a removed module's reserved id so another module may use it\n\nexit codes:\n  1  operation refused or failed (including read-only timeout)\n  4  mutating operation timed out; outcome unknown, verify before retrying";
+  ck module stderr <id>     retained stderr for a module (-n <count> to limit)\n  ck module terminals <id>  retained terminal exits for a module\n  ck module restart <id>    drain-restart a module\n    --now                   restart without waiting for in-flight requests\n    --drain-ms <n>          wait up to <n> ms for in-flight requests (this restart only)\n    --swap                  blue/green: start the replacement beside the running process,\n                            cut over when it is ready, then drain the old one (needs\n                            overlap: \"safe\" in the module's config)\n    --ready-ms <n>          with --swap: how long the replacement may take to be ready\n  ck module stop <id>       disable and stop a module (persists until start)\n  ck module start <id>      enable and spawn a module\n  ck module rescan          re-read subc.jsonc and reconcile the module set\n  ck module rescan --dry-run  show what a rescan would change, without changing it\n  ck module release <id>    forget a removed module's reserved id so another module may use it\n\nexit codes:\n  1  operation refused or failed (including read-only timeout)\n  4  mutating operation timed out; outcome unknown, verify before retrying";
 
 const CATALOG_HELP: &str = "ck catalog — what is registered with the daemon right now\n\nusage: ck [--json] catalog [<module-id>]\n\n  ck catalog         every module registered on the wire\n  ck catalog <id>    one module, exit 1 if it is not registered\n\nThis is the REGISTRY, not the supervisor roster: a module that connected and\nregistered itself appears here even though the daemon did not spawn it, so\n'ck module list' will not show it. Harnesses waiting for a module to come up\nshould poll this.";
 
@@ -513,6 +513,10 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
             module_id,
             drain_timeout_ms,
         }) => module_restart(&mut client, &module_id, drain_timeout_ms, args.json).await,
+        Command::Module(ModuleCommand::Swap {
+            module_id,
+            ready_timeout_ms,
+        }) => module_swap(&mut client, &module_id, ready_timeout_ms, args.json).await,
         Command::Module(ModuleCommand::Rescan { preview }) => {
             module_rescan(&mut client, args.json, preview).await
         }
@@ -1088,6 +1092,13 @@ enum ModuleCommand {
         /// `Some(ms)` overrides the module's configured drain budget for this
         /// one restart; `Some(0)` (from --now) skips the drain entirely.
         drain_timeout_ms: Option<u64>,
+    },
+    /// `ck module restart <id> --swap`: a blue/green restart.
+    Swap {
+        module_id: String,
+        /// How long the replacement may take to become ready; `None` sends no
+        /// field and takes the daemon's default.
+        ready_timeout_ms: Option<u64>,
     },
     Rescan {
         preview: bool,
@@ -2168,6 +2179,53 @@ fn parse_drain_override(tail: &[std::ffi::OsString]) -> Result<Option<u64>, CkEr
     }
 }
 
+/// `--swap` and `--ready-ms <N>` on `ck module restart`. Returns `None` when
+/// the restart is a plain one, `Some(ready_timeout_ms)` for a swap.
+///
+/// The drain flags are refused alongside `--swap` rather than ignored: a swap
+/// drains the old process only after the new one is serving, on the module's
+/// configured budget, so `--now` would not mean what it says. `--ready-ms`
+/// without `--swap` is refused for the same reason.
+fn parse_swap_request(tail: &[OsString]) -> Result<Option<Option<u64>>, CkError> {
+    let swap = tail.iter().any(|t| t == "--swap");
+    let mut ready_ms: Option<u64> = None;
+    let mut iter = tail.iter();
+    while let Some(token) = iter.next() {
+        if token == "--ready-ms" {
+            let value = iter.next().ok_or_else(|| {
+                CkError::Usage(format!(
+                    "--ready-ms needs a millisecond count\n\n{MODULE_HELP}"
+                ))
+            })?;
+            ready_ms = Some(
+                value
+                    .to_str()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .ok_or_else(|| {
+                        CkError::Usage(format!(
+                            "--ready-ms '{}' is not a millisecond count\n\n{MODULE_HELP}",
+                            value.to_string_lossy()
+                        ))
+                    })?,
+            );
+        }
+    }
+    if !swap {
+        return match ready_ms {
+            Some(_) => Err(CkError::Usage(format!(
+                "--ready-ms applies only to --swap\n\n{MODULE_HELP}"
+            ))),
+            None => Ok(None),
+        };
+    }
+    if tail.iter().any(|t| t == "--now" || t == "--drain-ms") {
+        return Err(CkError::Usage(format!(
+            "--swap drains the old process only after the new one is serving, on the module's configured budget; --now and --drain-ms do not apply\n\n{MODULE_HELP}"
+        )));
+    }
+    Ok(Some(ready_ms))
+}
+
 fn parse_module_logs(tail: &[OsString]) -> Result<(Option<String>, ModuleLogsOptions), CkError> {
     let mut module_id = None;
     let mut options = ModuleLogsOptions {
@@ -2509,6 +2567,42 @@ async fn module_restart(
         // module can settle instead of deadlocking the drain. The state column
         // above is therefore usually "restarting"; completion is a status read.
         println!("restart initiated; verify: ck module status {module_id}");
+    }
+    Ok(())
+}
+
+async fn module_swap(
+    client: &mut CkClient,
+    module_id: &str,
+    ready_timeout_ms: Option<u64>,
+    json_output: bool,
+) -> Result<(), CkError> {
+    // The daemon answers when the swap has cut over or failed, which can take
+    // as long as the replacement's readiness budget, so the wait is sized
+    // from that budget rather than from the ordinary control timeout.
+    let ready_budget = ready_timeout_ms
+        .map(Duration::from_millis)
+        .unwrap_or(subc_daemon::DEFAULT_SWAP_READY_TIMEOUT);
+    let response_timeout = ready_budget + CONTROL_RESPONSE_TIMEOUT;
+    let ack = client
+        .mutating_rpc_value(
+            ClientControlRequest::SupervisorSwap {
+                module_id: module_id.to_string(),
+                ready_timeout_ms,
+            },
+            response_timeout,
+            format!("ck module restart {module_id} --swap"),
+            format!("ck module status {module_id}"),
+        )
+        .await?;
+    print_ack_with_state(client, module_id, ack, "swap", json_output).await?;
+    if !json_output {
+        // The reply means CUT OVER: new routes land on the replacement. The old
+        // process drains after the reply, so its routes close over the next
+        // drain budget.
+        println!(
+            "swap cut over; the old process is draining. verify: ck module status {module_id}"
+        );
     }
     Ok(())
 }
@@ -6791,9 +6885,15 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
                 // never settles, so waiting only delays recovery); --drain-ms N
                 // widens/narrows the wait for this one restart. Flag-less form
                 // sends no override so older daemons keep accepting the request.
-                "restart" => ModuleCommand::Restart {
-                    module_id: id(1)?,
-                    drain_timeout_ms: parse_drain_override(tail)?,
+                "restart" => match parse_swap_request(tail)? {
+                    Some(ready_timeout_ms) => ModuleCommand::Swap {
+                        module_id: id(1)?,
+                        ready_timeout_ms,
+                    },
+                    None => ModuleCommand::Restart {
+                        module_id: id(1)?,
+                        drain_timeout_ms: parse_drain_override(tail)?,
+                    },
                 },
                 "stop" => ModuleCommand::Stop { module_id: id(1)? },
                 "start" => ModuleCommand::Start { module_id: id(1)? },
@@ -7344,6 +7444,38 @@ mod tests {
             assert!(parse_drain_override(&tail(&["aft", "--now", "--drain-ms", "5"])).is_err());
             assert!(parse_drain_override(&tail(&["aft", "--drain-ms"])).is_err());
             assert!(parse_drain_override(&tail(&["aft", "--drain-ms", "soon"])).is_err());
+        }
+    }
+
+    mod swap_request {
+        use super::super::parse_swap_request;
+        use std::ffi::OsString;
+
+        fn tail(tokens: &[&str]) -> Vec<OsString> {
+            tokens.iter().map(OsString::from).collect()
+        }
+
+        #[test]
+        fn swap_is_opt_in_and_carries_its_own_ready_budget() {
+            assert_eq!(parse_swap_request(&tail(&["aft"])).unwrap(), None);
+            assert_eq!(
+                parse_swap_request(&tail(&["aft", "--swap"])).unwrap(),
+                Some(None)
+            );
+            assert_eq!(
+                parse_swap_request(&tail(&["aft", "--swap", "--ready-ms", "5000"])).unwrap(),
+                Some(Some(5000))
+            );
+        }
+
+        /// Flags that belong to the other kind of restart are refused rather
+        /// than silently ignored.
+        #[test]
+        fn drain_flags_with_swap_and_ready_budget_without_it_are_refused() {
+            assert!(parse_swap_request(&tail(&["aft", "--swap", "--now"])).is_err());
+            assert!(parse_swap_request(&tail(&["aft", "--swap", "--drain-ms", "5"])).is_err());
+            assert!(parse_swap_request(&tail(&["aft", "--ready-ms", "5"])).is_err());
+            assert!(parse_swap_request(&tail(&["aft", "--swap", "--ready-ms"])).is_err());
         }
     }
 

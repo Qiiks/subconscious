@@ -485,6 +485,69 @@ The swap entry points carry `expect(dead_code)` outside tests; wiring them in
 C makes that expectation fail, and `clippy -D warnings` then forces its
 removal.
 
+### Slice C landed: what it decided
+
+The swap runs inside the module's supervise loop, like a restart
+(`supervise_swap.rs`). `supervisor.swap` is answered at cutover or failure;
+the incumbent drains after the answer, so a caller whose own lane rides the
+incumbent is not waiting on a drain that waits on it.
+
+B's seven obligations:
+
+1. HELLO: a swap gate runs before the reserved gate. While a swap is open for
+   an id, the candidate's nonce registers through `register_candidate_*`
+   (registry, then forwarding, the ordinary HELLO's order); the incumbent's
+   own nonce falls through to the ordinary gates; anything else, including no
+   nonce, is refused `swap_token_invalid`. The token admits one registration.
+2. Readiness is read from the candidate's registration by its connection. The
+   one health probe of the candidate (sent only if it advertises
+   `health.check`) is endpoint-keyed, as is the busy-gauge probe of the
+   draining incumbent.
+3. Not changed. `route_census`, `live_roots` and `catalog.list` show only the
+   promoted process after cutover; the incumbent's draining routes still get
+   `route.closing`/`route.closed`, and its routes are gone within one drain
+   budget.
+4. Not changed. Ordinary registration of an id with an open swap is now gated
+   by the swap token, which covers the window where it matters.
+5. Not changed: the incumbent never queries `LiveRoots` after cutover in this
+   sequence.
+6. Forwarding cutover first, then registry promotion. Every route.open reads
+   the registry and then reserves under the forwarding write lock, and the
+   reservation alone picks the process: in the gap a route.open reads the
+   incumbent's registration and lands on the candidate, which is ready and is
+   the process the module now is. With this order the registry never names a
+   process forwarding does not already route to. If the candidate vanishes
+   between the two calls, the incumbent cannot be restored (B has no
+   un-supersede), so the swap reports `cutover_lost` and falls back to a plain
+   restart.
+7. `drain_child_to_state` was not threaded; the incumbent is retired by its own
+   function, which drains with `begin_endpoint_drain` (reason `Restart`),
+   reaps the process, and waits for release by `Connection`. The module's
+   state is not touched, since it describes the promoted candidate.
+
+The open health-probe question: the candidate gets the same probe once
+before cutover (`failing` or no usable answer fails the swap, `degraded` does
+not). No swap failure spends a restart-budget unit: a failed candidate is
+classified and reaped on its own path and never reaches `next_crash_restart`.
+
+If the incumbent's registration goes away while the candidate warms, the
+candidate is promoted as soon as it has registered, ready or not.
+
+Found against the design:
+
+- `overlap` is not mirrored on the manifest: that is a subc-protocol field,
+  outside this slice. It lives in `ModuleSpec` and `subc.jsonc` only, and
+  `catalog.update` carries no overlap field, so it is frozen by construction.
+- The candidate's cgroup and capture file alternate between `<id>` and
+  `<id>@swap`: after cutover the promoted process keeps its key, so the next
+  swap's candidate takes the other one.
+- The candidate emits no spawn event until cutover (the spawn feed holds one
+  live process per id); the superseded incumbent's exit is emitted for its own
+  generation without clearing the promoted process's entry. Its stderr goes to
+  the module's one stderr ring, marked by a process-start boundary.
+- The default readiness budget is 100 s (aft's 90 s swap ceiling plus start
+  and HELLO); `ready_timeout_ms` overrides it per request.
+
 ### What rung 3 does not do
 
 - No transparent route migration. Routes close and reopen.

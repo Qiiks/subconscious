@@ -1305,6 +1305,7 @@ mod tests {
             reserved: false,
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::None,
+            overlap: Default::default(),
             health: HealthConfig::default(),
             drain_timeout_ms: None,
             route_bind_relay_timeout_ms: None,

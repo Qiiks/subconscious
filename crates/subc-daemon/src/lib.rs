@@ -57,9 +57,11 @@ pub use server::{
 pub use subc_protocol::{Frame, FrameBuildError};
 pub use subc_transport::{read_frame, write_frame, FrameIoError, ReadStage};
 pub use supervise::{
-    ExitKind, ExitReport, HealthAction, HealthConfig, ModuleHealthStatus, ModuleProcessLiveness,
-    ModuleSpec, ModuleState, ModuleStatus, RestartPolicy, SuperviseError, SupervisedModule,
-    Supervisor, SupervisorHandle, SupervisorProcessLiveness, DEFAULT_DRAIN_TIMEOUT, SUBC_ARG,
+    ExitKind, ExitReport, HealthAction, HealthConfig, ModuleHealthStatus, ModuleOverlap,
+    ModuleProcessLiveness, ModuleSpec, ModuleState, ModuleStatus, RestartPolicy, SuperviseError,
+    SupervisedModule, Supervisor, SupervisorHandle, SupervisorProcessLiveness, SwapFailureArm,
+    SwapRefusal, DEFAULT_DRAIN_TIMEOUT, DEFAULT_SWAP_READY_TIMEOUT, SPAWN_ROLE_SWAP_CANDIDATE,
+    SUBC_ARG, SUBC_SPAWN_ROLE_ENV,
 };
 pub use watchdog::{
     DaemonSelfWatchdog, DaemonSelfWatchdogConfig, WatchdogStage, WatchdogTickError,

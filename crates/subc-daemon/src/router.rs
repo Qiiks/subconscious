@@ -1118,6 +1118,7 @@ mod tests {
                     reserved: false,
                     reserved_prefixes: Vec::new(),
                     protocol: ModuleProtocol::Subc,
+                    overlap: Default::default(),
                 },
                 false,
             )

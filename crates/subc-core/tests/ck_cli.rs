@@ -3111,6 +3111,7 @@ fn stub_spec_with_env(module_id: &str, env: Vec<(&str, &str)>) -> ModuleSpec {
         reserved: false,
         reserved_prefixes: Vec::new(),
         protocol: ModuleProtocol::Subc,
+        overlap: Default::default(),
     }
 }
 
@@ -3290,6 +3291,7 @@ async fn spawn_quota_stub(
             reserved: false,
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
         })
         .unwrap();
     wait_for_supervisor_entry(&server.connection_file_path, module_id, |entry| {

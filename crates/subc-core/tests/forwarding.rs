@@ -14,10 +14,11 @@ use subc_control::{
     SupervisorHealthStatus,
 };
 use subc_daemon::{
-    read_frame, server::CONNECTION_EGRESS_BUFFER, test_support::TestTempDir, write_frame, ExitKind,
-    ForwardingTable, Frame, HealthAction, HealthConfig, ModuleSpec, ModuleState, ModuleStatus,
-    Registry, RestartPolicy, SupervisedModule, Supervisor, SupervisorHandle,
-    SupervisorProcessLiveness,
+    read_frame, server::CONNECTION_EGRESS_BUFFER, stderr_tail::TailEntry,
+    test_support::TestTempDir, write_frame, ExitKind, ForwardingTable, Frame, HealthAction,
+    HealthConfig, ModuleOverlap, ModuleSpec, ModuleState, ModuleStatus, Registry, RestartPolicy,
+    SuperviseError, SupervisedModule, Supervisor, SupervisorHandle, SupervisorProcessLiveness,
+    SwapFailureArm,
 };
 use subc_protocol::{
     error_codes,
@@ -7948,6 +7949,7 @@ fn never_connecting_spec(
             reserved: false,
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::None,
+            overlap: Default::default(),
         },
         ready,
     )
@@ -7997,6 +7999,7 @@ where
         reserved: false,
         reserved_prefixes: Vec::new(),
         protocol: ModuleProtocol::Subc,
+        overlap: Default::default(),
     }
 }
 
@@ -8333,4 +8336,431 @@ async fn run_e2e_bench_cell(
         p99_ms: to_ms(all[idx(0.99)]),
         throughput: total_calls as f64 / wall.as_secs_f64(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Blue/green swap (`supervisor.swap`).
+//
+// Each test starts an incumbent whose stub writes its events to one file, then
+// changes the module's spec (as a rescan would) so the swap's candidate writes
+// to another. Which file an `attach` or `draining` event lands in is therefore
+// which process received the route or the drain.
+// ---------------------------------------------------------------------------
+
+fn swap_spec<K, V, I>(server: &TestServer, module_id: &str, env: I) -> ModuleSpec
+where
+    K: Into<String>,
+    V: Into<String>,
+    I: IntoIterator<Item = (K, V)>,
+{
+    let mut spec = stub_spec_with_env(server, module_id, env);
+    spec.overlap = ModuleOverlap::Safe;
+    spec
+}
+
+fn events_of_kind(path: &Path, kind: &str) -> usize {
+    stub_events(path)
+        .iter()
+        .filter(|event| event["kind"] == kind)
+        .count()
+}
+
+async fn wait_for_candidate(
+    registry: &Registry,
+    module_id: &str,
+    wait: Duration,
+) -> subc_daemon::ModuleRegistration {
+    let deadline = Instant::now() + wait;
+    loop {
+        if let Some(registration) = registry.get_candidate(module_id).unwrap() {
+            return registration;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no swap candidate for {module_id} registered within {wait:?}"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn send_swap(module_id: &str, corr: u64, ready_timeout_ms: u64) -> Frame {
+    control_request_frame(
+        corr,
+        ClientControlRequest::SupervisorSwap {
+            module_id: module_id.to_string(),
+            ready_timeout_ms: Some(ready_timeout_ms),
+        },
+    )
+}
+
+/// The full swap on the stub: the candidate registers unroutable, flips
+/// ready, cutover sends new route.opens to it, and the incumbent is drained
+/// with reason `restart` and exits. Also pins the spawn role end to end: the
+/// incumbent's spec tries to set `SUBC_SPAWN_ROLE` and the process sees it
+/// unset; the candidate sees `swap_candidate`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn swap_cuts_new_routes_over_to_a_ready_candidate_and_drains_the_incumbent() {
+    let module_id = "fake-aft-swap-e2e";
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let incumbent_events = server.stub_events_path("swap-e2e-incumbent");
+    let candidate_events = server.stub_events_path("swap-e2e-candidate");
+    let ready_gate = server.temp_dir.join("swap-e2e-ready");
+    let module = supervisor
+        .spawn(swap_spec(
+            &server,
+            module_id,
+            [
+                (
+                    "FAKE_AFT_EVENTS_PATH",
+                    incumbent_events.to_string_lossy().into_owned(),
+                ),
+                ("FAKE_AFT_ECHO_ENV", "SUBC_SPAWN_ROLE".to_string()),
+                ("SUBC_SPAWN_ROLE", "swap_candidate".to_string()),
+            ],
+        ))
+        .unwrap();
+    let incumbent = wait_for_registration(&server.registry, module_id, SETUP_TIMEOUT).await;
+    let incumbent_status = module.status().unwrap();
+
+    let project = TestProject::new();
+    let mut before_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    let before = attach_on_stream(
+        &mut before_client,
+        &project,
+        1,
+        "ses-swap-before",
+        module_id,
+    )
+    .await;
+    assert_eq!(events_of_kind(&incumbent_events, "attach"), 1);
+
+    module
+        .update_spec_for_test(swap_spec(
+            &server,
+            module_id,
+            [
+                (
+                    "FAKE_AFT_EVENTS_PATH",
+                    candidate_events.to_string_lossy().into_owned(),
+                ),
+                ("FAKE_AFT_READY_FALSE", "1".to_string()),
+                (
+                    "FAKE_AFT_READY_UPDATE_PATH",
+                    ready_gate.to_string_lossy().into_owned(),
+                ),
+                ("FAKE_AFT_ECHO_ENV", "SUBC_SPAWN_ROLE".to_string()),
+            ],
+        ))
+        .await
+        .unwrap();
+    let mut control = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    write_frame(&mut control, &send_swap(module_id, 2, 10_000))
+        .await
+        .unwrap();
+    control.flush().await.unwrap();
+
+    // Registered, not ready, and not routable: a route.open still lands on the
+    // incumbent.
+    let candidate = wait_for_candidate(&server.registry, module_id, SETUP_TIMEOUT).await;
+    assert!(!candidate.ready);
+    assert_ne!(candidate.connection_id, incumbent.connection_id);
+    let mut during_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    attach_on_stream(
+        &mut during_client,
+        &project,
+        3,
+        "ses-swap-during",
+        module_id,
+    )
+    .await;
+    assert_eq!(events_of_kind(&incumbent_events, "attach"), 2);
+    assert_eq!(events_of_kind(&candidate_events, "attach"), 0);
+
+    // Ready: the swap cuts over and answers.
+    fs::write(&ready_gate, b"ready").unwrap();
+    assert!(read_supervisor_ack_on_stream(&mut control, 2, module_id).await);
+    let promoted = server.registry.get_module(module_id).unwrap().unwrap();
+    assert_eq!(promoted.connection_id, candidate.connection_id);
+
+    let mut after_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    attach_on_stream(&mut after_client, &project, 4, "ses-swap-after", module_id).await;
+    assert_eq!(events_of_kind(&candidate_events, "attach"), 1);
+    assert_eq!(events_of_kind(&incumbent_events, "attach"), 2);
+
+    // The incumbent is drained as a restart, by its endpoint, and exits.
+    let closing = read_frame_timeout(&mut before_client).await;
+    assert_route_lifecycle_push(
+        &closing,
+        "route.closing",
+        module_id,
+        "restart",
+        None,
+        None,
+        None,
+    );
+    let closed = read_frame_timeout(&mut before_client).await;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&closed.body).unwrap()["op"],
+        "route.closed"
+    );
+    let goodbye = read_frame_timeout(&mut before_client).await;
+    assert_eq!(goodbye.header.ty, FrameType::Goodbye);
+    assert_eq!(goodbye.header.channel, before.route_channel);
+    wait_for_stub_event(&incumbent_events, SETUP_TIMEOUT, |event| {
+        event["kind"] == "draining" && event["reason"] == "restart"
+    })
+    .await;
+    let deadline = Instant::now() + SETUP_TIMEOUT;
+    while server
+        .registry
+        .get_module_by_connection(incumbent.connection_id)
+        .unwrap()
+        .is_some()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the incumbent never deregistered"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        events_of_kind(&candidate_events, "draining"),
+        0,
+        "the promoted candidate must not be drained"
+    );
+
+    let status = wait_for_status(&module, SETUP_TIMEOUT, |status| {
+        status.state == ModuleState::Running && status.pid != incumbent_status.pid
+    })
+    .await;
+    assert_eq!(status.restart_count, incumbent_status.restart_count);
+    assert!(status.spawn_generation > incumbent_status.spawn_generation);
+
+    let tail = module.stderr_tail(None, None);
+    let roles = tail
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            TailEntry::Line { text, .. } if text.starts_with("echo-env SUBC_SPAWN_ROLE=") => {
+                Some(text.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        roles,
+        [
+            "echo-env SUBC_SPAWN_ROLE=<UNSET>",
+            "echo-env SUBC_SPAWN_ROLE=swap_candidate"
+        ],
+        "a plain spawn must not carry the spawn role even when its spec sets it"
+    );
+    module.stop().await.unwrap();
+}
+
+/// Design mutation arm (i). A candidate that never declares itself ready
+/// fails the swap, and the incumbent is left serving and UNDRAINED: its
+/// consumers see no `route.closing`, and it was never told to drain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn swap_whose_candidate_never_becomes_ready_leaves_the_incumbent_undrained() {
+    let module_id = "fake-aft-swap-never-ready";
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let incumbent_events = server.stub_events_path("swap-never-ready-incumbent");
+    let candidate_events = server.stub_events_path("swap-never-ready-candidate");
+    let module = supervisor
+        .spawn(swap_spec(
+            &server,
+            module_id,
+            [(
+                "FAKE_AFT_EVENTS_PATH",
+                incumbent_events.to_string_lossy().into_owned(),
+            )],
+        ))
+        .unwrap();
+    let incumbent = wait_for_registration(&server.registry, module_id, SETUP_TIMEOUT).await;
+    let project = TestProject::new();
+    let mut route_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    attach_on_stream(&mut route_client, &project, 1, "ses-never-ready", module_id).await;
+
+    module
+        .update_spec_for_test(swap_spec(
+            &server,
+            module_id,
+            [
+                (
+                    "FAKE_AFT_EVENTS_PATH",
+                    candidate_events.to_string_lossy().into_owned(),
+                ),
+                ("FAKE_AFT_READY_FALSE", "1".to_string()),
+            ],
+        ))
+        .await
+        .unwrap();
+    let mut control = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    write_frame(&mut control, &send_swap(module_id, 2, 500))
+        .await
+        .unwrap();
+    control.flush().await.unwrap();
+
+    // Watch the incumbent's consumer across the whole readiness budget and
+    // past it, BEFORE reading the swap's answer: a drain of the incumbent
+    // would begin right after the answer, so this is where it would show.
+    if let Ok(frame) = timeout(Duration::from_millis(1500), read_frame(&mut route_client)).await {
+        let frame = frame.unwrap().expect("route connection stays open");
+        panic!(
+            "the incumbent's consumer received {:?} during a failed swap; the incumbent was drained",
+            serde_json::from_slice::<Value>(&frame.body)
+                .ok()
+                .and_then(|body| body.get("op").cloned())
+        );
+    }
+    let error = read_control_error_on_stream(&mut control, 2, "swap_failed").await;
+    assert_eq!(error.detail.unwrap()["arm"], "never_ready");
+    assert_eq!(
+        events_of_kind(&incumbent_events, "draining"),
+        0,
+        "a failed swap must never drain the incumbent"
+    );
+    assert!(server.registry.get_candidate(module_id).unwrap().is_none());
+    assert_eq!(
+        server
+            .registry
+            .get_module(module_id)
+            .unwrap()
+            .unwrap()
+            .connection_id,
+        incumbent.connection_id
+    );
+    // Still serving: a fresh route.open lands on the incumbent.
+    let mut next_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    attach_on_stream(
+        &mut next_client,
+        &project,
+        3,
+        "ses-never-ready-next",
+        module_id,
+    )
+    .await;
+    assert_eq!(events_of_kind(&incumbent_events, "attach"), 2);
+    module.stop().await.unwrap();
+}
+
+/// A candidate that dies while warming is reaped on its own path: it spends
+/// no unit of the module's crash budget, adds nothing to its lifetime restart
+/// ledger, and leaves the incumbent `running` with the same process.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn swap_candidate_dying_mid_warm_spends_no_restart_budget() {
+    let module_id = "fake-aft-swap-dies-warming";
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module = supervisor
+        .spawn(swap_spec(
+            &server,
+            module_id,
+            std::iter::empty::<(&str, &str)>(),
+        ))
+        .unwrap();
+    let incumbent = wait_for_registration(&server.registry, module_id, SETUP_TIMEOUT).await;
+    let before = module.status().unwrap();
+
+    module
+        .update_spec_for_test(swap_spec(
+            &server,
+            module_id,
+            [
+                ("FAKE_AFT_READY_FALSE", "1"),
+                ("FAKE_AFT_CRASH_AFTER_MS", "200"),
+            ],
+        ))
+        .await
+        .unwrap();
+    let error = module
+        .swap(Some(Duration::from_secs(10)))
+        .await
+        .expect_err("a candidate that crashes while warming fails the swap");
+    match error {
+        SuperviseError::SwapFailed {
+            arm,
+            candidate_exit,
+            ..
+        } => {
+            assert_eq!(arm, SwapFailureArm::CandidateExited);
+            assert_eq!(candidate_exit.unwrap().kind, ExitKind::Crash);
+        }
+        other => panic!("expected SwapFailed, got {other:?}"),
+    }
+
+    let after = module.status().unwrap();
+    assert_eq!(after.state, ModuleState::Running);
+    assert_eq!(after.pid, before.pid);
+    assert_eq!(after.restart_count, before.restart_count);
+    assert_eq!(after.lifetime_restarts, before.lifetime_restarts);
+    assert_eq!(after.spawn_generation, before.spawn_generation);
+    assert_eq!(after.last_exit, before.last_exit);
+    assert!(server.registry.get_candidate(module_id).unwrap().is_none());
+    assert_eq!(
+        server
+            .registry
+            .get_module(module_id)
+            .unwrap()
+            .unwrap()
+            .connection_id,
+        incumbent.connection_id
+    );
+    // And the supervise loop is not left believing the module crashed: it
+    // stays running with the same process well past the respawn backoff.
+    sleep(Duration::from_millis(200)).await;
+    let settled = module.status().unwrap();
+    assert_eq!(settled.state, ModuleState::Running);
+    assert_eq!(settled.pid, before.pid);
+    assert_eq!(settled.restart_count, before.restart_count);
+    module.stop().await.unwrap();
+}
+
+/// `overlap` defaults to exclusive, and a swap of an exclusive module is
+/// refused before anything is spawned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn swap_of_an_exclusive_module_is_refused_and_spawns_nothing() {
+    let module_id = "fake-aft-swap-exclusive";
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module = spawn_stub(&server, &supervisor, module_id).await;
+    let before = module.status().unwrap();
+
+    let mut control = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    write_frame(&mut control, &send_swap(module_id, 1, 10_000))
+        .await
+        .unwrap();
+    control.flush().await.unwrap();
+    let error = read_control_error_on_stream(&mut control, 1, "swap_refused").await;
+    assert_eq!(error.detail.unwrap()["reason"], "overlap_exclusive");
+    assert!(
+        error.message.contains("exclusive"),
+        "the refusal names the declaration: {}",
+        error.message
+    );
+
+    let after = module.status().unwrap();
+    assert_eq!(after.spawn_generation, before.spawn_generation);
+    assert_eq!(after.pid, before.pid);
+    assert!(server.registry.get_candidate(module_id).unwrap().is_none());
+    module.stop().await.unwrap();
 }

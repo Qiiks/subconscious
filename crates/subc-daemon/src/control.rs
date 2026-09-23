@@ -53,7 +53,7 @@ use crate::{
     stderr_tail::{CaptureState, TailEntry},
     supervise::{
         validate_spec, ModuleProcessLiveness, ReservedHelloRejection, SpawnSubscribeRefusal,
-        SupervisorHandle,
+        SupervisorHandle, SwapHelloAdmission,
     },
     ConnectedClients, DaemonCounters, Frame, ProjectRootId, Supervisor,
 };
@@ -80,6 +80,7 @@ const SUBC_CONTROL_OPS: &[&str] = &[
     ops::ROUTE_CLOSED,
     ops::SUPERVISOR_LIST,
     ops::SUPERVISOR_RESTART,
+    ops::SUPERVISOR_SWAP,
     ops::SUPERVISOR_RELOAD,
     ops::SUPERVISOR_RESCAN,
     ops::SUPERVISOR_RELEASE_RESERVED,
@@ -1515,15 +1516,48 @@ impl ControlHandler {
             }
         };
 
+        // Swap gate, ahead of the reserved gate on purpose. While a blue/green
+        // swap is open for this id, the only HELLO admitted as a second process
+        // is the one carrying the candidate's launch nonce (the swap token), and
+        // it registers into the candidate slot rather than being refused as a
+        // duplicate. Run after the reserved gate, a reserved module's candidate
+        // would be refused `reserved_module` for presenting a nonce that gate
+        // does not know. See `SupervisorHandle::swap_hello_admission`.
+        let swap_admission = self
+            .supervisor
+            .swap_hello_admission(&hello.manifest.module_id, hello.launch_nonce.as_deref());
+        if swap_admission == SwapHelloAdmission::Refused {
+            warn!(
+                module_id = %hello.manifest.module_id,
+                connection_id = connection_id.get(),
+                "HELLO refused: a swap is open for this module_id and the launch nonce is not one the supervisor minted for it"
+            );
+            return Ok(vec![control_error_frame(
+                &frame,
+                "swap_token_invalid",
+                format!(
+                    "module_id '{}' is being swapped; HELLO without the swap candidate's launch nonce is rejected",
+                    hello.manifest.module_id
+                ),
+            )?]);
+        }
+        let swap_candidate = swap_admission == SwapHelloAdmission::Candidate;
+
         // Reserved-module identity gate: a module_id configured `reserved` may be
         // registered ONLY by the process subc spawned for it, proven by echoing the
         // one-time launch nonce subc injected. A non-reserved id has no recorded
         // nonce and always passes. This blocks a key-holder from impersonating a
         // security-boundary module (e.g. the credential vault) while the real one is
-        // down/restarting and its registration slot is momentarily free.
-        if let Some(rejection) = self
-            .supervisor
-            .reserved_hello_rejection(&hello.manifest.module_id, hello.launch_nonce.as_deref())
+        // down/restarting and its registration slot is momentarily free. A swap
+        // candidate has already proven the same thing with its own nonce above.
+        if let Some(rejection) = (!swap_candidate)
+            .then(|| {
+                self.supervisor.reserved_hello_rejection(
+                    &hello.manifest.module_id,
+                    hello.launch_nonce.as_deref(),
+                )
+            })
+            .flatten()
         {
             let message = match rejection {
                 ReservedHelloRejection::Exact { module_id } => format!(
@@ -1577,6 +1611,16 @@ impl ControlHandler {
         }
 
         let control_ops = effective_module_control_ops(hello.control_ops);
+        if swap_candidate {
+            return self.register_swap_candidate(
+                connection_id,
+                sink,
+                &frame,
+                hello.manifest,
+                negotiated_ver,
+                control_ops,
+            );
+        }
         let registration = match self.registry.register_with_control_ops(
             hello.manifest,
             negotiated_ver,
@@ -1680,6 +1724,96 @@ impl ControlHandler {
             "module registered"
         );
 
+        self.hello_ack(&frame, negotiated_ver, &registration.manifest.module_id)
+    }
+
+    /// Register a HELLO the swap gate admitted into the candidate slot of the
+    /// registry and of forwarding, where it is reachable over its own
+    /// connection (its `catalog.update` finds it) but by no by-id lookup, so
+    /// nothing routes to it until the supervisor cuts over.
+    ///
+    /// Registry first, then forwarding, the same order as an ordinary HELLO;
+    /// a forwarding failure removes the registry entry again. The capability
+    /// census is not run: it describes routable modules, and this one is not
+    /// routable until promotion.
+    fn register_swap_candidate(
+        &self,
+        connection_id: ConnectionId,
+        sink: Option<crate::FrameSink>,
+        frame: &Frame,
+        manifest: ModuleManifest,
+        negotiated_ver: u8,
+        control_ops: Vec<String>,
+    ) -> Result<Vec<Frame>, RouterError> {
+        let module_id = manifest.module_id.clone();
+        let registration = match self.registry.register_candidate_with_control_ops(
+            manifest,
+            negotiated_ver,
+            connection_id,
+            control_ops,
+        ) {
+            Ok(registration) => registration,
+            Err(RegistryError::DuplicateModuleId { module_id }) => {
+                return Ok(vec![control_error_frame(
+                    frame,
+                    "duplicate_module_id",
+                    format!(
+                        "module_id '{module_id}' already has a swap candidate registered; duplicate HELLO rejected"
+                    ),
+                )?])
+            }
+            Err(err @ RegistryError::PathHazardModuleId { .. }) => {
+                return Ok(vec![control_error_frame(
+                    frame,
+                    "invalid_module_id",
+                    err.to_string(),
+                )?])
+            }
+            Err(err) => {
+                return Ok(vec![control_error_frame(
+                    frame,
+                    "registry_error",
+                    err.to_string(),
+                )?])
+            }
+        };
+        if let Some(sink) = sink {
+            let concurrency = manifest_concurrency(&registration.manifest);
+            if let Err(err) = self.forwarding.register_candidate_module_connection(
+                connection_id,
+                module_id.clone(),
+                negotiated_ver,
+                concurrency,
+                sink,
+            ) {
+                if matches!(self.deregister_connection(connection_id), Ok(r) if !r.is_empty()) {
+                    crate::supervise::notify_registration_release();
+                }
+                return Ok(vec![control_error_frame(
+                    frame,
+                    forwarding_error_code(&err),
+                    err.to_string(),
+                )?]);
+            }
+        }
+        self.supervisor.mark_swap_candidate_admitted(&module_id);
+        info!(
+            module_id = %module_id,
+            module_version = %registration.manifest.module_version,
+            negotiated_ver,
+            ready = registration.ready,
+            connection_id = connection_id.get(),
+            "swap candidate registered; not routable until cutover"
+        );
+        self.hello_ack(frame, negotiated_ver, &module_id)
+    }
+
+    fn hello_ack(
+        &self,
+        frame: &Frame,
+        negotiated_ver: u8,
+        module_id: &str,
+    ) -> Result<Vec<Frame>, RouterError> {
         let ack = ModuleHelloAckBody {
             negotiated_ver,
             subc_ops: module_subc_ops(),
@@ -1687,7 +1821,7 @@ impl ControlHandler {
             storage: self
                 .storage_config
                 .as_ref()
-                .map(|cfg| cfg.descriptor_for(&registration.manifest.module_id)),
+                .map(|cfg| cfg.descriptor_for(module_id)),
         };
         let body = serde_json::to_vec(&ack).map_err(|err| {
             RouterError::backend(
@@ -1757,6 +1891,13 @@ impl ControlHandler {
                 drain_timeout_ms,
             } => {
                 self.handle_supervisor_restart(frame, module_id, drain_timeout_ms)
+                    .await
+            }
+            ClientControlRequest::SupervisorSwap {
+                module_id,
+                ready_timeout_ms,
+            } => {
+                self.handle_supervisor_swap(frame, module_id, ready_timeout_ms)
                     .await
             }
             ClientControlRequest::SupervisorReload { module_id } => {
@@ -3169,6 +3310,70 @@ impl ControlHandler {
         )?])
     }
 
+    /// `supervisor.swap`. Answered when the swap has cut over or failed, not
+    /// when the old process has finished draining: a caller whose own lane
+    /// rides the old process must get its reply before that drain waits on it.
+    async fn handle_supervisor_swap(
+        &self,
+        frame: Frame,
+        module_id: String,
+        ready_timeout_ms: Option<u64>,
+    ) -> Result<Vec<Frame>, RouterError> {
+        let operation_lock = self.supervisor.operation_lock();
+        let _operation_guard = operation_lock.lock().await;
+        let Some(module) = self.supervisor.get(&module_id) else {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "unknown_module",
+                format!("module_id '{module_id}' is not supervised"),
+            )?]);
+        };
+
+        if let Err(err) = module
+            .swap(ready_timeout_ms.map(Duration::from_millis))
+            .await
+        {
+            use crate::supervise::SuperviseError;
+            let message = err.to_string();
+            let error = match err {
+                SuperviseError::Disabled { .. } => ErrorBody::new("module_disabled", message),
+                SuperviseError::SwapRefused { reason, .. } => ErrorBody {
+                    code: "swap_refused".to_string(),
+                    message,
+                    detail: Some(serde_json::json!({ "reason": reason.as_str() })),
+                },
+                SuperviseError::SwapFailed {
+                    arm,
+                    candidate_exit,
+                    ..
+                } => ErrorBody {
+                    code: "swap_failed".to_string(),
+                    message,
+                    detail: Some(serde_json::json!({
+                        "arm": arm.as_str(),
+                        "candidate_exit_code": candidate_exit.as_ref().and_then(|exit| exit.code),
+                        "candidate_exit_signal": candidate_exit.as_ref().and_then(|exit| exit.signal),
+                    })),
+                },
+                _ => ErrorBody::new(
+                    "target_unavailable",
+                    format!("failed to swap module_id '{module_id}': {message}"),
+                ),
+            };
+            return Ok(vec![control_error_body_frame(&frame, error)?]);
+        }
+
+        let response = ClientControlResponse::SupervisorAck {
+            module_id,
+            applied: true,
+        };
+        Ok(vec![control_response_body_frame(
+            &frame,
+            &response,
+            "ClientControlResponse::SupervisorAck",
+        )?])
+    }
+
     async fn handle_supervisor_reload(
         &self,
         frame: Frame,
@@ -4480,6 +4685,7 @@ fn client_control_request_op(request: &ClientControlRequest) -> &'static str {
         ClientControlRequest::SupervisorSpawnSnapshot {} => ops::SUPERVISOR_SPAWN_SNAPSHOT,
         ClientControlRequest::SupervisorSpawnSubscribe { .. } => ops::SUPERVISOR_SPAWN_SUBSCRIBE,
         ClientControlRequest::SupervisorRestart { .. } => ops::SUPERVISOR_RESTART,
+        ClientControlRequest::SupervisorSwap { .. } => ops::SUPERVISOR_SWAP,
         ClientControlRequest::SupervisorReload { .. } => ops::SUPERVISOR_RELOAD,
         ClientControlRequest::SupervisorRescan { .. } => ops::SUPERVISOR_RESCAN,
         ClientControlRequest::SupervisorReleaseReserved { .. } => ops::SUPERVISOR_RELEASE_RESERVED,
@@ -5541,6 +5747,7 @@ mod tests {
                 reserved: false,
                 reserved_prefixes: Vec::new(),
                 protocol: ModuleProtocol::Subc,
+                overlap: Default::default(),
             })
             .unwrap();
 
@@ -5630,6 +5837,7 @@ mod tests {
                 reserved: false,
                 reserved_prefixes: Vec::new(),
                 protocol: ModuleProtocol::Subc,
+                overlap: Default::default(),
             })
             .unwrap();
 
@@ -7724,6 +7932,7 @@ mod tests {
                     reserved: false,
                     reserved_prefixes: Vec::new(),
                     protocol: ModuleProtocol::Subc,
+                    overlap: Default::default(),
                 },
                 true,
             )
@@ -7771,6 +7980,7 @@ mod tests {
                     reserved: false,
                     reserved_prefixes: Vec::new(),
                     protocol: ModuleProtocol::Subc,
+                    overlap: Default::default(),
                 },
                 true,
             )
@@ -7941,6 +8151,7 @@ mod tests {
                     reserved: false,
                     reserved_prefixes: Vec::new(),
                     protocol: ModuleProtocol::Subc,
+                    overlap: Default::default(),
                 },
                 true,
             )
@@ -8041,6 +8252,7 @@ mod tests {
                     reserved: false,
                     reserved_prefixes: Vec::new(),
                     protocol: ModuleProtocol::Subc,
+                    overlap: Default::default(),
                 },
                 false,
             )
@@ -9451,6 +9663,170 @@ mod tests {
                     .connection_id,
                 INCUMBENT
             );
+        }
+    }
+
+    /// The HELLO gate while the supervisor has a swap open: only the nonce it
+    /// minted for the candidate admits a second process, into the candidate
+    /// slot, and that check runs ahead of the reserved-module gate.
+    mod swap_admission {
+        use super::*;
+
+        const INCUMBENT_NONCE: &str = "incumbent-nonce";
+        const CANDIDATE_NONCE: &str = "candidate-nonce";
+
+        fn handler_with_incumbent(
+            module_id: &str,
+            reserved: bool,
+        ) -> (Arc<Registry>, SupervisorHandle, ControlHandler) {
+            let registry = Arc::new(Registry::default());
+            let supervisor = SupervisorHandle::new();
+            supervisor.set_spawn_nonce(module_id, INCUMBENT_NONCE.to_string());
+            if reserved {
+                supervisor.set_reserved_nonce(module_id, INCUMBENT_NONCE.to_string());
+            }
+            let handler =
+                ControlHandler::new(Arc::clone(&registry)).with_supervisor(supervisor.clone());
+            let incumbent = handler
+                .handle_control(
+                    ConnectionId::new(1),
+                    hello_frame_with_nonce(module_id, PROTOCOL_VERSION, 1, Some(INCUMBENT_NONCE)),
+                )
+                .unwrap();
+            assert_eq!(incumbent[0].header.ty, FrameType::HelloAck);
+            supervisor.open_swap(module_id, CANDIDATE_NONCE.to_string());
+            (registry, supervisor, handler)
+        }
+
+        /// Design mutation arm (ii). On an UNRESERVED id the reserved gate
+        /// admits every nonce, so while a swap is open the swap gate is the only
+        /// thing between a key-holder and the candidate slot. A nonce the
+        /// supervisor did not mint, or none at all, is refused, and neither the
+        /// incumbent's registration nor the candidate slot moves.
+        #[test]
+        fn unminted_nonce_on_an_unreserved_id_with_an_open_swap_is_refused() {
+            let (registry, _supervisor, handler) = handler_with_incumbent("aft", false);
+
+            for (connection, nonce) in [(2, Some("forged")), (3, None)] {
+                let replies = handler
+                    .handle_control(
+                        ConnectionId::new(connection),
+                        hello_frame_with_nonce("aft", PROTOCOL_VERSION, connection, nonce),
+                    )
+                    .unwrap();
+                assert_eq!(replies[0].header.ty, FrameType::Error);
+                assert_eq!(
+                    parse_error(&replies[0])["code"],
+                    "swap_token_invalid",
+                    "nonce {nonce:?}"
+                );
+            }
+            assert!(registry.get_candidate("aft").unwrap().is_none());
+            assert_eq!(
+                registry.get_module("aft").unwrap().unwrap().connection_id,
+                ConnectionId::new(1)
+            );
+
+            // Control: the minted token is admitted, into the candidate slot,
+            // and only once.
+            let admitted = handler
+                .handle_control(
+                    ConnectionId::new(4),
+                    hello_frame_with_nonce("aft", PROTOCOL_VERSION, 4, Some(CANDIDATE_NONCE)),
+                )
+                .unwrap();
+            assert_eq!(admitted[0].header.ty, FrameType::HelloAck);
+            assert_eq!(
+                registry
+                    .get_candidate("aft")
+                    .unwrap()
+                    .unwrap()
+                    .connection_id,
+                ConnectionId::new(4)
+            );
+            assert_eq!(
+                registry.get_module("aft").unwrap().unwrap().connection_id,
+                ConnectionId::new(1),
+                "the candidate must not take the active slot"
+            );
+            let replayed = handler
+                .handle_control(
+                    ConnectionId::new(5),
+                    hello_frame_with_nonce("aft", PROTOCOL_VERSION, 5, Some(CANDIDATE_NONCE)),
+                )
+                .unwrap();
+            assert_eq!(parse_error(&replayed[0])["code"], "swap_token_invalid");
+
+            // The case only this gate covers: the incumbent has died mid-swap,
+            // so its duplicate refusal is gone too, and without the gate a
+            // key-holder would take the id's ACTIVE slot.
+            handler.cleanup_connection(ConnectionId::new(1)).unwrap();
+            let squatter = handler
+                .handle_control(
+                    ConnectionId::new(6),
+                    hello_frame_with_nonce("aft", PROTOCOL_VERSION, 6, Some("forged")),
+                )
+                .unwrap();
+            assert_eq!(parse_error(&squatter[0])["code"], "swap_token_invalid");
+            assert!(
+                registry.get_module("aft").unwrap().is_none(),
+                "a squatter took the active slot of an id being swapped"
+            );
+        }
+
+        /// Design mutation arm (iii). A reserved module's candidate presents a
+        /// nonce the reserved gate has never seen (that gate holds the
+        /// incumbent's), so the swap gate must run first or the candidate is
+        /// refused `reserved_module` and a reserved module can never be swapped.
+        #[test]
+        fn reserved_module_candidate_is_admitted_ahead_of_the_reserved_gate() {
+            let (registry, _supervisor, handler) = handler_with_incumbent("vault", true);
+
+            let replies = handler
+                .handle_control(
+                    ConnectionId::new(2),
+                    hello_frame_with_nonce("vault", PROTOCOL_VERSION, 2, Some(CANDIDATE_NONCE)),
+                )
+                .unwrap();
+
+            assert_eq!(
+                replies[0].header.ty,
+                FrameType::HelloAck,
+                "reserved candidate refused: {:?}",
+                serde_json::from_slice::<Value>(&replies[0].body).ok()
+            );
+            assert_eq!(
+                registry
+                    .get_candidate("vault")
+                    .unwrap()
+                    .unwrap()
+                    .connection_id,
+                ConnectionId::new(2)
+            );
+        }
+
+        /// With no swap open the gate is inert: the incumbent's reserved gate
+        /// and duplicate refusal behave exactly as before.
+        #[test]
+        fn without_an_open_swap_the_ordinary_gates_decide() {
+            let (registry, supervisor, handler) = handler_with_incumbent("vault", true);
+            supervisor.close_swap("vault");
+
+            let candidate = handler
+                .handle_control(
+                    ConnectionId::new(2),
+                    hello_frame_with_nonce("vault", PROTOCOL_VERSION, 2, Some(CANDIDATE_NONCE)),
+                )
+                .unwrap();
+            assert_eq!(parse_error(&candidate[0])["code"], "reserved_module");
+            let duplicate = handler
+                .handle_control(
+                    ConnectionId::new(3),
+                    hello_frame_with_nonce("vault", PROTOCOL_VERSION, 3, Some(INCUMBENT_NONCE)),
+                )
+                .unwrap();
+            assert_eq!(parse_error(&duplicate[0])["code"], "duplicate_module_id");
+            assert!(registry.get_candidate("vault").unwrap().is_none());
         }
     }
 }

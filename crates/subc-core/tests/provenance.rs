@@ -220,6 +220,7 @@ async fn supervisor_provenance_detects_replaced_executable_image() {
             reserved: false,
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
         })
         .unwrap();
     wait_for_registration(&daemon, "provenance-replacement").await;
@@ -254,6 +255,7 @@ fn stub_spec(module_id: &str, env: Vec<(&str, &str)>) -> ModuleSpec {
         reserved: false,
         reserved_prefixes: Vec::new(),
         protocol: ModuleProtocol::Subc,
+        overlap: Default::default(),
     }
 }
 

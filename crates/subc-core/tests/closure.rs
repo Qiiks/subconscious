@@ -729,6 +729,7 @@ fn stub_spec_with_env(module_id: &str, extra_env: Vec<(&str, String)>) -> Module
         reserved: false,
         reserved_prefixes: Vec::new(),
         protocol: ModuleProtocol::Subc,
+        overlap: Default::default(),
     }
 }
 
@@ -755,6 +756,7 @@ fn thin_core_ops() -> BTreeSet<&'static str> {
         ops::ROUTE_CLOSED,
         ops::SUPERVISOR_LIST,
         ops::SUPERVISOR_RESTART,
+        ops::SUPERVISOR_SWAP,
         ops::SUPERVISOR_RELOAD,
         ops::SUPERVISOR_RESCAN,
         ops::SUPERVISOR_RELEASE_RESERVED,
