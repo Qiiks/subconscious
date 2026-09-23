@@ -42,17 +42,18 @@ if ! git merge-base "$BASE" HEAD >/dev/null 2>&1; then
   exit 2
 fi
 
-# The crates other repos actually path-depend on. Derived by sweeping sibling
-# manifests for `path = "../subconscious/crates/<name>"` rather than assumed;
-# re-derive with that sweep rather than editing from memory.
-CRATES=(
-  subc-protocol
-  subc-transport
-  subc-core
-  subc-control
-  subc-jsonc
-  subc-client-rs
-)
+# Every crate in the workspace, derived from the tree at run time. This used to
+# be a hand-kept list of "the crates other repos path-depend on", with a comment
+# asking to re-derive it by sweep. It drifted anyway: when subc-daemon was split
+# out (2026-09-19) it never joined the list, although six sibling repos
+# path-depend on it, so a subc-daemon version regression passed this check
+# twice over (2026-09-23). CI cannot see the siblings to derive the consumed set,
+# and checking a crate nobody consumes costs one version bump, while missing a
+# consumed one costs a silent lock rewrite in another repo. So: all of them.
+CRATES=()
+for dir in crates/*/; do
+  [ -f "$dir/Cargo.toml" ] && [ -d "$dir/src" ] && CRATES+=("$(basename "$dir")")
+done
 
 examined=0
 violations=0
@@ -73,10 +74,49 @@ if ! git diff --quiet HEAD -- crates/ 2>/dev/null; then
   echo "  committed history only ($BASE...HEAD) and does not see them." >&2
 fi
 
+# Versions are compared as values against the merge base, not detected as "a
+# version line was added". The line test read a DECREASE as a bump: on
+# 2026-09-23 a cherry-picked commit reset subc-daemon from 0.20.8 to 0.20.7
+# (its worker restored the manifest to its own older base), the diff carried
+# `+version = "0.20.7"`, this check passed, and master shipped a version that
+# already named different code. Path consumers' locks rewrote silently.
+merge_base=$(git merge-base "$BASE" HEAD 2>&1)
+if [ $? -ne 0 ]; then
+  echo "  merge-base $BASE HEAD failed: $merge_base -- refusing" >&2
+  exit 2
+fi
+
+# version_of <rev> <manifest>: the package version at that revision, or empty
+# when the manifest did not exist there (a new crate).
+version_of() {
+  git show "$1:$2" 2>/dev/null | grep -m1 -E '^version[[:space:]]*=' | sed -E 's/.*"(.*)".*/\1/'
+}
+
+# 0 when $2 is strictly greater than $1 (semver-ordered via sort -V).
+version_gt() {
+  [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$2" ]
+}
+
 for crate in "${CRATES[@]}"; do
   src="crates/$crate/src"
   manifest="crates/$crate/Cargo.toml"
   [ -d "$src" ] || continue
+
+  # A version must never go backwards, whether or not the crate's code changed
+  # in this range: a lower number re-names code a consumer may already have
+  # locked under the higher one.
+  base_version=$(version_of "$merge_base" "$manifest")
+  head_version=$(version_of HEAD "$manifest")
+  if [ -n "$base_version" ] && [ -n "$head_version" ] \
+    && [ "$base_version" != "$head_version" ] \
+    && ! version_gt "$base_version" "$head_version"; then
+    echo "  $crate: version went BACKWARDS, $base_version -> $head_version"
+    echo "      a version number already published to path consumers now names different code."
+    echo "      set $manifest above $base_version."
+    violations=$((violations + 1))
+    examined=$((examined + 1))
+    continue
+  fi
 
   # Every added/removed line under src/, minus the diff's own +++/--- headers.
   # A rename or a pure move shows up here too, which is correct: a consumer
@@ -111,10 +151,10 @@ for crate in "${CRATES[@]}"; do
     echo "  $crate: manifest diff failed: $manifest_diff -- refusing" >&2
     exit 2
   fi
-  # grep -c rather than -q: see verify-running-image.sh. Under pipefail an
-  # early-closing consumer inverts the check on any input large enough that the
-  # producer is still writing -- a big manifest diff is exactly that.
-  if [ "$(printf '%s\n' "$manifest_diff" | grep -cE '^\+version[[:space:]]*=')" -gt 0 ]; then
+  # Moved means strictly INCREASED against the merge base; a decrease was
+  # refused above. The diff is still read so a failed comparison refuses.
+  : "$manifest_diff"
+  if [ -z "$base_version" ] || version_gt "$base_version" "$head_version"; then
     continue
   fi
 
@@ -134,7 +174,7 @@ if [ "$examined" -eq 0 ]; then
 fi
 
 if [ "$violations" -gt 0 ]; then
-  echo "  $violations of $examined cross-repo crates changed without a version bump"
+  echo "  $violations of $examined cross-repo crates changed without a version bump, or moved backwards"
   exit 1
 fi
 
