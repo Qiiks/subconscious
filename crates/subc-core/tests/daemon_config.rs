@@ -1758,6 +1758,7 @@ async fn an_unset_capture_dir_captures_nowhere() {
     // this test: that file can exist only if this daemon wrote it, so the
     // assertion is about this run rather than about the machine.
     let leaked = subc_daemon::daemon_config::daemon_run_dir()
+        .expect("the test environment has an absolute data home")
         .join("logs")
         .join(format!("{module_id}.stderr.log"));
 

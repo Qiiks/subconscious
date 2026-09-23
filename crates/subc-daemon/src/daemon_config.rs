@@ -570,8 +570,13 @@ pub fn load_logging(path: impl AsRef<Path>) -> Result<Option<LoggingConfig>, Dae
 /// deployment: a directory it cannot chmod belongs to someone else, and refusing
 /// to boot over a permission bit would trade a reconnaissance leak for an
 /// outage. The caller logs what it could not do.
+///
+/// A run directory that cannot be resolved (see [`daemon_run_dir`]) is reported
+/// as an `InvalidInput` I/O error rather than created under the working
+/// directory.
 pub fn ensure_daemon_run_dir_private() -> Result<PathBuf, io::Error> {
-    let path = daemon_run_dir();
+    let path = daemon_run_dir()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
     ensure_directory_private(&path)?;
     Ok(path)
 }
@@ -608,16 +613,57 @@ fn ensure_directory_private(path: &Path) -> Result<(), io::Error> {
 }
 
 /// Existing per-user daemon run directory (`<data-home>/cortexkit/run`).
-pub fn daemon_run_dir() -> PathBuf {
-    let path = default_data_home().join("cortexkit").join("run");
-    if path.is_absolute() {
-        path
-    } else {
-        env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(path)
+///
+/// Refuses a relative data home (HOME and XDG_DATA_HOME both unset, or a
+/// relative XDG_DATA_HOME) instead of resolving it against the working
+/// directory. Resolving it there once wrote a stray `.local/` tree into a crate
+/// directory and dirtied a release build: the run directory holds the
+/// connection file, the terminal journal and the daemon's logs, so it must not
+/// depend on where a process happened to be started. The storage data home is
+/// refused at config parse for the same reason.
+pub fn daemon_run_dir() -> Result<PathBuf, DaemonRunDirError> {
+    daemon_run_dir_from(default_data_home())
+}
+
+/// The policy half of [`daemon_run_dir`], taking the data home as a parameter so
+/// a test can drive both outcomes without touching the process environment.
+fn daemon_run_dir_from(data_home: PathBuf) -> Result<PathBuf, DaemonRunDirError> {
+    if !data_home.is_absolute() {
+        return Err(DaemonRunDirError::RelativeDataHome { data_home });
+    }
+    Ok(data_home.join("cortexkit").join("run"))
+}
+
+/// Why the daemon run directory could not be resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonRunDirError {
+    /// The data home resolved to a relative path, which would place the run
+    /// directory under whatever directory the process was started from.
+    RelativeDataHome { data_home: PathBuf },
+}
+
+impl fmt::Display for DaemonRunDirError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RelativeDataHome { data_home } => write!(
+                f,
+                "cannot resolve the daemon run directory: the data home `{}` is relative, \
+                 so it would land under the current working directory; {}",
+                data_home.display(),
+                DATA_HOME_REMEDY
+            ),
+        }
     }
 }
+
+impl std::error::Error for DaemonRunDirError {}
+
+/// Which environment variables make the data home absolute on this platform.
+#[cfg(windows)]
+const DATA_HOME_REMEDY: &str =
+    "set XDG_DATA_HOME to an absolute path, or set APPDATA, USERPROFILE or HOME";
+#[cfg(not(windows))]
+const DATA_HOME_REMEDY: &str = "set XDG_DATA_HOME to an absolute path, or set HOME";
 
 fn read_config_doc(path: &Path) -> Result<Option<String>, DaemonConfigError> {
     match fs::read_to_string(path) {
@@ -1439,6 +1485,39 @@ mod tests {
                 None => env::remove_var(k),
             }
         }
+    }
+
+    /// A relative data home is what `default_data_home` returns when HOME and
+    /// XDG_DATA_HOME are both unset (the golden fixture pins `.local/share`), or
+    /// when XDG_DATA_HOME itself is relative. Either must be refused, never
+    /// joined onto the working directory.
+    #[test]
+    fn daemon_run_dir_refuses_a_relative_data_home_and_names_the_variables() {
+        for data_home in [PathBuf::from(".local/share"), PathBuf::from("relative-xdg")] {
+            let error = daemon_run_dir_from(data_home.clone())
+                .expect_err("a relative data home must be refused");
+            assert_eq!(
+                error,
+                DaemonRunDirError::RelativeDataHome {
+                    data_home: data_home.clone()
+                }
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains("XDG_DATA_HOME") && message.contains("HOME"),
+                "the refusal must name the variables to set: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn daemon_run_dir_under_an_absolute_data_home_is_cortexkit_run() {
+        let data_home = env::temp_dir().join("subc-run-dir-probe").join("data");
+        assert!(data_home.is_absolute());
+        assert_eq!(
+            daemon_run_dir_from(data_home.clone()),
+            Ok(data_home.join("cortexkit").join("run"))
+        );
     }
 
     /// Same harness as the data-home golden, over the config-home ladder. The two

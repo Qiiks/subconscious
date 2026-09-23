@@ -1592,7 +1592,6 @@ fn last_log_timestamp(path: &Path) -> String {
 
 fn discover_log_sources(module_id: &str, include_rotated: bool) -> Result<Vec<LogSource>, CkError> {
     let module_logs = FleetLogConfig::for_module(module_id).logs_dir;
-    let run_logs = subc_daemon::daemon_config::daemon_run_dir().join("logs");
     let mut sources = Vec::new();
     collect_sources_in_dir(
         &module_logs,
@@ -1601,7 +1600,19 @@ fn discover_log_sources(module_id: &str, include_rotated: bool) -> Result<Vec<Lo
         false,
         &mut sources,
     )?;
-    collect_sources_in_dir(&run_logs, module_id, include_rotated, true, &mut sources)?;
+    // The daemon's capture lane lives in the run directory. When that cannot be
+    // resolved (a relative data home), say so and still show the module's own
+    // logs rather than reading capture files relative to the working directory.
+    match subc_daemon::daemon_config::daemon_run_dir() {
+        Ok(run_dir) => collect_sources_in_dir(
+            &run_dir.join("logs"),
+            module_id,
+            include_rotated,
+            true,
+            &mut sources,
+        )?,
+        Err(error) => eprintln!("warning: skipping daemon capture logs: {error}"),
+    }
     sources.sort_by(|left, right| {
         left.lane
             .cmp(&right.lane)

@@ -116,6 +116,13 @@ pub struct BootstrapConfig {
     /// into. `None` disables capture; the shipped binary supplies its real run
     /// directory explicitly.
     capture_logs_dir: Option<PathBuf>,
+    /// File the supervisor appends every module's terminal exits to, so exit
+    /// history survives a daemon restart. `None` keeps terminal history in
+    /// memory only (each module's ring). Absent by default for the same reason
+    /// as `capture_logs_dir`: an in-process daemon booted by a test must not
+    /// append its exits to the operator's real `terminals.jsonl`, where they
+    /// would show up in `ck module terminals`. The shipped binary supplies
+    /// `<run dir>/terminals.jsonl` explicitly.
     terminal_journal_path: Option<PathBuf>,
     /// Where the machine id is read from, or minted into when absent. `None`
     /// serves no machine id. Absent by default for the same reason as
@@ -183,14 +190,18 @@ impl BootstrapConfig {
     /// The SHIPPED BINARY's config, which is the only caller that should capture
     /// child output into the operator's real run directory.
     ///
-    /// Kept separate from `from_env` deliberately: see `capture_logs_dir` on this
-    /// struct for why an absent value must mean NO CAPTURE rather than the real
-    /// directory.
+    /// Kept separate from `from_env` deliberately: see `capture_logs_dir` and
+    /// `terminal_journal_path` on this struct for why an absent value must mean
+    /// NO CAPTURE and NO JOURNAL rather than the operator's real run directory.
+    /// A run directory that cannot be resolved (a relative data home) refuses
+    /// startup instead of landing under the working directory.
     pub fn from_env_for_daemon_binary() -> Result<Self, BootstrapError> {
+        let run_dir = daemon_config::daemon_run_dir().map_err(BootstrapError::RunDir)?;
         let machine_id_path =
             crate::machine_id::default_machine_id_path().map_err(BootstrapError::MachineId)?;
         Ok(Self::from_env()?
-            .with_capture_logs_dir(daemon_config::daemon_run_dir().join("logs"))
+            .with_capture_logs_dir(run_dir.join("logs"))
+            .with_terminal_journal_path(run_dir.join("terminals.jsonl"))
             .with_machine_id_path(machine_id_path))
     }
 
@@ -622,23 +633,30 @@ async fn serve_bound_daemon(
     let supervisor_handle = SupervisorHandle::new();
     let connected_clients = ConnectedClients::new();
     let forwarding = Arc::new(ForwardingTable::default());
+    let daemon_incarnation = format!(
+        "{:032x}",
+        u128::from_be_bytes(bound.connection_info.daemon_id)
+    );
     let supervisor = Supervisor::new(Arc::clone(&registry), RestartPolicy::default())
         .with_process_liveness(process_liveness.clone())
         .with_forwarding(Arc::clone(&forwarding))
         .with_handle(supervisor_handle.clone())
         .with_connection_file_path(bound.connection_file_path.clone())
-        .with_terminal_journal(
-            terminal_journal_path
-                .unwrap_or_else(|| daemon_config::daemon_run_dir().join("terminals.jsonl")),
-            format!(
-                "{:032x}",
-                u128::from_be_bytes(bound.connection_info.daemon_id)
-            ),
-        );
-    // ABSENT MEANS NO CAPTURE, NOT "THE REAL RUN DIRECTORY", and the difference
-    // is a production-corruption hazard rather than a preference.
+        .with_daemon_incarnation(daemon_incarnation.clone());
+    // ABSENT MEANS NO CAPTURE AND NO JOURNAL, NOT "THE REAL RUN DIRECTORY", and
+    // the difference is a production-corruption hazard rather than a preference.
+    // Both fields below follow the same rule: `None` for `capture_logs_dir`
+    // means supervised output is not captured, and `None` for
+    // `terminal_journal_path` means terminal history lives only in each
+    // module's in-memory ring (`supervisor.terminals` still answers, with the
+    // journal counters at zero).
     //
-    // This line used to be `unwrap_or_else(|| daemon_run_dir().join("logs"))`,
+    // The terminal journal used to fall back to
+    // `daemon_run_dir().join("terminals.jsonl")`, so an in-process test daemon
+    // appended its fixture exits to the operator's journal, where they then
+    // appeared in `ck module terminals`.
+    //
+    // The capture line used to be `unwrap_or_else(|| daemon_run_dir().join("logs"))`,
     // so ANY caller that did not set the field captured supervised children into
     // the operator's live `~/.local/share/cortexkit/run/logs/`. That is twelve
     // sibling repos whose integration tests boot an in-process daemon through
@@ -658,9 +676,13 @@ async fn serve_bound_daemon(
     // and captured it into production's broca.stderr.log -- the same file I
     // count seal lines in before and after placing their binaries.
     //
-    // The supervisor already treats `None` as no-capture (supervise.rs:3950), so
-    // this only removes an invented default. The binary keeps capturing via
-    // `BootstrapConfig::from_env_for_daemon_binary`.
+    // The supervisor already treats `None` as no-capture and no-journal, so
+    // this only removes invented defaults. The binary keeps capturing and
+    // journaling via `BootstrapConfig::from_env_for_daemon_binary`.
+    let supervisor = match terminal_journal_path {
+        Some(path) => supervisor.with_terminal_journal(path, daemon_incarnation),
+        None => supervisor,
+    };
     let supervisor = match capture_logs_dir {
         Some(dir) => supervisor.with_capture_logs_dir(dir),
         None => supervisor,
@@ -1179,6 +1201,9 @@ pub enum BootstrapError {
     /// The machine id could not be established: its file is corrupt, unreadable
     /// or unwritable, or the data home is relative. The daemon does not start.
     MachineId(crate::machine_id::MachineIdFileError),
+    /// The daemon run directory could not be resolved because the data home is
+    /// relative. The daemon does not start.
+    RunDir(daemon_config::DaemonRunDirError),
     Serve(ServerError),
     ServeJoin(tokio::task::JoinError),
 }
@@ -1235,6 +1260,7 @@ impl fmt::Display for BootstrapError {
             }
             Self::DaemonConfig(err) => write!(f, "failed to load daemon config: {err}"),
             Self::MachineId(err) => write!(f, "refusing to start: {err}"),
+            Self::RunDir(err) => write!(f, "refusing to start: {err}"),
             Self::Serve(err) => write!(f, "daemon server failed: {err}"),
             Self::ServeJoin(err) => write!(f, "daemon server task failed: {err}"),
         }
@@ -1256,6 +1282,7 @@ impl Error for BootstrapError {
             | Self::LocalAddr { source, .. } => Some(source),
             Self::DaemonConfig(err) => Some(err),
             Self::MachineId(err) => Some(err),
+            Self::RunDir(err) => Some(err),
             Self::Serve(err) => Some(err),
             Self::ServeJoin(err) => Some(err),
             Self::StartLockBusy { .. } => None,
@@ -1337,6 +1364,10 @@ mod tests {
         assert!(path.exists(), "daemon did not create {}", path.display());
     }
 
+    /// An in-process daemon with the default (disabled) cgroup placement must
+    /// leave the host's live module cgroup tree exactly as it found it.
+    /// Red-checking this test (making it fail) creates a
+    /// `cgroup-isolation-probe-*` directory in the live cgroup tree, which must be removed by hand.
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_with_config_does_not_reconcile_the_ambient_cgroup_by_default() {
@@ -1594,6 +1625,50 @@ mod tests {
             env::temp_dir().join(format!("subc-{}.connection.json", user_connection_token()))
         );
         assert_eq!(source, ConnectionFileSource::TempDirFallback);
+    }
+
+    /// The shipped binary is the only caller that journals terminal exits into
+    /// the real run directory, so its constructor must supply that path itself;
+    /// the in-process default leaves it unset.
+    #[test]
+    fn daemon_binary_config_journals_and_captures_into_the_run_dir() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let root = unique_temp_dir("daemon-binary-config");
+        let data_home = root.join("data");
+        let _data = EnvGuard::set("XDG_DATA_HOME", &data_home);
+        let _config = EnvGuard::set("XDG_CONFIG_HOME", &root.join("config"));
+        let _port = EnvGuard::unset(SUBC_PORT_ENV);
+
+        let config = BootstrapConfig::from_env_for_daemon_binary().unwrap();
+
+        let run_dir = data_home.join("cortexkit").join("run");
+        assert_eq!(
+            config.terminal_journal_path,
+            Some(run_dir.join("terminals.jsonl"))
+        );
+        assert_eq!(config.capture_logs_dir, Some(run_dir.join("logs")));
+        assert_eq!(
+            BootstrapConfig::new(root.join("connection.json"), 0).terminal_journal_path,
+            None,
+            "an in-process config must not journal anywhere unless asked to"
+        );
+    }
+
+    #[test]
+    fn daemon_binary_config_refuses_a_relative_data_home() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let root = unique_temp_dir("daemon-binary-relative-data");
+        let _data = EnvGuard::set_str("XDG_DATA_HOME", "relative-data-home");
+        let _config = EnvGuard::set("XDG_CONFIG_HOME", &root.join("config"));
+        let _port = EnvGuard::unset(SUBC_PORT_ENV);
+
+        let error = BootstrapConfig::from_env_for_daemon_binary()
+            .expect_err("a relative data home must refuse the daemon binary's config");
+        assert!(
+            matches!(error, BootstrapError::RunDir(_)),
+            "expected a run-directory refusal, got {error}"
+        );
+        assert!(error.to_string().contains("XDG_DATA_HOME"), "{error}");
     }
 
     #[test]

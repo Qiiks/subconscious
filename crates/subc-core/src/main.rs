@@ -63,7 +63,20 @@ async fn main() {
         return;
     }
 
-    if let Err(err) = init_tracing() {
+    // Resolve the run directory before anything writes into it. A relative data
+    // home would otherwise put the daemon's logs, journal and connection state
+    // under whatever directory it was started from, so the daemon refuses to
+    // start and names the variables to set. This goes to stderr because the
+    // log sink lives inside the directory that could not be resolved.
+    let run_dir = match subc_daemon::daemon_config::daemon_run_dir() {
+        Ok(run_dir) => run_dir,
+        Err(error) => {
+            eprintln!("ck-subc: refusing to start: {error}");
+            process::exit(1);
+        }
+    };
+
+    if let Err(err) = init_tracing(&run_dir) {
         eprintln!("ck-subc: failed to initialize logging: {err}");
         process::exit(1);
     }
@@ -87,7 +100,7 @@ async fn main() {
     process::exit(0);
 }
 
-fn init_tracing() -> Result<(), cortexkit_log::InitError> {
+fn init_tracing(run_dir: &std::path::Path) -> Result<(), cortexkit_log::InitError> {
     let config_path = subc_daemon::daemon_config::default_config_path();
     // THIS eprintln! MUST STAY ON STDERR. It is the daemon's only pre-subscriber
     // channel: a failure to read logging config happens BEFORE the file sink exists,
@@ -117,10 +130,10 @@ fn init_tracing() -> Result<(), cortexkit_log::InitError> {
         Err(error) => eprintln!(
             "ck-subc: could not secure the run directory at {}: {error}; continuing, \
              but another account on this host may be able to list it",
-            subc_daemon::daemon_config::daemon_run_dir().display()
+            run_dir.display()
         ),
     }
-    let logs_dir = subc_daemon::daemon_config::daemon_run_dir().join("logs");
+    let logs_dir = run_dir.join("logs");
     install_tracing(daemon_logger_config(logs_dir, logging.as_ref()))
 }
 

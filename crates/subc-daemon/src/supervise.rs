@@ -2069,18 +2069,25 @@ impl Supervisor {
         self
     }
 
-    /// Enables best-effort history shared by every supervised module.
-    pub fn with_terminal_journal(mut self, path: PathBuf, daemon_incarnation: String) -> Self {
+    /// Names this daemon lifetime in spawn events, independently of whether a
+    /// terminal journal is configured.
+    pub fn with_daemon_incarnation(self, daemon_incarnation: String) -> Self {
         // A millisecond start stamp can repeat after clock rollback or a rapid
         // restart. Use the connection file's random daemon_id instead: it already
         // identifies this daemon lifetime independently of the wall clock.
-        self.spawn_events
-            .configure_incarnation(daemon_incarnation.clone());
-        self.terminal_journal = Some(Arc::new(crate::terminal_journal::TerminalJournal::open(
+        self.spawn_events.configure_incarnation(daemon_incarnation);
+        self
+    }
+
+    /// Enables best-effort history shared by every supervised module. Without
+    /// it, terminal history is kept only in each module's in-memory ring.
+    pub fn with_terminal_journal(self, path: PathBuf, daemon_incarnation: String) -> Self {
+        let mut this = self.with_daemon_incarnation(daemon_incarnation.clone());
+        this.terminal_journal = Some(Arc::new(crate::terminal_journal::TerminalJournal::open(
             path,
             daemon_incarnation,
         )));
-        self
+        this
     }
 
     pub fn with_forwarding(mut self, forwarding: Arc<ForwardingTable>) -> Self {

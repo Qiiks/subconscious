@@ -1,6 +1,6 @@
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{Condvar, Mutex, OnceLock},
     thread,
@@ -73,7 +73,7 @@ impl Fixture {
             .join(subc_transport::CONNECTION_FILE_NAME)
     }
 
-    fn boot(&mut self) {
+    fn acquire_permit(&mut self) {
         if !self.holds_permit {
             let (lock, cvar) = daemon_gate();
             let mut live = lock.lock().unwrap_or_else(|p| p.into_inner());
@@ -83,6 +83,10 @@ impl Fixture {
             *live += 1;
             self.holds_permit = true;
         }
+    }
+
+    fn boot(&mut self) {
+        self.acquire_permit();
         self.child = Some(
             Command::new(env!("CARGO_BIN_EXE_ck-subc"))
                 .env("XDG_DATA_HOME", self.root.join("data"))
@@ -130,37 +134,50 @@ impl Fixture {
     }
 
     fn try_ck(&self, args: &[&str]) -> Option<String> {
-        let output = Command::new(env!("CARGO_BIN_EXE_ck"))
-            .arg("--subc")
-            .arg(self.connection())
-            .args(args)
-            .output()
-            .unwrap();
-        output
-            .status
-            .success()
-            .then(|| String::from_utf8(output.stdout).unwrap())
-    }
-
-    fn ck(&self, args: &[&str]) -> Value {
-        serde_json::from_str(&self.try_ck(args).expect("ck command succeeds")).unwrap()
+        try_ck_at(&self.connection(), args)
     }
 
     fn terminals(&self) -> Value {
-        self.ck(&["module", "terminals", "history", "--json"])
+        ck_at(
+            &self.connection(),
+            &["module", "terminals", "history", "--json"],
+        )
     }
 
     fn exit(&self) {
-        self.ck(&["module", "start", "history", "--json"]);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while self.ck(&["module", "status", "history", "--json"])["module"]["live"] != true {
-            if Instant::now() >= deadline {
-                panic!("module never registered");
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        self.ck(&["module", "stop", "history", "--json"]);
+        exit_history_module(&self.connection());
     }
+}
+
+fn try_ck_at(connection: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new(env!("CARGO_BIN_EXE_ck"))
+        .arg("--subc")
+        .arg(connection)
+        .args(args)
+        .output()
+        .unwrap();
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8(output.stdout).unwrap())
+}
+
+fn ck_at(connection: &Path, args: &[&str]) -> Value {
+    serde_json::from_str(&try_ck_at(connection, args).expect("ck command succeeds")).unwrap()
+}
+
+/// Start the `history` module, wait until it registers, then stop it, which
+/// leaves exactly one terminal exit behind.
+fn exit_history_module(connection: &Path) {
+    ck_at(connection, &["module", "start", "history", "--json"]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while ck_at(connection, &["module", "status", "history", "--json"])["module"]["live"] != true {
+        if Instant::now() >= deadline {
+            panic!("module never registered");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    ck_at(connection, &["module", "stop", "history", "--json"]);
 }
 
 impl Drop for Fixture {
@@ -266,5 +283,176 @@ fn cli_renders_the_incarnation_and_corruption_warning() {
         text.contains(incarnation)
             && text.contains("warning: 1 unreadable terminal journal lines skipped"),
         "{text}"
+    );
+}
+
+/// Set on the re-executed test binary: the fixture root the child daemon uses.
+const NO_JOURNAL_CHILD_ROOT_ENV: &str = "SUBC_TEST_NO_JOURNAL_CHILD_ROOT";
+
+/// An in-process daemon (`run_with_config`, the entry point sibling repos'
+/// test harnesses use) that leaves `terminal_journal_path` unset must journal
+/// NOWHERE -- in particular not into `<data home>/cortexkit/run/terminals.jsonl`,
+/// which is the operator's journal that `ck module terminals` reads.
+///
+/// The daemon runs in a re-executed copy of this test binary so its data home
+/// can be an isolated `XDG_DATA_HOME` without mutating this process's
+/// environment. The assertion is on that isolated tree, which is exactly where
+/// a fallback to the ambient run directory would write: nothing else in the
+/// tree can produce a `terminals.jsonl`.
+#[test]
+fn an_in_process_daemon_without_a_journal_path_writes_no_journal() {
+    let mut fixture = Fixture::new();
+    fixture.acquire_permit();
+    let root = fixture.root.path().to_path_buf();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "in_process_daemon_without_a_journal_path_child",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(NO_JOURNAL_CHILD_ROOT_ENV, &root)
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_RUNTIME_DIR", root.join("runtime"))
+        .env("HOME", root.join("home"))
+        .env_remove("SUBC_CONNECTION_FILE")
+        .env_remove("CK_LOG")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "the in-process child daemon must run and pass exactly one test\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let journals = files_named(&root, "terminals.jsonl");
+    assert!(
+        journals.is_empty(),
+        "an in-process daemon with no journal path wrote a terminal journal: {journals:?}"
+    );
+}
+
+/// The daemon half of the test above. Does nothing unless re-executed by it.
+#[test]
+fn in_process_daemon_without_a_journal_path_child() {
+    let Some(root) = std::env::var_os(NO_JOURNAL_CHILD_ROOT_ENV) else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let connection = root
+        .join("runtime")
+        .join(subc_transport::CONNECTION_FILE_NAME);
+    let config = subc_daemon::bootstrap::BootstrapConfig::new(&connection, 0)
+        .with_daemon_config_path(root.join("config/cortexkit/subc.jsonc"))
+        .unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let daemon = runtime.spawn(subc_daemon::bootstrap::run_with_config(config));
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !(connection.exists()
+        && try_ck_at(&connection, &["module", "terminals", "history", "--json"]).is_some())
+    {
+        assert!(
+            !daemon.is_finished(),
+            "in-process daemon exited during boot"
+        );
+        assert!(Instant::now() < deadline, "daemon never became readable");
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    exit_history_module(&connection);
+    // The exit reaches the ring only after the journal append would have run
+    // (both happen under one lock), so once it is visible here any journal
+    // write has already happened.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let history = loop {
+        let history = ck_at(&connection, &["module", "terminals", "history", "--json"]);
+        if history["entries"]
+            .as_array()
+            .is_some_and(|entries| !entries.is_empty())
+        {
+            break history;
+        }
+        assert!(Instant::now() < deadline, "the exit never reached the ring");
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(
+        (
+            history["entries"].as_array().unwrap().len(),
+            // Zero counters are omitted from the wire, so absent reads as 0.
+            history["journal_skipped_lines"].as_u64().unwrap_or(0),
+            history["journal_read_errors"].as_u64().unwrap_or(0),
+            history["journal_write_failures"].as_u64().unwrap_or(0),
+        ),
+        (1, 0, 0, 0),
+        "the ring must answer with the exit and zero journal counters: {history}"
+    );
+    daemon.abort();
+    runtime.shutdown_timeout(Duration::from_secs(2));
+    let _ = fs::remove_file(&connection);
+}
+
+fn files_named(root: &Path, name: &str) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                pending.push(path);
+            } else if entry.file_name() == name {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// With no absolute data home, the daemon binary must refuse to start and say
+/// which variables to set, rather than resolving its run directory (logs,
+/// terminal journal) under the directory it was started from.
+#[test]
+fn the_daemon_binary_refuses_a_relative_data_home_by_name() {
+    let root = TestTempDir::new("relative-data-home");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ck-subc"));
+    command
+        .current_dir(root.path())
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_RUNTIME_DIR", root.join("runtime"))
+        .env("SUBC_PORT", "0")
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("HOME")
+        .env_remove("APPDATA")
+        .env_remove("USERPROFILE")
+        .env_remove("CK_LOG")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("ck-subc started with a relative data home instead of refusing");
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+    assert!(
+        !status.success() && stderr.contains("XDG_DATA_HOME") && stderr.contains("HOME"),
+        "ck-subc must fail naming the variables to set; status {status}, stderr: {stderr}"
+    );
+    assert!(
+        !root.join(".local").exists(),
+        "a refused start must not create a run directory under the working directory"
     );
 }
