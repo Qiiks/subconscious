@@ -5833,6 +5833,17 @@ mod slot_registration_wait_tests {
             Err(SuperviseError::RegistrationStillActive { .. })
         ));
 
+        // Still held while the incumbent's connection has not deregistered.
+        assert!(matches!(
+            wait_for_slot_registration_release(
+                &registry,
+                RegistrationSlot::Connection(ConnectionId::new(INCUMBENT)),
+                Duration::from_millis(50),
+            )
+            .await,
+            Err(SuperviseError::RegistrationStillActive { .. })
+        ));
+
         let releaser = Arc::clone(&registry);
         let release = tokio::spawn(async move {
             sleep(Duration::from_millis(20)).await;
