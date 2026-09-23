@@ -604,6 +604,15 @@ function resolveFilter(specOverride: string | undefined): LevelFilter {
 }
 
 /** Redact known credential shapes before optional caller redaction. */
+/**
+ * The fleet credential redactor, applied to every complete line before any
+ * caller redactor. Exported so a reader or a caller composing its own sanitizer
+ * can run the same rules; the shared fixture's `redaction` cases pin it.
+ */
+export function fleetRedact(line: string): string {
+  return defaultRedactor(line);
+}
+
 function defaultRedactor(line: string): string {
   return line
     .replace(

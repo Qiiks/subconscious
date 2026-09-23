@@ -5,6 +5,7 @@ import * as path from "node:path";
 
 import {
   createLogger,
+  fleetRedact,
   forPlugin,
   formatLine,
   parseLine,
@@ -587,33 +588,26 @@ describe("redaction and the one-line contract", () => {
     });
   }
 
-  // Each case goes through a real logger, so the fleet redactor is exercised on
-  // a complete rendered line exactly as it is in production.
+  // Every case against the redactor itself, as the Rust twin tests it: the
+  // fixture's inputs are rendered lines, and some (an escaped quote inside a
+  // quoted value) cannot be produced by rendering a message verbatim.
   for (const redaction of fixture.redaction.cases) {
-    test(`fleet redactor: ${redaction.name}`, async () => {
-      const event: LogEvent = {
-        at_ms: FIXED_MS,
-        level: "info",
-        logger: "test-module",
-        message: redaction.input,
-        fields: [],
-      };
-      const prefix = formatLine({ ...event, message: "" });
-      // The message must render verbatim, or the redactor would be tested on
-      // different text than the fixture names.
-      check(`${redaction.name} renders verbatim`, formatLine(event), `${prefix} ${redaction.input}`);
-
-      const logsDir = temporaryDirectory();
-      const logger = createLogger(configFor(logsDir));
-      logger.info(redaction.input);
-      await logger.close();
-      check(
-        `redact ${redaction.name}`,
-        readLines(segmentPath(logsDir, "test-module")),
-        [`${prefix} ${redaction.output}`],
-      );
+    test(`fleet redactor: ${redaction.name}`, () => {
+      check(`redact ${redaction.name}`, fleetRedact(redaction.input), redaction.output);
     });
   }
+
+  // And once through a real logger, so the wiring from write to redactor is
+  // exercised on a rendered line exactly as in production.
+  test("the logger applies the fleet redactor to the rendered line", async () => {
+    const logsDir = temporaryDirectory();
+    const logger = createLogger(configFor(logsDir));
+    logger.info("GET", { url: "https://api.example.com/v1?access_token=abc123&page=2" });
+    await logger.close();
+    const lines = readLines(segmentPath(logsDir, "test-module"));
+    check("one line", lines.length, 1);
+    expect(lines[0]).toEndWith("GET url=https://api.example.com/v1?access_token=[REDACTED]&page=2");
+  });
 
   test("an unterminated OSC in one value does not swallow the fields after it", async () => {
     const logsDir = temporaryDirectory();
