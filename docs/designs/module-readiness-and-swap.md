@@ -448,6 +448,43 @@ the active one. It found these, all fixable inside their slice:
    candidates" does not make it absent elsewhere. Plain spawns remove it
    explicitly, and the variable is refused as a configured `env` key.
 
+### Slice B landed: what C inherits
+
+Slice B added the candidate and superseded slots, `cutover_candidate`
+(one forwarding write-lock section; the incumbent's endpoint is returned for
+the drain and nothing is re-keyed), `begin_endpoint_drain`, slot-keyed
+registration waits, and the superseded-endpoint arm inside
+`complete_pending_relay`. It reported these obligations for C, read from the
+code rather than the design:
+
+1. The HELLO handoff registers in the registry (which refuses
+   `duplicate_module_id`) BEFORE forwarding, and forwarding's
+   `register_module_connection` has no duplicate check. C decides candidate
+   admission and calls `register_candidate_*` from that path.
+2. Health probes and module control RPCs resolve by id, so they cannot reach
+   a candidate. C needs an endpoint-keyed probe for its readiness wait.
+3. After cutover, `route_census`, `live_roots` and `catalog.list` show only
+   the promoted process; the incumbent's still-draining routes are invisible
+   there until it deregisters. Decide whether operators need to see them.
+4. Ordinary registration has no duplicate check against a candidate or
+   superseded entry for the same id.
+5. A superseded incumbent's `catalog.update` edits only its superseded
+   record, and its `LiveRoots` answers with the NEW active's routes, because
+   that lookup is by id. Harmless in the designed sequence (the incumbent
+   never queries after cutover) but wrong in principle; scope `LiveRoots` by
+   the caller's endpoint if C touches it.
+6. Registry promotion (`Registry::promote_candidate`) and forwarding cutover
+   are separate calls under separate locks. The forwarding write lock is the
+   routing linearization point; C orchestrates the two and must not route
+   between them.
+7. The old id-named registration waits are one-line wrappers over the slot
+   waits with `Active(module_id)`, so their call sites did not move. C threads
+   a slot through `drain_child_to_state` for the swap path.
+
+The swap entry points carry `expect(dead_code)` outside tests; wiring them in
+C makes that expectation fail, and `clippy -D warnings` then forces its
+removal.
+
 ### What rung 3 does not do
 
 - No transparent route migration. Routes close and reopen.
