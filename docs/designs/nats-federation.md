@@ -285,7 +285,12 @@ What shape 3 commits us to (CKCRED):
 
 ## Decisions needed
 
-1. **Rooms across machines (ALF; the largest item).** Store and forward delivers
+1. **Rooms across machines (ALF; the largest item). OPEN, widened by the
+   operator:** the default expectation is a local copy on every member machine,
+   not fetching room data from another machine, and this needs its own design
+   pass on how prefrontal as a whole works across machines (rooms, boards, asks,
+   peers, wakes). The two options below are kept for the record; (b) is not the
+   direction. Store and forward delivers
    every post body to B, but `room_wait` reads the transcript and board from the
    room's owning store, which lives on one machine. B can receive every post while
    the owner is offline and still be unable to read the room.
@@ -294,9 +299,10 @@ What shape 3 commits us to (CKCRED):
      which is a foundation change, and board state needs a merge rule.
    - **(b) Cross-machine rooms need the owner online to read.** Posts still arrive
      late but safe; reading the room waits for the owner. No foundation change.
-2. **Who mints the stable box id.** It must survive re-keys and trust
-   export/import, be opaque, and exist before any stream is created. CALLO's
-   case for callosum, which SUBC shares: it can mint the id at store creation, a
+2. **Who mints the stable box id. DECIDED 2026-09-23: callosum**, as the
+   cross-machine module that owns machine identity. It must survive re-keys and
+   trust export/import, be opaque, and exist before any stream is created.
+   CALLO's case for it: it can mint the id at store creation, a
    re-key leaves a separate id column in place, the trust export already carries
    its tables, and peers learn the id inside the paired session like the keys.
    ck-bus would need its own durable store and backup contract, and could never
