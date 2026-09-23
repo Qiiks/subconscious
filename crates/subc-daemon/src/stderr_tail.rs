@@ -964,7 +964,12 @@ mod tests {
         let mut ring = ring(1, 10_000, 128);
         ring.push_line("evicted");
         ring.push_line("also evicted");
+        // Emptying `entries` by hand must also zero the running totals kept
+        // beside it, or the ring holds counts for lines it no longer has and
+        // any later eviction decision is made against the stale numbers.
         ring.entries.clear();
+        ring.lines = 0;
+        ring.bytes = 0;
         ring.push_process_start();
         assert!(matches!(
             ring.entries.front(),
