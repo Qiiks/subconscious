@@ -41,7 +41,14 @@ session.info("trigger fired", { reason: "force_band", usage: "93.9%" });
   `\\`, `\"`, `\n`, `\r` escapes; an empty value renders as `""`. An unquoted
   value is verbatim.
 - One line per event, always: the message and every value escape their line
-  breaks, and no ANSI survives, including through a caller's redactor.
+  breaks, and no raw control character survives, including through a caller's
+  redactor.
+- Control characters are handled per field, never across the line: a complete
+  CSI or OSC sequence inside one message or value is removed (and counted in
+  `stats().ansiStripped`); every control character left over is written as
+  `\uXXXX` and forces quoting. A stray `ESC ]` therefore stays visible in its
+  own value instead of swallowing the fields after it. The guard after a
+  caller's redactor escapes the same way and never strips.
 
 ## Levels
 
@@ -96,7 +103,12 @@ interface LogConfig {
 
 `forPlugin(moduleId, harness)` is that config with `harness=` bound. A module
 MUST NOT log prompt text, message bodies, or credential payloads at any level;
-the built-in credential redactor is the backstop, not the policy.
+the built-in credential redactor is the backstop, not the policy. It covers
+`Authorization:` values, `Bearer` tokens, JWTs, `ckh_` handles, `sk-` keys,
+GitHub tokens (`ghp_`, `gho_`, `ghs_`, `ghu_`, `ghr_`, `github_pat_`), URL
+userinfo (`https://user:pass@host`), and credential query parameters
+(`access_token`, `token`, `api_key`, `apikey`, `password`, `secret`,
+`client_secret`).
 
 Also exported for consumers that read the files: `formatLine`, `parseLine`,
 `segmentName`, `segmentDay`, and `pruneCandidates`.

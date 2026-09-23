@@ -157,84 +157,120 @@ function assertFieldKey(label: string, key: string): void {
   }
 }
 
-// Backslash is escaped first so a literal `\n` in the text survives as `\\n`
-// and cannot be read back as a newline. Same order as the Rust twin.
-function escapeMessage(value: string): string {
-  return value.replaceAll("\\", "\\\\").replaceAll("\r", "\\r").replaceAll("\n", "\\n");
-}
-
-function formatValue(value: FieldValue): string {
-  const text = typeof value === "string" ? value : String(value);
-  // A `]` is quoted along with the whitespace and quote characters so a bound
-  // value can never be misread as the end of the bracket.
-  if (text !== "" && !/[ "\r\n\]]/.test(text)) {
-    // An unquoted value is verbatim, backslashes included: only the quoted
-    // form has an escape grammar, so only a quoted value is ever decoded.
-    return text;
-  }
-  const escaped = text
-    .replaceAll("\\", "\\\\")
-    .replaceAll('"', '\\"')
-    .replaceAll("\r", "\\r")
-    .replaceAll("\n", "\\n");
-  return `"${escaped}"`;
-}
-
 /**
- * Removes terminal escape sequences and counts how many it removed. Both the
- * 7-bit `ESC` forms and the 8-bit C1 forms are handled, because a log file is
- * read by `grep` and a dashboard, never by a terminal emulator.
+ * Removes the terminal escape sequences that are complete inside one field and
+ * counts them. Only two shapes count as a sequence: CSI (`ESC [` or C1 `U+009B`,
+ * parameter and intermediate bytes `0x20`-`0x3f`, then a final byte
+ * `0x40`-`0x7e`) and OSC (`ESC ]` or C1 `U+009D`, ended by `BEL`, `ESC \` or C1
+ * `U+009C`). An introducer whose sequence does not end inside the field is left
+ * in place, so the escaping step writes it out as text instead of letting it
+ * swallow whatever follows.
  */
-function stripAnsi(value: string): { value: string; count: number } {
-  if (!/[\u001b\u0080-\u009f]/.test(value)) return { value, count: 0 };
+function stripCompleteSequences(value: string): { value: string; count: number } {
+  if (!/[\u001b\u009b\u009d]/.test(value)) return { value, count: 0 };
 
   let output = "";
   let count = 0;
   let index = 0;
   while (index < value.length) {
     const char = value[index]!;
-    const isEscape = char === "\u001b";
-    const isControlSequence = isEscape ? value[index + 1] === "[" : char === "\u009b";
-    const isOperatingSystemCommand = isEscape ? value[index + 1] === "]" : char === "\u009d";
+    const next = value[index + 1];
+    const isCsi = (char === "\u001b" && next === "[") || char === "\u009b";
+    const isOsc = (char === "\u001b" && next === "]") || char === "\u009d";
+    let end = -1;
 
-    if (!isEscape && (char < "\u0080" || char > "\u009f")) {
-      output += char;
-      index += 1;
-      continue;
-    }
-
-    let cursor = index + (isEscape ? 2 : 1);
-    if (isEscape && value[index + 1] === undefined) cursor = index + 1;
-    if (isControlSequence) {
+    if (isCsi) {
+      let cursor = index + (char === "\u001b" ? 2 : 1);
       while (cursor < value.length) {
         const code = value.charCodeAt(cursor);
+        if (code >= 0x40 && code <= 0x7e) {
+          end = cursor + 1;
+          break;
+        }
+        if (code < 0x20 || code > 0x3f) break;
         cursor += 1;
-        if (code >= 0x40 && code <= 0x7e) break;
       }
-    } else if (isOperatingSystemCommand) {
+    } else if (isOsc) {
+      let cursor = index + (char === "\u001b" ? 2 : 1);
       while (cursor < value.length) {
         const code = value.charCodeAt(cursor);
         if (code === 0x07 || code === 0x9c) {
-          cursor += 1;
+          end = cursor + 1;
           break;
         }
         if (code === 0x1b && value[cursor + 1] === "\\") {
-          cursor += 2;
+          end = cursor + 2;
           break;
         }
         cursor += 1;
       }
     }
-    count += 1;
-    index = cursor;
+
+    if (end < 0) {
+      output += char;
+      index += 1;
+    } else {
+      count += 1;
+      index = end;
+    }
   }
   return { value: output, count };
 }
 
+// Every control character other than `\r` and `\n` (which have their own short
+// escapes): C0, DEL and the C1 range.
+const CONTROL_PATTERN = /[\u0000-\u0009\u000b\u000c\u000e-\u001f\u007f-\u009f]/;
+const CONTROL_PATTERN_GLOBAL = new RegExp(CONTROL_PATTERN.source, "g");
+
+/** Writes line breaks as `\r`/`\n` and every other control character as `\uXXXX`. */
+function escapeControls(value: string): string {
+  return value
+    .replaceAll("\r", "\\r")
+    .replaceAll("\n", "\\n")
+    .replace(
+      CONTROL_PATTERN_GLOBAL,
+      (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`,
+    );
+}
+
+/** Collects how many escape sequences the per-field strip removed for one line. */
+interface StripCounter {
+  count: number;
+}
+
+// Backslash is escaped first so text that merely looks like an escape (a
+// literal `\n` or `\u0041`) survives as `\\n` / `\\u0041` and cannot be read
+// back as one. Same order as the Rust twin.
+function escapeMessage(value: string, counter: StripCounter): string {
+  const stripped = stripCompleteSequences(value);
+  counter.count += stripped.count;
+  return escapeControls(stripped.value.replaceAll("\\", "\\\\"));
+}
+
+function formatValue(value: FieldValue, counter: StripCounter): string {
+  const stripped = stripCompleteSequences(typeof value === "string" ? value : String(value));
+  counter.count += stripped.count;
+  const text = stripped.value;
+  // A `]` is quoted along with the whitespace and quote characters so a bound
+  // value can never be misread as the end of the bracket. A control character
+  // forces quoting too, because only the quoted form can carry its escape.
+  if (text !== "" && !/[ "\r\n\]]/.test(text) && !CONTROL_PATTERN.test(text)) {
+    // An unquoted value is verbatim, backslashes included: only the quoted
+    // form has an escape grammar, so only a quoted value is ever decoded.
+    return text;
+  }
+  const escaped = escapeControls(text.replaceAll("\\", "\\\\").replaceAll('"', '\\"'));
+  return `"${escaped}"`;
+}
+
+// Each field is stripped and escaped on its own before it is placed in the
+// line. Stripping the assembled line instead lets a stray `ESC ]` in one value
+// start an OSC that eats that value's closing quote and every later field.
 function formatLineWithStats(event: LogEvent): FormatResult {
   if (!LEVELS.includes(event.level)) throw new Error(`unknown log level: ${String(event.level)}`);
   for (const segment of event.logger.split(".")) assertSegment("logger segment", segment);
 
+  const counter: StripCounter = { count: 0 };
   let line = `${new Date(event.at_ms).toISOString()} ${event.level
     .toUpperCase()
     .padEnd(5, " ")} ${event.logger}:`;
@@ -245,18 +281,17 @@ function formatLineWithStats(event: LogEvent): FormatResult {
   if (bound.length > 0) {
     const rendered = bound.map(([key, value]) => {
       assertFieldKey("bound field key", key);
-      return `${key}=${formatValue(value)}`;
+      return `${key}=${formatValue(value, counter)}`;
     });
     line += ` [${rendered.join(" ")}]`;
   }
-  if (event.message !== "") line += ` ${escapeMessage(event.message)}`;
+  if (event.message !== "") line += ` ${escapeMessage(event.message, counter)}`;
   for (const [key, value] of event.fields) {
     assertFieldKey("event field key", key);
-    line += ` ${key}=${formatValue(value)}`;
+    line += ` ${key}=${formatValue(value, counter)}`;
   }
 
-  const stripped = stripAnsi(line);
-  return { line: stripped.value, ansiStripped: stripped.count };
+  return { line, ansiStripped: counter.count };
 }
 
 /** Render one canonical fleet log line without a trailing newline. */
@@ -324,7 +359,11 @@ function decodeEscapedText(value: string): string | null {
     const escaped = value[index];
     if (escaped === "n") decoded += "\n";
     else if (escaped === "r") decoded += "\r";
-    else decoded += escaped;
+    else if (escaped === "u" && /^[0-9a-fA-F]{4}$/.test(value.slice(index + 1, index + 5))) {
+      // `\uXXXX` is how the renderer writes a control character.
+      decoded += String.fromCharCode(Number.parseInt(value.slice(index + 1, index + 5), 16));
+      index += 4;
+    } else decoded += escaped;
   }
   return decoded;
 }
@@ -575,7 +614,21 @@ function defaultRedactor(line: string): string {
     .replace(/\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, REDACTED)
     .replace(/\bckh_[A-Za-z0-9_-]+\b/g, REDACTED)
     .replace(/\bsk-[A-Za-z0-9_-]+\b/g, REDACTED)
-    .replace(/\b(?:ghp|gho)_[A-Za-z0-9_-]+\b/g, REDACTED);
+    .replace(/\bgh[pousr]_[A-Za-z0-9_-]+\b/g, REDACTED)
+    .replace(/\bgithub_pat_[A-Za-z0-9_]+\b/g, REDACTED)
+    // URL userinfo (`user:pass@` or `token@`). The run cannot cross whitespace,
+    // a path, query or fragment delimiter, or a quote, so an `@` later in the
+    // URL or in an ordinary email address is never taken for userinfo.
+    .replace(/\b([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^\s/?#"@]+@/g, `$1${REDACTED}@`)
+    // Credential query parameters, value only. This is its own pattern because
+    // a generic `key=value` rule reads `https:` as the key and misses
+    // `?access_token=`. The value consumes backslash escape pairs so an escaped
+    // quote inside a quoted field value is redacted rather than split, which
+    // would unbalance the field's quoting.
+    .replace(
+      /([?&](?:access_token|token|api_key|apikey|password|secret|client_secret)=)(?:\\.|[^&#\s"\\])+/gi,
+      `$1${REDACTED}`,
+    );
 }
 
 function utcDay(at: Date): string {
@@ -688,11 +741,11 @@ class SegmentSink {
     try {
       let redacted = defaultRedactor(line);
       if (this.redact) redacted = this.redact(redacted);
-      const clean = stripAnsi(redacted);
-      this.ansiStripped += clean.count;
       // Redactors are extension points, so the last guard before the write
-      // keeps the one-line, no-ANSI contract even when one introduces a break.
-      const guarded = clean.value.replaceAll("\r", "\\r").replaceAll("\n", "\\n");
+      // keeps the one-line, no-raw-control contract even when one introduces a
+      // break or an escape sequence. It escapes and never strips: stripping
+      // across the whole line is what let one bad value eat the fields after it.
+      const guarded = escapeControls(redacted);
       const output = `${guarded}\n`;
 
       if (this.fallbackActive) {

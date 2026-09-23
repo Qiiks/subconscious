@@ -20,6 +20,7 @@ import {
 interface GoldenFixture {
   schema: number;
   cases: Array<{ name: string; event: LogEvent; line: string }>;
+  redaction: { cases: Array<{ name: string; input: string; output: string }> };
   parse_rejects: Array<{ name: string; line: string; reason: string }>;
   level_filter: {
     cases: Array<{ spec: string; level: Level; logger: string; emit: boolean }>;
@@ -46,7 +47,23 @@ const fixturePath = new URL(
   "../../../crates/subc-core/tests/fixtures/log_format_golden.json",
   import.meta.url,
 );
-const fixture = JSON.parse(fs.readFileSync(fixturePath, "utf8")) as GoldenFixture;
+  const fixture = JSON.parse(fs.readFileSync(fixturePath, "utf8")) as GoldenFixture;
+
+// Complete CSI and OSC sequences, written independently of the renderer from
+// the spec's wording. Rendering removes these, so a parsed-back line equals its
+// event only once they are gone from the event's text too.
+const COMPLETE_SEQUENCE =
+  /(?:\u001b\[|\u009b)[\u0020-\u003f]*[\u0040-\u007e]|(?:\u001b\]|\u009d)[^]*?(?:\u0007|\u009c|\u001b\\)/g;
+
+function withoutSequences(text: string): string {
+  return text.replace(COMPLETE_SEQUENCE, "");
+}
+
+function withoutSequencesInPairs(
+  pairs: ReadonlyArray<readonly [string, string | number | boolean]>,
+): Array<[string, string | number | boolean]> {
+  return pairs.map(([key, value]) => [key, typeof value === "string" ? withoutSequences(value) : value]);
+}
 
 const FIXED_MS = 1_788_604_863_123;
 const FIXED_DAY = "2026-09-05";
@@ -132,9 +149,9 @@ describe("golden line format", () => {
           at_ms: golden.event.at_ms,
           level: golden.event.level,
           logger: golden.event.logger,
-          bound: golden.event.bound ?? [],
-          message: golden.event.message,
-          fields: golden.event.fields,
+          bound: withoutSequencesInPairs(golden.event.bound ?? []),
+          message: withoutSequences(golden.event.message),
+          fields: withoutSequencesInPairs(golden.event.fields),
         },
       );
     });
@@ -570,6 +587,51 @@ describe("redaction and the one-line contract", () => {
     });
   }
 
+  // Each case goes through a real logger, so the fleet redactor is exercised on
+  // a complete rendered line exactly as it is in production.
+  for (const redaction of fixture.redaction.cases) {
+    test(`fleet redactor: ${redaction.name}`, async () => {
+      const event: LogEvent = {
+        at_ms: FIXED_MS,
+        level: "info",
+        logger: "test-module",
+        message: redaction.input,
+        fields: [],
+      };
+      const prefix = formatLine({ ...event, message: "" });
+      // The message must render verbatim, or the redactor would be tested on
+      // different text than the fixture names.
+      check(`${redaction.name} renders verbatim`, formatLine(event), `${prefix} ${redaction.input}`);
+
+      const logsDir = temporaryDirectory();
+      const logger = createLogger(configFor(logsDir));
+      logger.info(redaction.input);
+      await logger.close();
+      check(
+        `redact ${redaction.name}`,
+        readLines(segmentPath(logsDir, "test-module")),
+        [`${prefix} ${redaction.output}`],
+      );
+    });
+  }
+
+  test("an unterminated OSC in one value does not swallow the fields after it", async () => {
+    const logsDir = temporaryDirectory();
+    const logger = createLogger(configFor(logsDir));
+    logger.warn("server said", { text: "x\u001b]title", code: 2 });
+    await logger.close();
+
+    const lines = readLines(segmentPath(logsDir, "test-module"));
+    check("one line", lines.length, 1);
+    const parsed = parseLine(lines[0] ?? "");
+    if ("reject" in parsed) throw new Error(`rejected as ${parsed.reject}: ${lines[0]}`);
+    check("fields survive", parsed.fields, [
+      ["text", "x\u001b]title"],
+      ["code", "2"],
+    ]);
+    expect(lines[0]).toEndWith(' text="x\\u001b]title" code=2');
+  });
+
   test("ordinary text passes through and caller redaction runs second", async () => {
     const logsDir = temporaryDirectory();
     const logger = createLogger(
@@ -596,17 +658,19 @@ describe("redaction and the one-line contract", () => {
     expect(lines[0]).toContain("one\\ntwo here");
   });
 
-  test("ANSI sequences are removed and counted, including through a redactor", async () => {
+  test("ANSI sequences in fields are removed and counted; a redactor's are escaped", async () => {
     const logsDir = temporaryDirectory();
     const logger = createLogger(
       configFor(logsDir, { redact: (line) => line.replace("plain", "\u001b[1mbold\u001b[0m") }),
     );
-    logger.info("color \u001b[31mred\u001b[0m and plain");
+    logger.info("color \u001b[31mred\u001b[0m and plain", { tag: "\u001b[32mok\u001b[0m" });
     await logger.close();
 
     const line = readLines(segmentPath(logsDir, "test-module"))[0] ?? "";
     expect(line).not.toContain("\u001b");
-    expect(line).toContain("color red and bold");
+    // The guard after the redactor never strips, so what a redactor introduces
+    // is kept as visible `\u001b` text rather than removed.
+    expect(line).toEndWith("color red and \\u001b[1mbold\\u001b[0m tag=ok");
     check("sequences stripped", logger.stats().ansiStripped, 4);
   });
 });
