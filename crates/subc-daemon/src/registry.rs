@@ -17,7 +17,7 @@ impl ConnectionId {
     #[cfg(test)]
     pub const LOCAL: Self = Self(0);
 
-    pub fn new(raw: u64) -> Self {
+    pub const fn new(raw: u64) -> Self {
         Self(raw)
     }
 
@@ -44,12 +44,49 @@ pub struct ModuleRegistration {
     pub control_ops: Vec<String>,
 }
 
+/// Which registration a lookup or a lifecycle wait is about.
+///
+/// A module id alone stops naming one process once a blue/green swap runs two
+/// processes under the same id: the incumbent in the active slot, the
+/// replacement in the candidate slot, and, after cutover, the old incumbent
+/// demoted until its connection goes away. A wait keyed on the bare id would
+/// confuse them (a successful swap never empties the id's active slot, and a
+/// candidate's "has it registered yet" would be answered by the incumbent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationSlot<'a> {
+    /// The routable registration for this module id. This is what every plain
+    /// start, stop and restart path means by "the module is registered".
+    Active(&'a str),
+    /// A swap candidate registered under this module id and not yet promoted.
+    Candidate(&'a str),
+    /// Whatever registration this module connection holds, in any slot.
+    Connection(ConnectionId),
+}
+
+/// The result of promoting a module's candidate registration to active.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegistryCutover {
+    /// The registration that is now active (the former candidate).
+    pub promoted: ModuleRegistration,
+    /// The former active registration, now demoted. `None` when the incumbent
+    /// had already gone away before the promotion.
+    pub superseded: Option<ModuleRegistration>,
+}
+
 /// Control-plane registry for module manifests and supervision ownership.
 ///
 /// Duplicate active `module_id`s are rejected rather than replaced. Rejection is
 /// the safer v1 behavior because replacing a still-connected module could hijack
 /// in-flight routes. Stale registrations are removed by connection cleanup; a
 /// reconnect after the old connection drops can then register the same id again.
+///
+/// A blue/green swap is the one sanctioned way two processes hold the same id.
+/// The replacement registers into a separate candidate slot, which every by-id
+/// lookup ignores, so it stays unroutable until [`Registry::promote_candidate`]
+/// swaps it in. The old incumbent is then kept as "superseded" until its
+/// connection deregisters. Lookups keyed by connection id search all three
+/// slots, because a connection must be able to update and remove its own
+/// registration whichever slot it currently sits in.
 #[derive(Debug, Default)]
 pub struct Registry {
     inner: Mutex<RegistryInner>,
@@ -58,6 +95,11 @@ pub struct Registry {
 #[derive(Debug, Default)]
 struct RegistryInner {
     modules: HashMap<String, ModuleRegistration>,
+    /// Swap candidates by module id: registered, never routable, never listed.
+    candidates: HashMap<String, ModuleRegistration>,
+    /// Former incumbents demoted by a promotion, kept only so their own
+    /// connection can still find and remove them. Never routable, never listed.
+    superseded: Vec<ModuleRegistration>,
     generation: u64,
 }
 
@@ -94,8 +136,95 @@ impl Registry {
         Ok(registration)
     }
 
+    /// Register a swap candidate for `manifest.module_id` into the candidate slot.
+    ///
+    /// The candidate is invisible to [`Self::get_module`], [`Self::list_modules`]
+    /// and every other by-id lookup until [`Self::promote_candidate`]. An active
+    /// registration for the id is not required, because the incumbent may die
+    /// while the swap is open; deciding whether a candidate may register at all
+    /// belongs to the caller that admits it. A second candidate for the same id
+    /// is refused.
+    pub fn register_candidate_with_control_ops(
+        &self,
+        manifest: ModuleManifest,
+        negotiated_ver: u8,
+        connection_id: ConnectionId,
+        control_ops: Vec<String>,
+    ) -> Result<ModuleRegistration, RegistryError> {
+        let module_id = manifest.module_id.clone();
+        if let Err(reason) = module_id_path_hazard(&module_id) {
+            return Err(RegistryError::PathHazardModuleId { module_id, reason });
+        }
+        let mut inner = self.lock_inner()?;
+        if inner.candidates.contains_key(&module_id) {
+            return Err(RegistryError::DuplicateModuleId { module_id });
+        }
+        let ready = manifest.ready.unwrap_or(true);
+        let registration = ModuleRegistration {
+            manifest,
+            ready,
+            negotiated_ver,
+            state: ChannelState::Active,
+            connection_id,
+            control_ops,
+        };
+        inner.candidates.insert(module_id, registration.clone());
+        Ok(registration)
+    }
+
+    /// Move the candidate for `module_id` into the active slot and demote the
+    /// previous active registration, in one registry critical section.
+    ///
+    /// Returns `Ok(None)` when there is no candidate to promote. Bumps the
+    /// catalog generation, because the listed registration for the id changed.
+    pub fn promote_candidate(
+        &self,
+        module_id: &str,
+    ) -> Result<Option<RegistryCutover>, RegistryError> {
+        let mut inner = self.lock_inner()?;
+        let Some(promoted) = inner.candidates.remove(module_id) else {
+            return Ok(None);
+        };
+        let superseded = inner
+            .modules
+            .insert(module_id.to_string(), promoted.clone());
+        if let Some(superseded) = superseded.clone() {
+            inner.superseded.push(superseded);
+        }
+        inner.bump_generation();
+        Ok(Some(RegistryCutover {
+            promoted,
+            superseded,
+        }))
+    }
+
+    /// The ACTIVE registration for `module_id`. Candidates and superseded
+    /// incumbents are never returned: this is the lookup routing decisions use.
     pub fn get_module(&self, module_id: &str) -> Result<Option<ModuleRegistration>, RegistryError> {
         Ok(self.lock_inner()?.modules.get(module_id).cloned())
+    }
+
+    /// The swap candidate registered for `module_id`, if any.
+    pub fn get_candidate(
+        &self,
+        module_id: &str,
+    ) -> Result<Option<ModuleRegistration>, RegistryError> {
+        Ok(self.lock_inner()?.candidates.get(module_id).cloned())
+    }
+
+    /// The registration held in one specific slot. See [`RegistrationSlot`].
+    pub fn registration(
+        &self,
+        slot: RegistrationSlot<'_>,
+    ) -> Result<Option<ModuleRegistration>, RegistryError> {
+        let inner = self.lock_inner()?;
+        Ok(match slot {
+            RegistrationSlot::Active(module_id) => inner.modules.get(module_id).cloned(),
+            RegistrationSlot::Candidate(module_id) => inner.candidates.get(module_id).cloned(),
+            RegistrationSlot::Connection(connection_id) => inner
+                .find_by_connection(connection_id)
+                .map(|(_, registration)| registration.clone()),
+        })
     }
 
     pub fn active_registration_count(&self) -> Result<usize, RegistryError> {
@@ -127,20 +256,26 @@ impl Registry {
         Ok(true)
     }
 
+    /// The registration owned by `connection_id`, searching the active,
+    /// candidate and superseded slots in that order.
     pub fn get_module_by_connection(
         &self,
         connection_id: ConnectionId,
     ) -> Result<Option<ModuleRegistration>, RegistryError> {
         Ok(self
             .lock_inner()?
-            .modules
-            .values()
-            .find(|registration| registration.connection_id == connection_id)
-            .cloned())
+            .find_by_connection(connection_id)
+            .map(|(_, registration)| registration.clone()))
     }
 
     /// Replace the provider role list and, when supplied, the attested capability
     /// declaration for the module owned by `connection_id`.
+    ///
+    /// Searches every slot: a swap candidate declares itself ready through this
+    /// call, and if only the active slot were searched its update would find
+    /// nothing and the candidate would never become ready. Only a change to the
+    /// active slot bumps the catalog generation, because only the active slot is
+    /// listed.
     pub fn replace_catalog_for_connection(
         &self,
         connection_id: ConnectionId,
@@ -149,19 +284,12 @@ impl Registry {
         ready: Option<bool>,
     ) -> Result<Option<ModuleRegistration>, RegistryError> {
         let mut inner = self.lock_inner()?;
-        let Some(module_id) = inner
-            .modules
-            .iter()
-            .find(|(_, registration)| registration.connection_id == connection_id)
-            .map(|(module_id, _)| module_id.clone())
-        else {
+        let Some((slot, _)) = inner.find_by_connection(connection_id) else {
             return Ok(None);
         };
-
         let registration = inner
-            .modules
-            .get_mut(&module_id)
-            .expect("module_id discovered from registry values must still exist");
+            .registration_mut(slot, connection_id)
+            .expect("registration discovered under the same registry lock must still exist");
         registration.manifest.provides = provides;
         if let Some(capabilities) = capabilities {
             registration.manifest.capabilities = Some(capabilities);
@@ -171,11 +299,13 @@ impl Registry {
             registration.manifest.ready = Some(ready);
         }
         let updated = registration.clone();
-        inner.bump_generation();
+        if matches!(slot, SlotKind::Active) {
+            inner.bump_generation();
+        }
         Ok(Some(updated))
     }
 
-    /// Deregister every module owned by a dropped connection.
+    /// Deregister every module owned by a dropped connection, in any slot.
     pub fn deregister_connection(
         &self,
         connection_id: ConnectionId,
@@ -188,10 +318,33 @@ impl Registry {
             .map(|(module_id, _)| module_id.clone())
             .collect();
 
-        Ok(module_ids
+        let mut closed: Vec<ModuleRegistration> = module_ids
             .into_iter()
             .filter_map(|module_id| inner.close_module(&module_id))
-            .collect())
+            .collect();
+
+        let candidate_ids: Vec<String> = inner
+            .candidates
+            .iter()
+            .filter(|(_, registration)| registration.connection_id == connection_id)
+            .map(|(module_id, _)| module_id.clone())
+            .collect();
+        for module_id in candidate_ids {
+            if let Some(mut registration) = inner.candidates.remove(&module_id) {
+                registration.state = ChannelState::Closed;
+                closed.push(registration);
+            }
+        }
+
+        let (removed, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut inner.superseded)
+            .into_iter()
+            .partition(|registration| registration.connection_id == connection_id);
+        inner.superseded = kept;
+        closed.extend(removed.into_iter().map(|mut registration| {
+            registration.state = ChannelState::Closed;
+            registration
+        }));
+        Ok(closed)
     }
 
     fn lock_inner(&self) -> Result<MutexGuard<'_, RegistryInner>, RegistryError> {
@@ -199,7 +352,53 @@ impl Registry {
     }
 }
 
+/// Which internal slot a connection-keyed lookup found its registration in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotKind {
+    Active,
+    Candidate,
+    Superseded,
+}
+
 impl RegistryInner {
+    fn find_by_connection(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Option<(SlotKind, &ModuleRegistration)> {
+        let owned_by =
+            |registration: &&ModuleRegistration| registration.connection_id == connection_id;
+        self.modules
+            .values()
+            .find(owned_by)
+            .map(|registration| (SlotKind::Active, registration))
+            .or_else(|| {
+                self.candidates
+                    .values()
+                    .find(owned_by)
+                    .map(|registration| (SlotKind::Candidate, registration))
+            })
+            .or_else(|| {
+                self.superseded
+                    .iter()
+                    .find(owned_by)
+                    .map(|registration| (SlotKind::Superseded, registration))
+            })
+    }
+
+    fn registration_mut(
+        &mut self,
+        slot: SlotKind,
+        connection_id: ConnectionId,
+    ) -> Option<&mut ModuleRegistration> {
+        let owned_by =
+            |registration: &&mut ModuleRegistration| registration.connection_id == connection_id;
+        match slot {
+            SlotKind::Active => self.modules.values_mut().find(owned_by),
+            SlotKind::Candidate => self.candidates.values_mut().find(owned_by),
+            SlotKind::Superseded => self.superseded.iter_mut().find(owned_by),
+        }
+    }
+
     fn close_module(&mut self, module_id: &str) -> Option<ModuleRegistration> {
         let mut registration = self.modules.remove(module_id)?;
         registration.state = ChannelState::Closed;
@@ -370,5 +569,146 @@ mod path_hazard_tests {
                 .unwrap_or_else(|err| panic!("id {good:?} must register: {err}"));
         }
         assert_eq!(registry.active_registration_count().unwrap(), 3);
+    }
+}
+
+#[cfg(test)]
+mod swap_slot_tests {
+    use super::*;
+
+    fn manifest(module_id: &str, ready: Option<bool>) -> ModuleManifest {
+        let mut manifest = ModuleManifest::builder(module_id, "0.1.0").build();
+        manifest.ready = ready;
+        manifest
+    }
+
+    const INCUMBENT: ConnectionId = ConnectionId(1);
+    const CANDIDATE: ConnectionId = ConnectionId(2);
+
+    fn registry_with_candidate() -> Registry {
+        let registry = Registry::default();
+        registry
+            .register_with_control_ops(manifest("m", None), 1, INCUMBENT, Vec::new())
+            .unwrap();
+        registry
+            .register_candidate_with_control_ops(
+                manifest("m", Some(false)),
+                1,
+                CANDIDATE,
+                Vec::new(),
+            )
+            .unwrap();
+        registry
+    }
+
+    #[test]
+    fn candidate_is_invisible_to_by_id_lookups_and_listing() {
+        let registry = registry_with_candidate();
+        let generation = registry.generation().unwrap();
+        assert_eq!(
+            registry.get_module("m").unwrap().unwrap().connection_id,
+            INCUMBENT
+        );
+        let (listed_generation, listed) = registry.list_modules().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].connection_id, INCUMBENT);
+        assert_eq!(listed_generation, generation);
+        assert_eq!(registry.active_registration_count().unwrap(), 1);
+        assert_eq!(
+            registry.get_candidate("m").unwrap().unwrap().connection_id,
+            CANDIDATE
+        );
+        assert_eq!(
+            registry
+                .register_candidate_with_control_ops(
+                    manifest("m", None),
+                    1,
+                    ConnectionId(3),
+                    Vec::new()
+                )
+                .unwrap_err(),
+            RegistryError::DuplicateModuleId {
+                module_id: "m".to_string()
+            }
+        );
+    }
+
+    /// Without the candidate slot in the connection-keyed search, this update
+    /// returns `Ok(None)` and the candidate never becomes ready.
+    #[test]
+    fn candidate_catalog_update_reaches_the_candidate_registration() {
+        let registry = registry_with_candidate();
+        assert!(!registry.get_candidate("m").unwrap().unwrap().ready);
+
+        let updated = registry
+            .replace_catalog_for_connection(CANDIDATE, Vec::new(), None, Some(true))
+            .unwrap()
+            .expect("the candidate's own connection finds its registration");
+
+        assert_eq!(updated.connection_id, CANDIDATE);
+        assert!(registry.get_candidate("m").unwrap().unwrap().ready);
+        assert_eq!(
+            registry.get_module_by_connection(CANDIDATE).unwrap(),
+            Some(updated)
+        );
+        assert_eq!(
+            registry.get_module("m").unwrap().unwrap().connection_id,
+            INCUMBENT,
+            "a candidate's update must not touch the active registration"
+        );
+    }
+
+    #[test]
+    fn promotion_swaps_slots_and_each_connection_still_deregisters_its_own() {
+        let registry = registry_with_candidate();
+        let before = registry.generation().unwrap();
+        let cutover = registry.promote_candidate("m").unwrap().unwrap();
+        assert_eq!(cutover.promoted.connection_id, CANDIDATE);
+        assert_eq!(cutover.superseded.unwrap().connection_id, INCUMBENT);
+        assert_ne!(registry.generation().unwrap(), before);
+        assert_eq!(registry.promote_candidate("m").unwrap(), None);
+
+        assert_eq!(
+            registry
+                .registration(RegistrationSlot::Active("m"))
+                .unwrap()
+                .unwrap()
+                .connection_id,
+            CANDIDATE
+        );
+        assert!(registry
+            .registration(RegistrationSlot::Candidate("m"))
+            .unwrap()
+            .is_none());
+        assert!(registry
+            .registration(RegistrationSlot::Connection(INCUMBENT))
+            .unwrap()
+            .is_some());
+
+        let closed = registry.deregister_connection(INCUMBENT).unwrap();
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].connection_id, INCUMBENT);
+        assert_eq!(closed[0].state, ChannelState::Closed);
+        assert!(registry
+            .registration(RegistrationSlot::Connection(INCUMBENT))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            registry.get_module("m").unwrap().unwrap().connection_id,
+            CANDIDATE
+        );
+    }
+
+    #[test]
+    fn a_dropped_candidate_deregisters_from_the_candidate_slot_only() {
+        let registry = registry_with_candidate();
+        let closed = registry.deregister_connection(CANDIDATE).unwrap();
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].connection_id, CANDIDATE);
+        assert!(registry.get_candidate("m").unwrap().is_none());
+        assert_eq!(
+            registry.get_module("m").unwrap().unwrap().connection_id,
+            INCUMBENT
+        );
     }
 }

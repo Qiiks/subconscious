@@ -191,6 +191,23 @@ pub(crate) enum RouteBindRelayOutcome {
     ModuleGone(String),
 }
 
+/// What [`ForwardingTable::cutover_candidate`] did.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "blue/green swap is driven by the supervisor's swap state machine, which is not wired yet; until then only tests reach it"
+    )
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ForwardingCutover {
+    /// The endpoint now in the active slot (the former candidate).
+    pub promoted: ModuleEndpointId,
+    /// The endpoint demoted out of the active slot, to be drained by endpoint.
+    /// `None` when the incumbent's connection was already gone.
+    pub incumbent: Option<ModuleEndpointId>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct PendingRelayCompletion {
     pub settled: bool,
@@ -291,7 +308,22 @@ struct ModuleConnection {
 #[derive(Debug, Default)]
 struct ForwardingInner {
     daemon_draining: bool,
+    /// The ACTIVE slot: the one endpoint per module id that routing resolves.
+    /// Every by-id lookup (relay reservation, drain-by-id, liveness, census,
+    /// live roots, module-control RPCs) reads this map and nothing else.
     modules_by_id: HashMap<String, ModuleConnection>,
+    /// The CANDIDATE slot of a blue/green swap: a second process registered
+    /// under an id that already has an active endpoint. It has a full endpoint
+    /// identity (so its own connection can be looked up and torn down) but no
+    /// by-id lookup sees it, so nothing is routed to it until `cutover_candidate`
+    /// promotes it.
+    candidates_by_id: HashMap<String, ModuleConnection>,
+    /// Former active endpoints demoted by `cutover_candidate`, until their
+    /// connection is removed. Membership is what distinguishes an endpoint that
+    /// was SUPERSEDED by a promotion (still alive, still carrying bound routes,
+    /// about to be drained) from one that is merely STALE (replaced some other
+    /// way, which is treated as a fault on the acking connection).
+    superseded_endpoints: HashMap<ModuleEndpointId, ModuleConnection>,
     endpoint_by_connection: HashMap<ConnectionId, ModuleEndpointId>,
     module_id_by_endpoint: HashMap<ModuleEndpointId, String>,
     /// Endpoints mid-drain, keyed to the reason the drain was begun with. The
@@ -473,6 +505,129 @@ impl ForwardingTable {
             );
         }
         Ok(endpoint)
+    }
+
+    /// Register a blue/green swap candidate for `module_id` into the candidate
+    /// slot, alongside whatever endpoint is active for the id.
+    ///
+    /// Unlike [`Self::register_module_connection`], this never touches the
+    /// active slot and never resets the bind-relay breaker: the incumbent is
+    /// still the process serving the id, so what the breaker learned about it
+    /// is still true. The breaker is reset at cutover instead, when the process
+    /// behind the name actually changes. A second candidate for the same id is
+    /// refused.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "blue/green swap is driven by the supervisor's swap state machine, which is not wired yet; until then only tests reach it"
+        )
+    )]
+    pub(crate) fn register_candidate_module_connection(
+        &self,
+        connection_id: ConnectionId,
+        module_id: String,
+        negotiated_ver: u8,
+        concurrency: Concurrency,
+        sink: FrameSink,
+    ) -> Result<ModuleEndpointId, ForwardingError> {
+        let mut inner = self.write_inner()?;
+        if inner.daemon_draining || inner.closing_connections.contains(&connection_id) {
+            return Err(ForwardingError::ConnectionClosing { connection_id });
+        }
+        if inner.candidates_by_id.contains_key(&module_id) {
+            return Err(ForwardingError::CandidateSlotOccupied { module_id });
+        }
+        if let Some(old_endpoint) = inner.endpoint_by_connection.remove(&connection_id) {
+            let _ = remove_module_connection_locked(&mut inner, old_endpoint);
+        }
+
+        inner.next_generation = inner.next_generation.checked_add(1).unwrap_or(1);
+        let endpoint = ModuleEndpointId {
+            connection_id,
+            generation: inner.next_generation,
+        };
+        inner.endpoint_by_connection.insert(connection_id, endpoint);
+        inner
+            .module_id_by_endpoint
+            .insert(endpoint, module_id.clone());
+        inner.next_module_channel.insert(endpoint, 1);
+        inner.next_control_corr.insert(endpoint, 1);
+        inner.candidates_by_id.insert(
+            module_id,
+            ModuleConnection {
+                endpoint,
+                sink,
+                negotiated_ver,
+                concurrency,
+            },
+        );
+        Ok(endpoint)
+    }
+
+    /// Promote `module_id`'s candidate to the active slot, in ONE forwarding
+    /// write-lock critical section.
+    ///
+    /// That single section is the linearization point of a swap. Every relay
+    /// reservation resolves the active slot under the same lock, so each one
+    /// lands wholly before cutover (on the incumbent) or wholly after it (on the
+    /// promoted candidate), never on a mix. A relay reserved on the incumbent
+    /// before cutover can no longer commit: `commit_route_locked` requires the
+    /// reservation's endpoint to be the active one, and an ack for it arriving
+    /// later is answered by the superseded-endpoint arm of
+    /// `complete_pending_relay` instead of ending the incumbent's connection.
+    ///
+    /// Both endpoints keep their identities: nothing is re-keyed, so the
+    /// incumbent's bound routes and its pending correlation keys stay exactly
+    /// where they are until it is drained with [`Self::begin_endpoint_drain`],
+    /// using the incumbent endpoint this returns. Returns `Ok(None)` when there
+    /// is no candidate for the id.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "blue/green swap is driven by the supervisor's swap state machine, which is not wired yet; until then only tests reach it"
+        )
+    )]
+    pub(crate) fn cutover_candidate(
+        &self,
+        module_id: &str,
+    ) -> Result<Option<ForwardingCutover>, ForwardingError> {
+        let mut inner = self.write_inner()?;
+        if inner.daemon_draining {
+            return Err(ForwardingError::ModuleReloading {
+                module_id: module_id.to_string(),
+            });
+        }
+        let Some(candidate) = inner.candidates_by_id.remove(module_id) else {
+            return Ok(None);
+        };
+        let promoted = candidate.endpoint;
+        let incumbent = inner.modules_by_id.insert(module_id.to_string(), candidate);
+        let incumbent = incumbent.map(|incumbent| {
+            let endpoint = incumbent.endpoint;
+            inner.superseded_endpoints.insert(endpoint, incumbent);
+            endpoint
+        });
+        drop(inner);
+
+        // A different process now answers for this id; see the matching reset
+        // in `register_module_connection` for why a verdict about the old one
+        // must not carry over.
+        if let Some(discarded) = self
+            .route_bind_breakers
+            .reset_for_new_module_connection(module_id)
+        {
+            info!(
+                module_id = %module_id,
+                discarded_consecutive_timeouts = discarded,
+                "route.bind breaker state discarded: a swap candidate was promoted over the process it described"
+            );
+        }
+        Ok(Some(ForwardingCutover {
+            promoted,
+            incumbent,
+        }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1001,6 +1156,49 @@ impl ForwardingTable {
                     abandoned,
                 });
             }
+            // The acking endpoint was the active one when this relay was
+            // reserved, and a swap has since promoted a candidate over it. The
+            // module did nothing wrong: it bound the route it was asked to bind,
+            // and it is still carrying every other client's routes until it is
+            // drained. So this is settled here, while the pending entry still
+            // holds the client's sender and the reservation pair: release the
+            // pair, tell the waiting route.open to retry (it will reserve on the
+            // promoted endpoint), and hand back the module-side channel so the
+            // caller sends one channel-scoped GOODBYE for the binding the module
+            // just created. Nothing here touches the module connection.
+            //
+            // Only membership in `superseded_endpoints` takes this arm. An
+            // endpoint that stopped being the active one for any other reason
+            // is STALE, not superseded, and still falls through to
+            // `commit_route_locked`, which refuses it with `StaleModuleEndpoint`
+            // exactly as before swaps existed.
+            RouteBindRelayOutcome::Accepted
+                if inner.superseded_endpoints.contains_key(&endpoint) =>
+            {
+                release_reserved_route_locked(
+                    &mut inner,
+                    pending.reservation.client_key,
+                    pending.reservation.module_key,
+                );
+                // Not gated on `relay_enqueued`: an ack proves the module
+                // received the bind, whether or not the enqueue mark was set.
+                let abandoned = abandoned_route_target(&inner, &pending.reservation);
+                let module_id = inner
+                    .module_id_by_endpoint
+                    .get(&endpoint)
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".to_string());
+                let _ = pending
+                    .sender
+                    .send(RouteBindRelayOutcome::Rejected(ErrorBody::new(
+                        "module_reloading",
+                        format!("module_id '{module_id}' is reloading"),
+                    )));
+                return Ok(PendingRelayCompletion {
+                    settled: true,
+                    abandoned,
+                });
+            }
             RouteBindRelayOutcome::Accepted => {
                 let abandoned = commit_route_locked(&mut inner, pending)?;
                 return Ok(PendingRelayCompletion {
@@ -1109,6 +1307,14 @@ impl ForwardingTable {
     #[cfg(test)]
     pub(crate) fn closing_connection_count(&self) -> Result<usize, ForwardingError> {
         Ok(self.read_inner()?.closing_connections.len())
+    }
+
+    /// Reserved-but-uncommitted route handles, counted on both index sides, so
+    /// a test can assert a reservation pair was actually given back.
+    #[cfg(test)]
+    pub(crate) fn reserved_route_count(&self) -> Result<(usize, usize), ForwardingError> {
+        let inner = self.read_inner()?;
+        Ok((inner.reserved_client.len(), inner.reserved_module.len()))
     }
 
     pub(crate) fn module_endpoint_for_connection(
@@ -1361,9 +1567,30 @@ impl ForwardingTable {
                 .draining_endpoints
                 .insert(*endpoint, RouteCloseReason::Restart);
         }
+        // Swap candidates and superseded incumbents are not routable, but they
+        // are live endpoints that could still be sent module-control work, so
+        // the daemon-wide gate covers them too. The returned ids are unchanged:
+        // they name modules for the supervisor to drain, one per id.
+        let off_slot_endpoints = inner
+            .candidates_by_id
+            .values()
+            .map(|module| module.endpoint)
+            .chain(inner.superseded_endpoints.keys().copied())
+            .collect::<Vec<_>>();
+        for endpoint in off_slot_endpoints {
+            inner
+                .draining_endpoints
+                .insert(endpoint, RouteCloseReason::Restart);
+        }
         Ok(modules.into_iter().map(|(id, _)| id).collect())
     }
 
+    /// Begin draining whatever endpoint is ACTIVE for `module_id`.
+    ///
+    /// After a swap's cutover the active endpoint is the promoted candidate, so
+    /// this must not be used to drain the incumbent; use
+    /// [`Self::begin_endpoint_drain`] with the endpoint `cutover_candidate`
+    /// returned.
     pub(crate) fn begin_module_drain(
         &self,
         module_id: &str,
@@ -1373,6 +1600,54 @@ impl ForwardingTable {
         let Some(module) = inner.modules_by_id.get(module_id).cloned() else {
             return Ok(None);
         };
+        Ok(Some(begin_drain_locked(
+            &mut inner, module_id, module, reason,
+        )))
+    }
+
+    /// Begin draining one specific endpoint, whichever slot it is in.
+    ///
+    /// This is how a swap drains its incumbent after cutover: the incumbent's
+    /// endpoint is captured by `cutover_candidate`, and resolving it by module id
+    /// instead would find the promoted candidate and leave neither process
+    /// routable. Returns `Ok(None)` when the endpoint is no longer registered.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "blue/green swap is driven by the supervisor's swap state machine, which is not wired yet; until then only tests reach it"
+        )
+    )]
+    pub(crate) fn begin_endpoint_drain(
+        &self,
+        endpoint: ModuleEndpointId,
+        reason: RouteCloseReason,
+    ) -> Result<Option<ModuleDrainTarget>, ForwardingError> {
+        let mut inner = self.write_inner()?;
+        let Some(module) = module_connection_for_endpoint_locked(&inner, endpoint).cloned() else {
+            return Ok(None);
+        };
+        let module_id = inner
+            .module_id_by_endpoint
+            .get(&endpoint)
+            .cloned()
+            .expect("an endpoint resolved to a module connection has a module id");
+        Ok(Some(begin_drain_locked(
+            &mut inner, &module_id, module, reason,
+        )))
+    }
+}
+
+/// Mark `module`'s endpoint draining and settle everything still pending on it.
+/// Shared by the by-id and by-endpoint drain entry points, which differ only in
+/// how they find the endpoint.
+fn begin_drain_locked(
+    inner: &mut ForwardingInner,
+    module_id: &str,
+    module: ModuleConnection,
+    reason: RouteCloseReason,
+) -> ModuleDrainTarget {
+    {
         let endpoint = module.endpoint;
         inner.draining_endpoints.insert(endpoint, reason);
 
@@ -1399,12 +1674,12 @@ impl ForwardingTable {
                 continue;
             };
             release_reserved_route_locked(
-                &mut inner,
+                inner,
                 pending.reservation.client_key,
                 pending.reservation.module_key,
             );
             if pending.relay_enqueued {
-                if let Some(target) = abandoned_route_target(&inner, &pending.reservation) {
+                if let Some(target) = abandoned_route_target(inner, &pending.reservation) {
                     abandoned_bindings.push(target);
                 }
             }
@@ -1432,15 +1707,17 @@ impl ForwardingTable {
             }
         }
 
-        Ok(Some(ModuleDrainTarget {
+        ModuleDrainTarget {
             endpoint,
             sink: module.sink,
             negotiated_ver: module.negotiated_ver,
             abandoned_bindings,
             excluded_subscriptions,
-        }))
+        }
     }
+}
 
+impl ForwardingTable {
     pub(crate) fn endpoint_in_flight_count(
         &self,
         endpoint: ModuleEndpointId,
@@ -2067,6 +2344,31 @@ fn commit_route_locked(
     Ok(None)
 }
 
+/// The live module connection registered under exactly `endpoint`, whichever
+/// slot holds it: active, swap candidate, or superseded incumbent.
+///
+/// Resolving by endpoint rather than by module id is what keeps an incumbent
+/// addressable after a swap promoted a candidate over its id. An endpoint that
+/// is in none of the three (a stale one, replaced without a promotion) resolves
+/// to nothing, as it always has.
+fn module_connection_for_endpoint_locked(
+    inner: &ForwardingInner,
+    endpoint: ModuleEndpointId,
+) -> Option<&ModuleConnection> {
+    let module_id = inner.module_id_by_endpoint.get(&endpoint)?;
+    inner
+        .modules_by_id
+        .get(module_id)
+        .filter(|module| module.endpoint == endpoint)
+        .or_else(|| {
+            inner
+                .candidates_by_id
+                .get(module_id)
+                .filter(|module| module.endpoint == endpoint)
+        })
+        .or_else(|| inner.superseded_endpoints.get(&endpoint))
+}
+
 fn abandoned_route_target(
     inner: &ForwardingInner,
     reservation: &RouteReservation,
@@ -2074,7 +2376,7 @@ fn abandoned_route_target(
     let module_id = inner
         .module_id_by_endpoint
         .get(&reservation.module_key.endpoint)?;
-    let module = inner.modules_by_id.get(module_id)?;
+    let module = module_connection_for_endpoint_locked(inner, reservation.module_key.endpoint)?;
     (module.endpoint == reservation.module_key.endpoint).then(|| GoodbyeTarget {
         connection_id: module.endpoint.connection_id,
         sink: module.sink.clone(),
@@ -2100,7 +2402,15 @@ fn remove_module_connection_locked(
         {
             inner.modules_by_id.remove(module_id);
         }
+        if inner
+            .candidates_by_id
+            .get(module_id)
+            .is_some_and(|module| module.endpoint == endpoint)
+        {
+            inner.candidates_by_id.remove(module_id);
+        }
     }
+    inner.superseded_endpoints.remove(&endpoint);
     inner.endpoint_by_connection.remove(&endpoint.connection_id);
     inner.next_module_channel.remove(&endpoint);
     inner.next_control_corr.remove(&endpoint);
@@ -2391,6 +2701,10 @@ pub enum ForwardingError {
         connection_id: ConnectionId,
     },
     RouteOpenBuild(String),
+    /// A swap candidate is already registered for this module id.
+    CandidateSlotOccupied {
+        module_id: String,
+    },
     Poisoned,
 }
 
@@ -2436,6 +2750,10 @@ impl fmt::Display for ForwardingError {
             Self::RouteOpenBuild(message) => {
                 write!(f, "failed to prebuild route.open response: {message}")
             }
+            Self::CandidateSlotOccupied { module_id } => write!(
+                f,
+                "module_id '{module_id}' already has a swap candidate registered"
+            ),
             Self::Poisoned => write!(f, "forwarding table lock was poisoned"),
         }
     }
@@ -3449,5 +3767,386 @@ mod tests {
         // left to protect for this id.
         forwarding.cleanup_connection(client).unwrap();
         assert_eq!(forwarding.closing_connection_count().unwrap(), 0);
+    }
+}
+
+/// Blue/green swap slots: a candidate registered beside the active endpoint,
+/// promoted by `cutover_candidate`, with the old incumbent drained by endpoint.
+#[cfg(test)]
+mod swap_slot_tests {
+    use std::time::Duration;
+
+    use super::*;
+    use tokio::sync::mpsc;
+
+    const MODULE_ID: &str = "swapped";
+
+    struct SwapFixture {
+        forwarding: ForwardingTable,
+        incumbent_connection: ConnectionId,
+        incumbent: ModuleEndpointId,
+        candidate_connection: ConnectionId,
+        candidate: ModuleEndpointId,
+        _module_rxs: Vec<mpsc::Receiver<crate::router::OutboundFrame>>,
+    }
+
+    fn swap_fixture() -> SwapFixture {
+        let forwarding = ForwardingTable::default();
+        let incumbent_connection = ConnectionId::new(100);
+        let candidate_connection = ConnectionId::new(110);
+        let (incumbent_tx, incumbent_rx) = mpsc::channel(8);
+        let incumbent = forwarding
+            .register_module_connection(
+                incumbent_connection,
+                MODULE_ID.to_string(),
+                2,
+                Concurrency::ModuleManaged,
+                FrameSink::new(incumbent_tx),
+            )
+            .unwrap();
+        let (candidate_tx, candidate_rx) = mpsc::channel(8);
+        let candidate = forwarding
+            .register_candidate_module_connection(
+                candidate_connection,
+                MODULE_ID.to_string(),
+                2,
+                Concurrency::ModuleManaged,
+                FrameSink::new(candidate_tx),
+            )
+            .unwrap();
+        SwapFixture {
+            forwarding,
+            incumbent_connection,
+            incumbent,
+            candidate_connection,
+            candidate,
+            _module_rxs: vec![incumbent_rx, candidate_rx],
+        }
+    }
+
+    fn client(
+        raw: u64,
+    ) -> (
+        ConnectionId,
+        FrameSink,
+        mpsc::Receiver<crate::router::OutboundFrame>,
+    ) {
+        let (tx, rx) = mpsc::channel(8);
+        (ConnectionId::new(raw), FrameSink::new(tx), rx)
+    }
+
+    fn committed_endpoints(forwarding: &ForwardingTable) -> Vec<ModuleEndpointId> {
+        forwarding
+            .read_inner()
+            .unwrap()
+            .client_to_module
+            .values()
+            .map(|route| route.module_endpoint)
+            .collect()
+    }
+
+    #[test]
+    fn candidate_is_unroutable_until_cutover_and_by_id_lookups_resolve_the_active_slot() {
+        let fixture = swap_fixture();
+        let forwarding = &fixture.forwarding;
+        assert_ne!(fixture.incumbent, fixture.candidate);
+
+        // Every by-id consumer still resolves the incumbent.
+        assert!(forwarding.has_live_module_connection(MODULE_ID).unwrap());
+        assert!(!forwarding.module_is_draining(MODULE_ID).unwrap());
+        let (client_connection, client_sink, _client_rx) = client(200);
+        let pending = forwarding
+            .begin_route_bind_relay_for_test(client_connection, client_sink, 1, MODULE_ID)
+            .unwrap();
+        assert_eq!(pending.endpoint, fixture.incumbent);
+        let rpc = forwarding
+            .begin_module_control_rpc_for(
+                MODULE_ID,
+                "health.check",
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(rpc.endpoint, fixture.incumbent);
+        let census = forwarding.route_census(Some(MODULE_ID)).unwrap();
+        assert_eq!(census.len(), 1, "the census lists one endpoint per id");
+
+        // Connection-keyed lookups see the candidate, so its own frames resolve.
+        assert_eq!(
+            forwarding
+                .module_endpoint_for_connection(fixture.candidate_connection)
+                .unwrap(),
+            Some(fixture.candidate)
+        );
+        assert_eq!(
+            forwarding
+                .module_id_for_connection(fixture.candidate_connection)
+                .unwrap()
+                .as_deref(),
+            Some(MODULE_ID)
+        );
+
+        // One candidate per id.
+        let (other_tx, _other_rx) = mpsc::channel(1);
+        assert_eq!(
+            forwarding.register_candidate_module_connection(
+                ConnectionId::new(120),
+                MODULE_ID.to_string(),
+                2,
+                Concurrency::ModuleManaged,
+                FrameSink::new(other_tx),
+            ),
+            Err(ForwardingError::CandidateSlotOccupied {
+                module_id: MODULE_ID.to_string()
+            })
+        );
+    }
+
+    /// The cutover linearization point. A relay reserved on the incumbent before
+    /// cutover must never become a route on the incumbent, and every relay
+    /// reserved after it must land on the promoted candidate.
+    #[test]
+    fn relay_reserved_before_cutover_never_commits_and_later_relays_land_on_the_candidate() {
+        let fixture = swap_fixture();
+        let forwarding = &fixture.forwarding;
+        let (early_client, early_sink, _early_rx) = client(200);
+        let mut early = forwarding
+            .begin_route_bind_relay_for_test(early_client, early_sink, 1, MODULE_ID)
+            .unwrap();
+        assert_eq!(early.endpoint, fixture.incumbent);
+        assert!(forwarding
+            .mark_route_bind_relay_enqueued(early.endpoint, early.corr)
+            .unwrap());
+
+        let cutover = forwarding.cutover_candidate(MODULE_ID).unwrap().unwrap();
+        assert_eq!(
+            cutover,
+            ForwardingCutover {
+                promoted: fixture.candidate,
+                incumbent: Some(fixture.incumbent),
+            }
+        );
+
+        // A route.open reserved after cutover goes to the promoted candidate.
+        let (late_client, late_sink, _late_rx) = client(201);
+        let late = forwarding
+            .begin_route_bind_relay_for_test(late_client, late_sink, 2, MODULE_ID)
+            .unwrap();
+        assert_eq!(
+            late.endpoint, fixture.candidate,
+            "a route.open after cutover was reserved on the incumbent"
+        );
+
+        // The incumbent acks the early relay after cutover.
+        let completion = forwarding
+            .complete_pending_relay(
+                fixture.incumbent_connection,
+                early.corr,
+                RouteBindRelayOutcome::Accepted,
+            )
+            .expect("a superseded endpoint's ack is not an error on its connection");
+        assert!(completion.settled);
+        assert!(
+            !committed_endpoints(forwarding).contains(&fixture.incumbent),
+            "a relay reserved before cutover committed a route on the incumbent"
+        );
+        let goodbye = completion
+            .abandoned
+            .expect("the incumbent is told to drop the binding it just created");
+        assert_eq!(goodbye.connection_id, fixture.incumbent_connection);
+        assert_eq!(goodbye.channel, early.module_channel);
+        assert_eq!(goodbye.epoch, early.module_epoch);
+        assert_eq!(goodbye.kind, GoodbyeTargetKind::Module);
+        match early.receiver.try_recv() {
+            Ok(RouteBindRelayOutcome::Rejected(body)) => assert_eq!(body.code, "module_reloading"),
+            other => panic!("expected a retryable module_reloading answer, got {other:?}"),
+        }
+        assert!(matches!(
+            forwarding
+                .lookup_data_route(early_client, early.client_channel, early.client_epoch)
+                .unwrap(),
+            DataRoute::Client(DataRouteState::Absent)
+        ));
+
+        // The late relay commits on the candidate; only its pair stays reserved
+        // until then.
+        assert_eq!(forwarding.reserved_route_count().unwrap(), (1, 1));
+        forwarding
+            .complete_pending_relay(
+                fixture.candidate_connection,
+                late.corr,
+                RouteBindRelayOutcome::Accepted,
+            )
+            .unwrap();
+        assert_eq!(forwarding.reserved_route_count().unwrap(), (0, 0));
+        assert_eq!(committed_endpoints(forwarding), vec![fixture.candidate]);
+    }
+
+    #[test]
+    fn endpoint_drain_after_cutover_drains_the_incumbent_not_the_promoted_candidate() {
+        let fixture = swap_fixture();
+        let forwarding = &fixture.forwarding;
+        // One bound route and one in-flight relay on the incumbent.
+        let (bound_client, bound_sink, _bound_rx) = client(200);
+        let bound = forwarding
+            .begin_route_bind_relay_for_test(bound_client, bound_sink, 1, MODULE_ID)
+            .unwrap();
+        forwarding
+            .complete_pending_relay(
+                fixture.incumbent_connection,
+                bound.corr,
+                RouteBindRelayOutcome::Accepted,
+            )
+            .unwrap();
+        let (pending_client, pending_sink, _pending_rx) = client(201);
+        let mut in_flight = forwarding
+            .begin_route_bind_relay_for_test(pending_client, pending_sink, 2, MODULE_ID)
+            .unwrap();
+        forwarding
+            .mark_route_bind_relay_enqueued(in_flight.endpoint, in_flight.corr)
+            .unwrap();
+
+        let incumbent = forwarding
+            .cutover_candidate(MODULE_ID)
+            .unwrap()
+            .unwrap()
+            .incumbent
+            .unwrap();
+        let target = forwarding
+            .begin_endpoint_drain(incumbent, RouteCloseReason::Restart)
+            .unwrap()
+            .expect("the superseded incumbent is still registered");
+
+        assert_eq!(target.endpoint, fixture.incumbent);
+        assert!(forwarding.endpoint_is_draining(fixture.incumbent).unwrap());
+        assert!(!forwarding.endpoint_is_draining(fixture.candidate).unwrap());
+        assert!(!forwarding.module_is_draining(MODULE_ID).unwrap());
+        assert_eq!(target.abandoned_bindings.len(), 1);
+        assert_eq!(
+            target.abandoned_bindings[0].channel,
+            in_flight.module_channel
+        );
+        assert!(matches!(
+            in_flight.receiver.try_recv(),
+            Ok(RouteBindRelayOutcome::Rejected(body)) if body.code == "module_reloading"
+        ));
+        assert_eq!(
+            forwarding.endpoint_routes(fixture.incumbent).unwrap().len(),
+            1,
+            "the incumbent's bound route stays until its drain finishes"
+        );
+
+        let (next_client, next_sink, _next_rx) = client(202);
+        let next = forwarding
+            .begin_route_bind_relay_for_test(next_client, next_sink, 3, MODULE_ID)
+            .expect("the promoted candidate keeps accepting routes");
+        assert_eq!(next.endpoint, fixture.candidate);
+    }
+
+    /// An endpoint replaced WITHOUT a promotion (a successor registered over it
+    /// as an ordinary active HELLO) is stale, not superseded, and its ack still
+    /// fails the acking connection exactly as it did before swap slots existed:
+    /// `StaleModuleEndpoint`, the reservation indexes already stripped, and the
+    /// waiting client's sender dropped unanswered.
+    #[test]
+    fn stale_endpoint_ack_without_a_promotion_still_fails_as_before() {
+        let forwarding = ForwardingTable::default();
+        let first_connection = ConnectionId::new(70);
+        let (first_tx, _first_rx) = mpsc::channel(8);
+        forwarding
+            .register_module_connection(
+                first_connection,
+                MODULE_ID.to_string(),
+                2,
+                Concurrency::ModuleManaged,
+                FrameSink::new(first_tx),
+            )
+            .unwrap();
+        let (client_connection, client_sink, _client_rx) = client(200);
+        let mut pending = forwarding
+            .begin_route_bind_relay_for_test(client_connection, client_sink, 1, MODULE_ID)
+            .unwrap();
+        let (second_tx, _second_rx) = mpsc::channel(8);
+        forwarding
+            .register_module_connection(
+                ConnectionId::new(80),
+                MODULE_ID.to_string(),
+                2,
+                Concurrency::ModuleManaged,
+                FrameSink::new(second_tx),
+            )
+            .unwrap();
+
+        assert_eq!(
+            forwarding
+                .complete_pending_relay(
+                    first_connection,
+                    pending.corr,
+                    RouteBindRelayOutcome::Accepted
+                )
+                .unwrap_err(),
+            ForwardingError::StaleModuleEndpoint
+        );
+        assert!(committed_endpoints(&forwarding).is_empty());
+        assert_eq!(forwarding.reserved_route_count().unwrap(), (0, 0));
+        assert!(matches!(
+            pending.receiver.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+    }
+
+    #[test]
+    fn cleanup_releases_candidate_and_superseded_slots_without_touching_the_active_one() {
+        // A candidate whose connection drops leaves the incumbent routable.
+        let fixture = swap_fixture();
+        let forwarding = &fixture.forwarding;
+        assert!(forwarding
+            .cleanup_connection(fixture.candidate_connection)
+            .unwrap()
+            .is_empty());
+        assert_eq!(forwarding.cutover_candidate(MODULE_ID).unwrap(), None);
+        let (client_connection, client_sink, _client_rx) = client(200);
+        assert_eq!(
+            forwarding
+                .begin_route_bind_relay_for_test(client_connection, client_sink, 1, MODULE_ID)
+                .unwrap()
+                .endpoint,
+            fixture.incumbent
+        );
+
+        // After a cutover, the incumbent's teardown releases its own routes and
+        // leaves the promoted candidate in place.
+        let fixture = swap_fixture();
+        let forwarding = &fixture.forwarding;
+        let (bound_client, bound_sink, _bound_rx) = client(200);
+        let bound = forwarding
+            .begin_route_bind_relay_for_test(bound_client, bound_sink, 1, MODULE_ID)
+            .unwrap();
+        forwarding
+            .complete_pending_relay(
+                fixture.incumbent_connection,
+                bound.corr,
+                RouteBindRelayOutcome::Accepted,
+            )
+            .unwrap();
+        forwarding.cutover_candidate(MODULE_ID).unwrap().unwrap();
+        let released = forwarding
+            .cleanup_connection(fixture.incumbent_connection)
+            .unwrap();
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].connection_id, bound_client);
+        assert!(forwarding
+            .read_inner()
+            .unwrap()
+            .superseded_endpoints
+            .is_empty());
+        assert!(forwarding.has_live_module_connection(MODULE_ID).unwrap());
+        let (next_client, next_sink, _next_rx) = client(201);
+        assert_eq!(
+            forwarding
+                .begin_route_bind_relay_for_test(next_client, next_sink, 2, MODULE_ID)
+                .unwrap()
+                .endpoint,
+            fixture.candidate
+        );
     }
 }

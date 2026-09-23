@@ -5314,8 +5314,36 @@ async fn begin_forwarding_drain_with(
     Ok(())
 }
 
+/// Wait for the freshly spawned child to take the ACTIVE slot for `module_id`,
+/// the only slot a plain (non-swap) spawn can register into.
 async fn wait_for_registration_after_reload(
     registry: &Registry,
+    module_id: &str,
+    snapshot: &SharedSnapshot,
+    child: &mut SupervisedChild,
+    wait: Duration,
+) -> Result<RegistrationWaitOutcome, SuperviseError> {
+    wait_for_slot_registration(
+        registry,
+        crate::registry::RegistrationSlot::Active(module_id),
+        module_id,
+        snapshot,
+        child,
+        wait,
+    )
+    .await
+}
+
+/// Wait for `child` to register into `slot`, or to exit, or for `wait` to pass.
+///
+/// Keyed on the slot rather than the bare module id because during a swap the
+/// id's active slot is already held by the incumbent: an id-keyed wait would
+/// report the incumbent's registration as the candidate's and a candidate that
+/// never registers would look registered. A swap candidate waits on
+/// `crate::registry::RegistrationSlot::Candidate`.
+async fn wait_for_slot_registration(
+    registry: &Registry,
+    slot: crate::registry::RegistrationSlot<'_>,
     module_id: &str,
     snapshot: &SharedSnapshot,
     child: &mut SupervisedChild,
@@ -5324,7 +5352,7 @@ async fn wait_for_registration_after_reload(
     let deadline = Instant::now() + wait;
     loop {
         if registry
-            .get_module(module_id)
+            .registration(slot)
             .map_err(SuperviseError::Registry)?
             .is_some()
         {
@@ -5704,41 +5732,154 @@ fn terminal_disposition(final_state: ModuleState) -> TerminalDisposition {
     }
 }
 
+/// Wait for the ACTIVE registration of `module_id` to go away, which is what a
+/// plain stop or restart waits for before it spawns a replacement.
 async fn wait_for_registration_release(
     registry: &Registry,
     module_id: &str,
     wait: Duration,
 ) -> Result<(), SuperviseError> {
+    wait_for_slot_registration_release(
+        registry,
+        crate::registry::RegistrationSlot::Active(module_id),
+        wait,
+    )
+    .await
+}
+
+/// Wait for the registration in `slot` to go away.
+///
+/// Keyed on the slot rather than the bare module id because a successful swap
+/// never empties the id's active slot (the promoted candidate is in it), so an
+/// id-keyed wait for the incumbent's release would always time out. Draining a
+/// swap's incumbent waits on `crate::registry::RegistrationSlot::Connection` with the
+/// incumbent's connection instead.
+async fn wait_for_slot_registration_release(
+    registry: &Registry,
+    slot: crate::registry::RegistrationSlot<'_>,
+    wait: Duration,
+) -> Result<(), SuperviseError> {
     let deadline = Instant::now() + wait;
     let mut release_events = registration_release_events().subscribe();
+    let still_active = |registration: &crate::registry::ModuleRegistration| {
+        SuperviseError::RegistrationStillActive {
+            module_id: registration.manifest.module_id.clone(),
+            waited: wait,
+        }
+    };
     loop {
         let _observed_generation = *release_events.borrow_and_update();
-        if registry
-            .get_module(module_id)
+        let Some(registration) = registry
+            .registration(slot)
             .map_err(SuperviseError::Registry)?
-            .is_none()
-        {
+        else {
             return Ok(());
-        }
+        };
 
         let now = Instant::now();
         if now >= deadline {
-            return Err(SuperviseError::RegistrationStillActive {
-                module_id: module_id.to_string(),
-                waited: wait,
-            });
+            return Err(still_active(&registration));
         }
 
         let remaining = deadline.saturating_duration_since(now);
         match timeout(remaining, release_events.changed()).await {
             Ok(Ok(())) | Ok(Err(_)) => {}
-            Err(_) => {
-                return Err(SuperviseError::RegistrationStillActive {
-                    module_id: module_id.to_string(),
-                    waited: wait,
-                })
-            }
+            Err(_) => return Err(still_active(&registration)),
         }
+    }
+}
+
+#[cfg(test)]
+mod slot_registration_wait_tests {
+    use super::*;
+    use crate::registry::{ConnectionId, RegistrationSlot};
+    use subc_protocol::manifest::ModuleManifest;
+
+    const INCUMBENT: u64 = 1;
+    const CANDIDATE: u64 = 2;
+
+    fn swapped_registry() -> Arc<Registry> {
+        let registry = Arc::new(Registry::default());
+        let manifest = ModuleManifest::builder("m", "0.1.0").build();
+        registry
+            .register_with_control_ops(
+                manifest.clone(),
+                1,
+                ConnectionId::new(INCUMBENT),
+                Vec::new(),
+            )
+            .unwrap();
+        registry
+            .register_candidate_with_control_ops(
+                manifest,
+                1,
+                ConnectionId::new(CANDIDATE),
+                Vec::new(),
+            )
+            .unwrap();
+        registry
+    }
+
+    /// After a promotion the id's active slot is held by the new process, so an
+    /// id-keyed wait for the incumbent's release can never succeed; the
+    /// connection-keyed wait completes as soon as the incumbent deregisters.
+    #[tokio::test]
+    async fn incumbent_release_is_awaited_by_connection_not_by_module_id() {
+        let registry = swapped_registry();
+        registry.promote_candidate("m").unwrap().unwrap();
+
+        assert!(matches!(
+            wait_for_registration_release(&registry, "m", Duration::from_millis(50)).await,
+            Err(SuperviseError::RegistrationStillActive { .. })
+        ));
+
+        let releaser = Arc::clone(&registry);
+        let release = tokio::spawn(async move {
+            sleep(Duration::from_millis(20)).await;
+            releaser
+                .deregister_connection(ConnectionId::new(INCUMBENT))
+                .unwrap();
+            notify_registration_release();
+        });
+        wait_for_slot_registration_release(
+            &registry,
+            RegistrationSlot::Connection(ConnectionId::new(INCUMBENT)),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("the incumbent's own registration is released");
+        release.await.unwrap();
+        assert!(registry.get_module("m").unwrap().is_some());
+    }
+
+    /// The candidate slot is waited on separately from the active slot: the
+    /// incumbent's registration neither holds up nor stands in for it.
+    #[tokio::test]
+    async fn candidate_slot_wait_ignores_the_incumbents_registration() {
+        let registry = swapped_registry();
+        assert!(matches!(
+            wait_for_slot_registration_release(
+                &registry,
+                RegistrationSlot::Candidate("m"),
+                Duration::from_millis(50),
+            )
+            .await,
+            Err(SuperviseError::RegistrationStillActive { .. })
+        ));
+        registry
+            .deregister_connection(ConnectionId::new(CANDIDATE))
+            .unwrap();
+        wait_for_slot_registration_release(
+            &registry,
+            RegistrationSlot::Candidate("m"),
+            Duration::from_millis(50),
+        )
+        .await
+        .expect("a candidate slot with no candidate is released");
+        assert!(registry
+            .registration(RegistrationSlot::Active("m"))
+            .unwrap()
+            .is_some());
     }
 }
 

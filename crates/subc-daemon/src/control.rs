@@ -4812,6 +4812,9 @@ fn forwarding_error_code(err: &ForwardingError) -> &'static str {
         | ForwardingError::UnknownReservation { .. }
         | ForwardingError::ConnectionClosing { .. }
         | ForwardingError::ClientEgressClosed { .. } => "target_unavailable",
+        // Only a swap candidate's registration can produce this, and it means
+        // exactly what a second active HELLO for a live id means.
+        ForwardingError::CandidateSlotOccupied { .. } => "duplicate_module_id",
         ForwardingError::RelayCorrelationExhausted
         | ForwardingError::RouteOpenBuild(_)
         | ForwardingError::Poisoned => "forwarding_error",
@@ -9153,6 +9156,302 @@ mod tests {
             parse_error(&response[0])["code"],
             "unsupported_control_frame"
         );
+    }
+
+    /// Blue/green swap at the control-plane boundary. The supervisor that opens
+    /// a swap is not wired yet, so the candidate is registered here directly
+    /// into the registry and forwarding candidate slots, the way the swap's
+    /// HELLO admission will.
+    mod swap {
+        use super::*;
+
+        const INCUMBENT: ConnectionId = ConnectionId::new(30);
+        const CANDIDATE: ConnectionId = ConnectionId::new(40);
+
+        struct Swap {
+            registry: Arc<Registry>,
+            forwarding: Arc<ForwardingTable>,
+            handler: ControlHandler,
+            incumbent_ctx: RouteCtx,
+            incumbent_rx: mpsc::Receiver<crate::router::OutboundFrame>,
+            candidate_ctx: RouteCtx,
+            candidate_rx: mpsc::Receiver<crate::router::OutboundFrame>,
+        }
+
+        async fn swap_with_incumbent() -> Swap {
+            let registry = Arc::new(Registry::default());
+            let forwarding = Arc::new(ForwardingTable::default());
+            let handler =
+                ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding));
+            let (incumbent_ctx, incumbent_rx) = route_ctx(INCUMBENT);
+            handler
+                .handle_control_frame(&incumbent_ctx, hello_frame("aft", PROTOCOL_VERSION, 7))
+                .await
+                .unwrap();
+            let (candidate_ctx, candidate_rx) = route_ctx(CANDIDATE);
+            Swap {
+                registry,
+                forwarding,
+                handler,
+                incumbent_ctx,
+                incumbent_rx,
+                candidate_ctx,
+                candidate_rx,
+            }
+        }
+
+        fn register_candidate(swap: &Swap, ready: Option<bool>) {
+            let mut candidate_manifest = manifest("aft", PROTOCOL_VERSION);
+            candidate_manifest.ready = ready;
+            let registration = swap
+                .registry
+                .register_candidate_with_control_ops(
+                    candidate_manifest,
+                    PROTOCOL_VERSION,
+                    CANDIDATE,
+                    module_baseline_control_ops(),
+                )
+                .unwrap();
+            swap.forwarding
+                .register_candidate_module_connection(
+                    CANDIDATE,
+                    "aft".to_string(),
+                    PROTOCOL_VERSION,
+                    manifest_concurrency(&registration.manifest),
+                    swap.candidate_ctx.egress.clone(),
+                )
+                .unwrap();
+        }
+
+        fn cutover(swap: &Swap) -> crate::forwarding::ModuleEndpointId {
+            let cutover = swap.forwarding.cutover_candidate("aft").unwrap().unwrap();
+            swap.registry.promote_candidate("aft").unwrap().unwrap();
+            cutover.incumbent.unwrap()
+        }
+
+        fn keyed_total(counters: &Value, key: &str) -> u64 {
+            counters[key]
+                .as_object()
+                .map(|counts| counts.values().filter_map(Value::as_u64).sum())
+                .unwrap_or(0)
+        }
+
+        /// An ack from the incumbent for a bind it was sent before cutover,
+        /// arriving before the incumbent is drained. The incumbent is the live
+        /// connection carrying every other client's routes, so the ack must
+        /// not end it: the waiting client is told to retry, the reservation is
+        /// given back, and the incumbent is told to drop just that binding.
+        #[tokio::test]
+        async fn incumbent_ack_between_promotion_and_drain_keeps_the_incumbent_serving() {
+            let mut swap = swap_with_incumbent().await;
+            let handler = swap.handler.clone();
+
+            // A co-tenant route, bound on the incumbent before the swap.
+            let cotenant = ConnectionId::new(31);
+            let (cotenant_ctx, mut cotenant_rx) = route_ctx(cotenant);
+            let (cotenant_task, cotenant_bind) = relay_route_open(
+                &handler,
+                cotenant,
+                &cotenant_ctx.egress,
+                &mut swap.incumbent_rx,
+                100,
+                "aft",
+                "swap-cotenant",
+            )
+            .await;
+            handler
+                .handle_control_frame(
+                    &swap.incumbent_ctx,
+                    route_bind_ack(cotenant_bind.header.corr),
+                )
+                .await
+                .unwrap();
+            assert!(cotenant_task.await.unwrap().is_empty());
+            let (cotenant_channel, cotenant_epoch) =
+                published_route(&cotenant_rx.recv().await.unwrap());
+
+            // A second route.open, relayed to the incumbent and not yet acked.
+            let caller = ConnectionId::new(32);
+            let (caller_ctx, mut caller_rx) = route_ctx(caller);
+            let (caller_task, caller_bind) = relay_route_open(
+                &handler,
+                caller,
+                &caller_ctx.egress,
+                &mut swap.incumbent_rx,
+                101,
+                "aft",
+                "swap-caller",
+            )
+            .await;
+            let (abandoned_channel, abandoned_epoch) = route_bind_channel(&caller_bind);
+
+            register_candidate(&swap, None);
+            cutover(&swap);
+
+            // The incumbent acks after promotion and before any drain.
+            let ack = handler
+                .handle_control_frame(&swap.incumbent_ctx, route_bind_ack(caller_bind.header.corr))
+                .await;
+            let module_loop_error = ack.as_ref().err().map(ToString::to_string);
+            if module_loop_error.is_some() {
+                // What the connection loop does with an untranslated router
+                // error: end the connection, releasing every route on it.
+                handler.cleanup_connection(INCUMBENT).unwrap();
+            }
+
+            // 1. The incumbent's other routes survive.
+            assert!(
+                cotenant_rx.try_recv().is_err(),
+                "the co-tenant route on the incumbent was torn down by one late ack: \
+                 {module_loop_error:?}"
+            );
+            assert!(matches!(
+                swap.forwarding
+                    .lookup_data_route(cotenant, cotenant_channel, cotenant_epoch)
+                    .unwrap(),
+                DataRoute::Client(DataRouteState::Bound(_))
+            ));
+            assert_eq!(module_loop_error, None);
+            assert!(swap
+                .registry
+                .get_module_by_connection(INCUMBENT)
+                .unwrap()
+                .is_some());
+
+            // 2. Exactly one channel-scoped GOODBYE to the incumbent.
+            let goodbye = tokio::time::timeout(Duration::from_secs(1), swap.incumbent_rx.recv())
+                .await
+                .expect("the incumbent is told to drop the abandoned binding")
+                .unwrap()
+                .frame;
+            assert_eq!(goodbye.header.ty, FrameType::Goodbye);
+            assert_eq!(goodbye.header.channel, abandoned_channel);
+            assert_eq!(goodbye.header.epoch, abandoned_epoch);
+            assert!(swap.incumbent_rx.try_recv().is_err());
+
+            // 3. The waiting client gets a retryable refusal and no route.
+            let response = caller_task.await.unwrap();
+            assert_eq!(response.len(), 1);
+            assert_eq!(parse_error(&response[0])["code"], "module_reloading");
+            assert!(caller_rx.try_recv().is_err());
+
+            // 4. The reservation pair is given back, and the pending bind
+            //    settled exactly once: one accepted open (the co-tenant) and one
+            //    refused open (the caller), nothing counted twice.
+            assert_eq!(swap.forwarding.reserved_route_count().unwrap(), (0, 0));
+            let counters = handler.counters().snapshot();
+            assert_eq!(
+                keyed_total(&counters, "route_open_accepted_by_principal"),
+                1
+            );
+            assert_eq!(keyed_total(&counters, "route_open_refused_by_code"), 1);
+            assert_eq!(counters["route_open_refused_by_code"]["module_rejected"], 1);
+        }
+
+        /// After cutover the incumbent is drained BY ENDPOINT. Draining by module
+        /// id would resolve to the promoted candidate and every new route.open
+        /// would be refused as reloading, leaving neither process routable.
+        #[tokio::test]
+        async fn route_open_after_cutover_and_incumbent_drain_is_relayed_to_the_candidate() {
+            let mut swap = swap_with_incumbent().await;
+            register_candidate(&swap, None);
+            let incumbent = cutover(&swap);
+            swap.forwarding
+                .begin_endpoint_drain(incumbent, RouteCloseReason::Restart)
+                .unwrap()
+                .expect("the incumbent is still registered");
+
+            let client = ConnectionId::new(33);
+            let (client_ctx, mut client_rx) = route_ctx(client);
+            let route_handler = swap.handler.clone();
+            let open_ctx = RouteCtx {
+                connection_id: client,
+                egress: client_ctx.egress.clone(),
+            };
+            let mut route_task = tokio::spawn(async move {
+                route_handler
+                    .handle_control_frame(
+                        &open_ctx,
+                        route_open_frame(90, "aft", unique_project_root("swap-after-drain")),
+                    )
+                    .await
+                    .unwrap()
+            });
+            let bind = tokio::select! {
+                bind = swap.candidate_rx.recv() => bind.expect("candidate egress is open").frame,
+                response = &mut route_task => {
+                    let response = response.unwrap();
+                    panic!(
+                        "post-cutover route.open was refused instead of relayed to the candidate: {}",
+                        parse_error(&response[0])["code"]
+                    );
+                }
+            };
+            swap.handler
+                .handle_control_frame(&swap.candidate_ctx, route_bind_ack(bind.header.corr))
+                .await
+                .unwrap();
+            assert!(route_task.await.unwrap().is_empty());
+            let (channel, epoch) = published_route(&client_rx.recv().await.unwrap());
+            match swap
+                .forwarding
+                .lookup_data_route(client, channel, epoch)
+                .unwrap()
+            {
+                DataRoute::Client(DataRouteState::Bound(route)) => {
+                    assert_eq!(route.module_endpoint.connection_id, CANDIDATE)
+                }
+                other => panic!("expected a bound route on the candidate, got {other:?}"),
+            }
+            assert!(swap.incumbent_rx.try_recv().is_err());
+        }
+
+        /// A candidate declares itself ready with `catalog.update` on its own
+        /// connection. If the connection-keyed registry lookups searched only the
+        /// active slot, this would answer `not_registered` and the candidate
+        /// would never become ready.
+        #[tokio::test]
+        async fn candidate_catalog_update_ready_reaches_the_candidate_registration() {
+            let swap = swap_with_incumbent().await;
+            register_candidate(&swap, Some(false));
+            let update = Frame::build(
+                FrameType::Request,
+                control_flags(),
+                0,
+                0,
+                55,
+                serde_json::to_vec(&ModuleControlRequestFromModule::CatalogUpdate {
+                    provides: manifest("aft", PROTOCOL_VERSION).provides,
+                    capabilities: None,
+                    ready: Some(true),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+
+            let replies = swap
+                .handler
+                .handle_control_frame(&swap.candidate_ctx, update)
+                .await
+                .unwrap();
+
+            assert_eq!(replies.len(), 1);
+            assert_eq!(
+                replies[0].header.ty,
+                FrameType::Response,
+                "candidate catalog.update was refused: {:?}",
+                serde_json::from_slice::<Value>(&replies[0].body).ok()
+            );
+            assert!(swap.registry.get_candidate("aft").unwrap().unwrap().ready);
+            assert_eq!(
+                swap.registry
+                    .get_module("aft")
+                    .unwrap()
+                    .unwrap()
+                    .connection_id,
+                INCUMBENT
+            );
+        }
     }
 }
 
