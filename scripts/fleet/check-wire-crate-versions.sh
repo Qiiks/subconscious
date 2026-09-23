@@ -133,7 +133,6 @@ for crate in "${CRATES[@]}"; do
   examined=$((examined + 1))
   changed=$(printf '%s\n' "$raw_diff" \
     | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)' || true)
-  [ -z "$changed" ] && continue
 
   # Strip comment and blank lines. Doc comments (///, //!), line comments (//),
   # and block-comment bodies (/*, *, */) are all prose: they cannot change what
@@ -142,24 +141,42 @@ for crate in "${CRATES[@]}"; do
     | sed -E 's/^[+-][[:space:]]*//' \
     | grep -vE '^(///|//!|//|/\*|\*|\*/)' \
     | grep -vE '^[[:space:]]*$' || true)
-  [ -z "$substantive" ] && continue
 
-  # The version line must have moved in the same range. Same separation: a
-  # failed manifest diff must refuse, not read as "version did not move".
+  # The manifest is read either way: a failed diff must refuse, not read as
+  # "nothing changed".
   manifest_diff=$(git diff "$BASE"...HEAD -- "$manifest" 2>&1)
   if [ $? -ne 0 ]; then
     echo "  $crate: manifest diff failed: $manifest_diff -- refusing" >&2
     exit 2
   fi
+
+  # A dependency edit in the manifest changes what a consumer compiles as
+  # surely as a source edit does, and for a registry consumer it is the whole
+  # difference: crates.io keeps a version's dependency requirements forever.
+  # On 2026-09-23 subc-control's subc-protocol requirement moved ^0.22 -> ^0.23
+  # under an unchanged version, so the publisher skipped it (0.16.1 already
+  # existed), and every crate needing the ^0.23 control failed package
+  # verification against the published ^0.22 one. Any changed manifest line
+  # other than the package's own version line, a comment or a blank counts.
+  manifest_substantive=$(printf '%s\n' "$manifest_diff" \
+    | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)' \
+    | sed -E 's/^[+-][[:space:]]*//' \
+    | grep -vE '^version[[:space:]]*=' \
+    | grep -vE '^#' \
+    | grep -vE '^[[:space:]]*$' || true)
+  [ -z "$substantive" ] && [ -z "$manifest_substantive" ] && continue
   # Moved means strictly INCREASED against the merge base; a decrease was
   # refused above. The diff is still read so a failed comparison refuses.
-  : "$manifest_diff"
   if [ -z "$base_version" ] || version_gt "$base_version" "$head_version"; then
     continue
   fi
 
   cur=$(grep -m1 -E '^version[[:space:]]*=' "$manifest" | sed -E 's/.*"(.*)".*/\1/')
-  echo "  $crate: code changed, version still $cur"
+  if [ -n "$substantive" ]; then
+    echo "  $crate: code changed, version still $cur"
+  else
+    echo "  $crate: dependencies changed in its manifest, version still $cur"
+  fi
   echo "      seven repos path-depend on these crates and cannot see this."
   echo "      bump $manifest, or confirm the change is doc-only."
   violations=$((violations + 1))
