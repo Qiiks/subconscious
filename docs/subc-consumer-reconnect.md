@@ -168,10 +168,11 @@ requirements):
   `handle_route_open` 715-788; the consumer must key on the CODE, not message
   text):
   - `unknown_module` — target is in NEITHER the registry NOR the supervisor
-    snapshot. **THIS is ALF's steady-state transient case**: the plugin provider
-    is self-connecting (not daemon-supervised), so after a restart, before it
-    re-HELLOs, it falls through to `unknown_module` (NOT `target_unavailable`,
-    which only fires for a *supervised* module that is inactive). RETRYABLE.
+    snapshot. TERMINAL since subc-protocol 0.24.0 (issue #116). A self-connecting
+    provider that has not yet re-HELLOed after a restart also lands here, and a
+    consumer that must reach one across that gap owns its own retry (prefrontal
+    redrives host effects from durable intents); an in-place SDK retry would
+    otherwise make every typo'd or undeployed target wait out the deadline.
   - `module_reloading` — a `supervisor.reload` drain is in progress. RETRYABLE.
   - `target_unavailable` — overloaded: transient (supervised-not-available / not
     active / not live / no live forwarding connection) BUT ALSO permanent (the
@@ -251,8 +252,8 @@ fixed.)
    `CachedRoute.opening` shape). Do NOT hold a mutex across the `.await`.
 
 4. **Target-absence retry: code-specific, bounded, lazy-per-call.** Retry ONLY the
-   transient codes (`unknown_module`, `module_reloading`, and the transient
-   `target_unavailable`/`module_timeout` cases) — see the verified taxonomy above.
+   transient codes (`module_reloading`, `module_warming`, and the transient
+   `target_unavailable`/`module_timeout` cases; `unknown_module` is terminal) — see the verified taxonomy above.
    Bound it (cap + deadline) → a permanently-absent/misconfigured target surfaces a
    terminal `NotSent`, never an infinite spin. The retry is INTERNAL to the
    consumer (the caller sees only the exhausted terminal `NotSent`, not per-attempt

@@ -27,10 +27,18 @@ For each item: what the SDKs do, and what breaks without it.
 ## 1. Route-open retry is deadline-bounded, and the failure must name the target
 
 The retryable code set for `route.open`, identical in both SDKs (Rust
-`is_retryable_route_open_code`, TS `isRetryableRouteOpenCode` — each pinned by
-its own unit test; there is no cross-SDK conformance test for this today):
+`is_retryable_route_open_code`, TS `isRetryableRouteOpenCode`), both executed
+against the shared record `crates/subc-protocol/tests/golden/decision_tables.json`
+(`route_open_retryable`):
 
-    unknown_module · module_reloading · target_unavailable · module_timeout
+    module_reloading · module_warming · target_unavailable · module_timeout
+
+`unknown_module` is terminal (subc-protocol 0.24.0, issue #116). It means "no
+module of this id is registered or supervised here": a typo, or a peer not
+deployed on this host. The daemon answers a configured-but-late module with
+`module_warming` or `target_unavailable` instead, so an in-place retry of
+`unknown_module` could only ever help an unsupervised module whose HELLO lands
+inside the caller's window, and that caller owns its own retry.
 
 Everything else (`bad_consumer_identity`, `invalid_project_root`, …) is
 permanent and fails immediately. Retries stop at a deadline — TS
@@ -40,10 +48,10 @@ optional `max_attempts` that can stop earlier. Scope note: the retry loop
 lives in the MANAGED call path in both SDKs; TS `routeOpen()` called directly
 performs one RPC and does not retry.
 
-Without the bound: `unknown_module` is AMBIGUOUS between "restarting, will
-return" and "never registered / wrong id". An unbounded retry loop converts a
-typo'd module id into an eternal quiet retry — the caller waits forever while
-every gauge reads healthy.
+Without the bound: a retryable code that can also mean "never coming back"
+(for example `target_unavailable` on a role mismatch) turns a misconfiguration
+into an eternal quiet retry, with the caller waiting forever while every gauge
+reads healthy. The same reasoning is why `unknown_module` left the set.
 
 On the naming half, the precise failure mode: THE DAEMON'S REJECTION PAYLOAD
 ALREADY NAMES THE MODULE ID. A client that WRAPS the daemon's message inherits
