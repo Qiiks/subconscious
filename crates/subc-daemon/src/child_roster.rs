@@ -23,6 +23,10 @@ use std::{
 use subc_control::ModuleProtocol;
 
 /// One live supervised process.
+///
+/// Read only by the Unix shutdown stop; Windows child lifetime is a job-object
+/// concern, so there the entry is recorded and never consulted.
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub(crate) struct RosterEntry {
     pub(crate) module_id: String,
@@ -78,6 +82,7 @@ impl ChildRoster {
         }
     }
 
+    #[cfg(unix)]
     pub(crate) fn live(&self) -> Vec<RosterEntry> {
         lock(&self.inner.live).values().cloned().collect()
     }
