@@ -930,9 +930,9 @@ fn version_from_output(output: &[u8]) -> Result<String, String> {
             matches!(
                 (parts.next(), parts.next(), parts.next()),
                 (Some(major), Some(minor), Some(patch))
-                    if major.chars().all(char::is_numeric)
-                        && minor.chars().all(char::is_numeric)
-                        && patch.chars().next().is_some_and(char::is_numeric)
+                    if is_ascii_digits(major)
+                        && is_ascii_digits(minor)
+                        && patch.bytes().next().is_some_and(|byte| byte.is_ascii_digit())
             )
         })
         .map(|version| {
@@ -943,6 +943,13 @@ fn version_from_output(output: &[u8]) -> Result<String, String> {
         })
         .filter(|version: &String| !version.is_empty())
         .ok_or_else(|| format!("refusal: --version output had no semantic version: {output:?}"))
+}
+
+/// A version segment is one or more ASCII digits. `char::is_numeric` also
+/// accepts non-ASCII digits (Arabic-Indic, Devanagari, ...) and is trivially
+/// true for an empty segment, neither of which is a version component.
+fn is_ascii_digits(segment: &str) -> bool {
+    !segment.is_empty() && segment.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn canonical_or_original(path: &Path) -> PathBuf {

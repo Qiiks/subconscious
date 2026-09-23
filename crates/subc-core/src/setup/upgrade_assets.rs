@@ -144,8 +144,8 @@ pub fn prepare_upgrade_asset<F: UpgradeAssetFetcher>(
     platform: AlphaTarget,
 ) -> Result<PreparedUpgradeAsset, UpgradeAssetError> {
     let names = convention_asset_names(target, platform);
-    let workspace = temporary_workspace(target)?;
-    let archive = workspace.join(&names.archive);
+    let workspace = WorkspaceGuard(temporary_workspace(target)?);
+    let archive = workspace.0.join(&names.archive);
 
     let expected = fetcher.fetch_archive(target, platform, &archive)?;
     let actual = sha256_file(&archive).map_err(|reason| UpgradeAssetError::Io {
@@ -160,7 +160,7 @@ pub fn prepare_upgrade_asset<F: UpgradeAssetFetcher>(
         });
     }
 
-    let extracted = workspace.join("extracted");
+    let extracted = workspace.0.join("extracted");
     extract(&archive, &extracted).map_err(|reason| UpgradeAssetError::Extraction {
         asset: names.archive.clone(),
         reason,
@@ -176,8 +176,28 @@ pub fn prepare_upgrade_asset<F: UpgradeAssetFetcher>(
         names,
         candidate,
         archive_sha256: expected,
-        workspace,
+        workspace: workspace.hand_off(),
     })
+}
+
+/// Removes the temporary workspace on drop so every early return between
+/// its creation and the handoff to a `PreparedUpgradeAsset` still cleans
+/// up. The handoff disarms the guard: from then on
+/// `PreparedUpgradeAsset::cleanup` owes the removal.
+struct WorkspaceGuard(PathBuf);
+
+impl WorkspaceGuard {
+    fn hand_off(self) -> PathBuf {
+        let workspace = self.0.clone();
+        std::mem::forget(self);
+        workspace
+    }
+}
+
+impl Drop for WorkspaceGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 pub fn sha256_file(path: &Path) -> Result<String, String> {
@@ -233,18 +253,24 @@ fn extract_command(archive: &Path, destination: &Path) -> Command {
     }
 }
 
+/// Fixed PowerShell script text: both paths reach the child through its
+/// environment, never through interpolation, so an apostrophe in a profile
+/// path (a user named `O'Neil`) cannot end a `'...'` segment early and a
+/// path containing `'; ...` cannot run as PowerShell.
+const EXPAND_ARCHIVE_SCRIPT: &str =
+    "Expand-Archive -LiteralPath $env:CK_ARCHIVE -DestinationPath $env:CK_DEST -Force";
+
 fn windows_extract_command(archive: &Path, destination: &Path) -> Command {
     let mut command = Command::new("powershell.exe");
-    command.args([
-        "-NoProfile".to_string(),
-        "-NonInteractive".to_string(),
-        "-Command".to_string(),
-        format!(
-            "Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force",
-            archive.display(),
-            destination.display()
-        ),
-    ]);
+    command
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            EXPAND_ARCHIVE_SCRIPT,
+        ])
+        .env("CK_ARCHIVE", archive.to_string_lossy().into_owned())
+        .env("CK_DEST", destination.to_string_lossy().into_owned());
     command
 }
 
@@ -398,7 +424,9 @@ mod tests {
     /// FIXED and both paths must reach the child through its environment.
     #[test]
     fn windows_expand_archive_keeps_paths_out_of_the_script_text() {
-        let archive = PathBuf::from("C:\\Users\\O'Neil\\AppData\\Local\\Temp\\ck.zip'; Write-Output INJECTED; '");
+        let archive = PathBuf::from(
+            "C:\\Users\\O'Neil\\AppData\\Local\\Temp\\ck.zip'; Write-Output INJECTED; '",
+        );
         let destination = PathBuf::from("C:\\Users\\O'Neil\\AppData\\Local\\Temp\\extracted");
         let command = windows_extract_command(&archive, &destination);
         assert_eq!(command.get_program().to_string_lossy(), "powershell.exe");

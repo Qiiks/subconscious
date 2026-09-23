@@ -234,6 +234,17 @@ fn index_download_command(url: &str, body: &str, headers: &str, deadline: Durati
     }
 }
 
+/// Fixed PowerShell script texts: every value that can contain a quote or a
+/// space reaches the child through its environment, never through
+/// interpolation into the script. An apostrophe in a Windows profile path
+/// (a user named `O'Neil` puts one in every temp path) would otherwise end
+/// a `'...'` segment early, and a value containing `'; ...` would run as
+/// PowerShell.
+const INDEX_DOWNLOAD_SCRIPT: &str = "$r = Invoke-WebRequest -Uri $env:CK_URL -OutFile $env:CK_BODY -PassThru -UseBasicParsing -TimeoutSec ([int]$env:CK_TIMEOUT_SECS); $lines = @(); foreach ($key in $r.Headers.Keys) { $lines += \"${key}: $($r.Headers[$key])\" }; Set-Content -LiteralPath $env:CK_HEADERS -Value ($lines -join \"`n\")";
+
+const ASSET_DOWNLOAD_SCRIPT: &str =
+    "Invoke-WebRequest -Uri $env:CK_URL -OutFile $env:CK_OUT -UseBasicParsing";
+
 fn windows_index_download_command(
     url: &str,
     body: &str,
@@ -242,16 +253,19 @@ fn windows_index_download_command(
 ) -> Command {
     // Invoke-WebRequest takes whole seconds and treats 0 as infinite, so the
     // floor is one second.
-    let powershell_seconds = deadline.as_secs().max(1);
+    let timeout_seconds = deadline.as_secs().max(1).to_string();
     let mut command = Command::new("powershell.exe");
-    command.args([
-        "-NoProfile".to_string(),
-        "-NonInteractive".to_string(),
-        "-Command".to_string(),
-        format!(
-            "$r = Invoke-WebRequest -Uri '{url}' -OutFile '{body}' -PassThru -UseBasicParsing -TimeoutSec {powershell_seconds}; $lines = @(); foreach ($key in $r.Headers.Keys) {{ $lines += \"${{key}}: $($r.Headers[$key])\" }}; Set-Content -LiteralPath '{headers}' -Value ($lines -join \"`n\")"
-        ),
-    ]);
+    command
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            INDEX_DOWNLOAD_SCRIPT,
+        ])
+        .env("CK_URL", url)
+        .env("CK_BODY", body)
+        .env("CK_HEADERS", headers)
+        .env("CK_TIMEOUT_SECS", timeout_seconds);
     command
 }
 
@@ -358,12 +372,15 @@ fn download_command(url: &str, destination: &str) -> Command {
 
 fn windows_download_command(url: &str, destination: &str) -> Command {
     let mut command = Command::new("powershell.exe");
-    command.args([
-        "-NoProfile".to_string(),
-        "-NonInteractive".to_string(),
-        "-Command".to_string(),
-        format!("Invoke-WebRequest -Uri '{url}' -OutFile '{destination}' -UseBasicParsing"),
-    ]);
+    command
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            ASSET_DOWNLOAD_SCRIPT,
+        ])
+        .env("CK_URL", url)
+        .env("CK_OUT", destination);
     command
 }
 
