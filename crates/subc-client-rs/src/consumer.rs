@@ -1530,6 +1530,8 @@ struct Shared {
     opts: ConsumerOptions,
     inner: Mutex<Inner>,
     notify: Notify,
+    #[cfg(test)]
+    before_wait: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     close_token: CancellationToken,
     /// Epoch milliseconds of the last frame dispatched from the current connection.
     /// The liveness probe reads this to distinguish a healthy slow request from a
@@ -1668,6 +1670,8 @@ impl Shared {
                 writer_task: None,
             }),
             notify: Notify::new(),
+            #[cfg(test)]
+            before_wait: Mutex::new(None),
             close_token: CancellationToken::new(),
             last_inbound_ms: AtomicU64::new(0),
             liveness_probe_running: AtomicBool::new(false),
@@ -1777,8 +1781,11 @@ impl Shared {
                     "call deadline elapsed waiting for reconnection",
                 ));
             }
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
             let action = {
                 let mut inner = self.lock_inner();
+                notified.as_mut().enable();
                 if inner.closed {
                     return Err(CallError::not_sent("consumer closed"));
                 }
@@ -1812,11 +1819,16 @@ impl Shared {
 
             match action {
                 EnsureAction::Wait => {
-                    timeout_at(deadline, self.notify.notified())
-                        .await
-                        .map_err(|_| {
-                            CallError::not_sent("call deadline elapsed waiting for reconnection")
-                        })?;
+                    #[cfg(test)]
+                    {
+                        let hook = self.before_wait.lock().unwrap().take();
+                        if let Some(hook) = hook {
+                            hook();
+                        }
+                    }
+                    timeout_at(deadline, notified).await.map_err(|_| {
+                        CallError::not_sent("call deadline elapsed waiting for reconnection")
+                    })?;
                 }
                 EnsureAction::Lead {
                     generation,
@@ -6045,6 +6057,35 @@ mod tests {
         let catalog = request.await.unwrap().unwrap();
         assert_eq!(catalog.generation, 9);
         assert!(catalog.modules.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconnect_completion_between_wait_decision_and_registration_wakes_caller() {
+        let shared = Arc::new(Shared::new(
+            PathBuf::from("/tmp/subc-client-rs-reconnect-wakeup"),
+            ConsumerOptions::default(),
+        ));
+        let (sender, _receiver) = mpsc::channel(EGRESS_BUFFER);
+        {
+            let mut inner = shared.lock_inner();
+            inner.reconnect = ReconnectState::Inline {
+                generation: inner.generation,
+            };
+        }
+        let completing = Arc::clone(&shared);
+        *shared.before_wait.lock().unwrap() = Some(Box::new(move || {
+            completing.lock_inner().writer = Some(sender);
+            completing.notify.notify_waiters();
+        }));
+
+        let result = shared
+            .ensure_connected_for_call(Instant::now() + Duration::from_millis(30))
+            .await;
+        assert!(
+            result.is_ok(),
+            "connected caller should not time out: {result:?}"
+        );
+        assert!(shared.before_wait.lock().unwrap().is_none());
     }
 
     #[tokio::test]
