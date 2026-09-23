@@ -370,11 +370,24 @@ fi
 
 # Signing posture must match the running image: an ad-hoc re-sign of a Developer ID
 # binary silently revokes its macOS TCC grants, and the reverse is a surprise too.
+# The posture is every field a grant or the loader keys on, not just the signer:
+# the identifier is part of the designated requirement TCC grants are bound to,
+# so a changed identifier revokes them exactly as an ad-hoc re-sign does; the
+# team is the signer's scope; and the CodeDirectory flags carry the hardened
+# runtime, which changes what the loader permits. Comparing only the first
+# Signature/Authority line passed a re-sign under a different identifier.
+signing_posture() {
+  codesign -dvv "$1" 2>&1 \
+    | grep -E '^(Signature|Identifier|TeamIdentifier)=|^Authority=|^CodeDirectory ' \
+    | sed -E 's/^CodeDirectory .*(flags=[^ ]+).*/\1/' \
+    | grep -vE '^Authority=Apple (Worldwide|Root)' \
+    | sort | tr '\n' ' ' || true
+}
 if command -v codesign >/dev/null; then
-  staged_sig=$(codesign -dvv "$STAGED" 2>&1 | grep -E '^(Signature|Authority)=' | head -1 || true)
-  live_sig=$(codesign -dvv "$DEST" 2>&1 | grep -E '^(Signature|Authority)=' | head -1 || true)
+  staged_sig=$(signing_posture "$STAGED")
+  live_sig=$(signing_posture "$DEST")
   [ "$staged_sig" = "$live_sig" ] || refuse "signing posture differs: staged [$staged_sig] vs running [$live_sig]"
-  say "signing posture: $staged_sig (matches running)"
+  say "signing posture: $staged_sig(matches running)"
 fi
 
 # Marker differential. A marker that reads 0 on the staged file proves nothing about
