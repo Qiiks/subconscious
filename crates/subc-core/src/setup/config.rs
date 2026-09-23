@@ -315,44 +315,119 @@ pub fn apply(change: &ConfigChange) -> Result<(), String> {
 /// Removes only a component's values when setup must unwind a later failure.
 /// Matching the generated values prevents rollback from deleting a user edit
 /// that occurred after setup wrote the original component entry.
-pub fn remove_component(
-    path: &Path,
-    component: Component,
-    binary_home: &Path,
-    claustrum_key_path: Option<&Path>,
-) -> Result<bool, String> {
-    let before = match fs::read_to_string(path) {
+pub fn rollback_change(change: &ConfigChange) -> Result<bool, String> {
+    let current = match fs::read_to_string(&change.path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(format!("could not read {}: {error}", path.display())),
+        Err(error) => return Err(format!("could not read {}: {error}", change.path.display())),
     };
-    let strict = jsonc_to_json(&before)
-        .map_err(|error| format!("could not parse {} for rollback: {error}", path.display()))?;
-    let mut document: Value = serde_json::from_str(&strict)
-        .map_err(|error| format!("could not parse {} for rollback: {error}", path.display()))?;
-    let Some(object) = document.as_object_mut() else {
-        return Err(format!(
-            "could not roll back non-object configuration {}",
-            path.display()
-        ));
+    if current == change.after {
+        if change.before.is_empty() {
+            fs::remove_file(&change.path)
+                .map_err(|error| format!("could not remove {}: {error}", change.path.display()))?;
+        } else {
+            apply(&ConfigChange {
+                path: change.path.clone(),
+                before: current,
+                after: change.before.clone(),
+            })?;
+        }
+        return Ok(true);
+    }
+    let old: Value = if change.before.is_empty() {
+        Value::Object(Map::new())
+    } else {
+        serde_json::from_str(
+            &jsonc_to_json(&change.before)
+                .map_err(|error| format!("could not parse prior configuration: {error}"))?,
+        )
+        .map_err(|error| format!("could not parse prior configuration: {error}"))?
     };
+    let written: Value = serde_json::from_str(
+        &jsonc_to_json(&change.after)
+            .map_err(|error| format!("could not parse written configuration: {error}"))?,
+    )
+    .map_err(|error| format!("could not parse written configuration: {error}"))?;
+    let mut updated = current.clone();
     let mut removed = false;
-    for (key, desired) in desired_values_with_key(component, binary_home, claustrum_key_path) {
-        removed |= remove_exact_value(object, &key, &desired);
+    for (key, desired) in inserted_values(&old, &written) {
+        let parsed: Value = serde_json::from_str(
+            &jsonc_to_json(&updated)
+                .map_err(|error| format!("could not parse {}: {error}", change.path.display()))?,
+        )
+        .map_err(|error| format!("could not parse {}: {error}", change.path.display()))?;
+        if existing_value(&parsed, &key) == Some(&desired) {
+            removed |= remove_textual_value(&mut updated, &key)?;
+        }
     }
-    if !removed {
-        return Ok(false);
+    if removed {
+        // Drop only parent objects that this invocation created and that are
+        // still empty. An operator's newly added sibling keeps its parent.
+        let mut created_parents = Vec::new();
+        for (key, _) in inserted_values(&old, &written) {
+            let mut parent = key.rsplit_once('.').map(|(parent, _)| parent);
+            while let Some(path) = parent {
+                if existing_value(&old, path).is_none()
+                    && !created_parents.contains(&path.to_string())
+                {
+                    created_parents.push(path.to_string());
+                }
+                parent = path.rsplit_once('.').map(|(next, _)| next);
+            }
+        }
+        created_parents.sort_by_key(|path| std::cmp::Reverse(path.matches('.').count()));
+        for path in created_parents {
+            let parsed: Value = serde_json::from_str(
+                &jsonc_to_json(&updated)
+                    .map_err(|error| format!("could not parse edited configuration: {error}"))?,
+            )
+            .map_err(|error| format!("could not parse edited configuration: {error}"))?;
+            if existing_value(&parsed, &path)
+                .and_then(Value::as_object)
+                .is_some_and(Map::is_empty)
+            {
+                remove_textual_value(&mut updated, &path)?;
+            }
+        }
     }
-    let change = ConfigChange {
-        path: path.to_path_buf(),
-        before,
-        after: format!(
-            "{}\n",
-            serde_json::to_string_pretty(&document).expect("JSON values always serialize")
-        ),
-    };
-    apply(&change)?;
-    Ok(true)
+    if removed {
+        apply(&ConfigChange {
+            path: change.path.clone(),
+            before: current,
+            after: updated,
+        })?;
+    }
+    Ok(removed)
+}
+
+fn inserted_values(before: &Value, after: &Value) -> Vec<(String, Value)> {
+    fn collect(
+        before: Option<&Value>,
+        after: &Value,
+        prefix: &str,
+        result: &mut Vec<(String, Value)>,
+    ) {
+        if let Some(object) = after.as_object() {
+            for (key, value) in object {
+                let path = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                collect(
+                    before.and_then(|old| old.as_object()?.get(key)),
+                    value,
+                    &path,
+                    result,
+                );
+            }
+        } else if before.is_none() && !prefix.is_empty() {
+            result.push((prefix.to_string(), after.clone()));
+        }
+    }
+    let mut result = Vec::new();
+    collect(Some(before), after, "", &mut result);
+    result
 }
 
 #[allow(dead_code)]
@@ -629,27 +704,140 @@ fn insert_value(document: &mut Value, dotted_key: &str, desired: Value) -> Resul
     unreachable!("a desired configuration key always has a segment")
 }
 
-fn remove_exact_value(object: &mut Map<String, Value>, dotted_key: &str, desired: &Value) -> bool {
-    let keys = dotted_key.split('.').collect::<Vec<_>>();
-    remove_exact_value_at(object, &keys, desired)
+// Token offsets come from the original JSONC, not the normalized JSON value.
+// Skipping comments here lets rollback remove a member without rebuilding the file.
+fn member_tokens(document: &str) -> Result<Vec<(String, usize, usize)>, String> {
+    let bytes = document.as_bytes();
+    let mut tokens = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at].is_ascii_whitespace() {
+            at += 1;
+            continue;
+        }
+        if bytes[at..].starts_with(b"//") {
+            at += 2;
+            while at < bytes.len() && bytes[at] != b'\n' {
+                at += 1;
+            }
+            continue;
+        }
+        if bytes[at..].starts_with(b"/*") {
+            at += 2;
+            while at + 1 < bytes.len() && !bytes[at..].starts_with(b"*/") {
+                at += 1;
+            }
+            if at + 1 >= bytes.len() {
+                return Err("unterminated comment".to_string());
+            }
+            at += 2;
+            continue;
+        }
+        let start = at;
+        if bytes[at] == b'"' {
+            at += 1;
+            while at < bytes.len() {
+                if bytes[at] == b'\\' {
+                    at += 2;
+                } else if bytes[at] == b'"' {
+                    at += 1;
+                    break;
+                } else {
+                    at += 1;
+                }
+            }
+            if at > bytes.len() || bytes[at - 1] != b'"' {
+                return Err("unterminated string".to_string());
+            }
+            tokens.push((
+                serde_json::from_str::<String>(&document[start..at])
+                    .map_err(|error| error.to_string())?,
+                start,
+                at,
+            ));
+        } else if b"{}[],:".contains(&bytes[at]) {
+            at += 1;
+            tokens.push((document[start..at].to_string(), start, at));
+        } else {
+            while at < bytes.len()
+                && !bytes[at].is_ascii_whitespace()
+                && !b"{}[],:/".contains(&bytes[at])
+            {
+                at += 1;
+            }
+            if at == start {
+                return Err("invalid JSONC token".to_string());
+            }
+            tokens.push((document[start..at].to_string(), start, at));
+        }
+    }
+    Ok(tokens)
 }
 
-fn remove_exact_value_at(object: &mut Map<String, Value>, keys: &[&str], desired: &Value) -> bool {
-    let Some((key, rest)) = keys.split_first() else {
-        return false;
-    };
-    if rest.is_empty() {
-        return object.get(*key).is_some_and(|actual| actual == desired)
-            && object.remove(*key).is_some();
+fn remove_textual_value(document: &mut String, dotted_key: &str) -> Result<bool, String> {
+    let tokens = member_tokens(document)?;
+    let mut open = 0;
+    let segments = dotted_key.split('.').collect::<Vec<_>>();
+    for (depth_index, segment) in segments.iter().enumerate() {
+        if tokens.get(open).map(|token| token.0.as_str()) != Some("{") {
+            return Ok(false);
+        }
+        let mut depth = 0_i32;
+        let mut found = None;
+        let mut index = open + 1;
+        while index < tokens.len() {
+            match tokens[index].0.as_str() {
+                "{" | "[" => depth += 1,
+                "}" | "]" if depth == 0 => break,
+                "}" | "]" => depth -= 1,
+                _ => {}
+            }
+            if depth == 0
+                && tokens.get(index + 1).map(|token| token.0.as_str()) == Some(":")
+                && tokens[index].0 == *segment
+            {
+                found = Some(index);
+                break;
+            }
+            index += 1;
+        }
+        let Some(key) = found else {
+            return Ok(false);
+        };
+        let value = key + 2;
+        if depth_index + 1 != segments.len() {
+            open = value;
+            continue;
+        }
+        let mut end = value;
+        let mut nested = 0_i32;
+        while end < tokens.len() {
+            match tokens[end].0.as_str() {
+                "{" | "[" => nested += 1,
+                "}" | "]" if nested == 0 => break,
+                "}" | "]" => nested -= 1,
+                "," if nested == 0 => break,
+                _ => {}
+            }
+            end += 1;
+        }
+        let start = tokens[key].1;
+        let stop = if tokens.get(end).map(|token| token.0.as_str()) == Some(",") {
+            tokens[end].2
+        } else {
+            tokens[end - 1].2
+        };
+        let previous_comma = (open + 1..key).rev().find(|&i| tokens[i].0 == ",");
+        if tokens.get(end).map(|token| token.0.as_str()) == Some(",") {
+            document.replace_range(start..stop, "");
+        } else if let Some(comma) = previous_comma {
+            document.replace_range(tokens[comma].1..stop, "");
+        } else {
+            document.replace_range(start..stop, "");
+        }
+        return Ok(true);
     }
-    let Some(child) = object.get_mut(*key).and_then(Value::as_object_mut) else {
-        return false;
-    };
-    let removed = remove_exact_value_at(child, rest, desired);
-    if removed && child.is_empty() {
-        object.remove(*key);
-    }
-    removed
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -659,6 +847,90 @@ mod tests {
 
     fn fixture_path(name: &str) -> TestTempDir {
         TestTempDir::new(name)
+    }
+
+    #[test]
+    fn failed_setup_restores_existing_version_and_jsonc_comments() {
+        let root = fixture_path("config-rollback-existing-version");
+        let config = root.join("subc.jsonc");
+        let original = "{\n  // operator's version must survive\n  \"version\": 1,\n  \"modules\": {\n    // existing module\n    \"custom\": {\"program\": \"/usr/bin/custom\"}\n  }\n}\n";
+        fs::write(&config, original).unwrap();
+        let change = plan_component(&config, Component::Core, &root)
+            .expect("core config")
+            .expect("storage.backend is missing");
+        assert!(change.after.contains("\"backend\""));
+        let result = (|| -> Result<(), String> {
+            apply(&change)?;
+            Err("forced failure after config insert".to_string())
+        })();
+        assert_eq!(result.unwrap_err(), "forced failure after config insert");
+        rollback_change(&change).unwrap();
+        let restored = fs::read_to_string(&config).unwrap();
+        let parsed: Value = serde_json::from_str(&jsonc_to_json(&restored).unwrap()).unwrap();
+        let version_ok = parsed.pointer("/version") == Some(&Value::from(1));
+        let comments_ok = restored.contains("// operator's version must survive");
+        assert!(
+            version_ok && comments_ok,
+            "existing version survived: {version_ok}; JSONC comments survived: {comments_ok}"
+        );
+        assert_eq!(
+            restored, original,
+            "rollback must restore the original bytes"
+        );
+    }
+
+    #[test]
+    fn rollback_after_another_edit_removes_only_inserted_storage() {
+        let root = fixture_path("config-rollback-edited");
+        let config = root.join("subc.jsonc");
+        let original = "{\n  // keep this note\n  \"version\": 1,\n  \"modules\": {}\n}\n";
+        fs::write(&config, original).unwrap();
+        let change = plan_component(&config, Component::Core, &root)
+            .unwrap()
+            .unwrap();
+        apply(&change).unwrap();
+        let current = fs::read_to_string(&config).unwrap();
+        fs::write(
+            &config,
+            current.replace("// keep this note", "// edited by operator"),
+        )
+        .unwrap();
+        assert!(rollback_change(&change).unwrap());
+        let restored = fs::read_to_string(&config).unwrap();
+        assert!(restored.contains("// edited by operator"));
+        let parsed: Value = serde_json::from_str(&jsonc_to_json(&restored).unwrap()).unwrap();
+        assert_eq!(parsed.pointer("/version"), Some(&Value::from(1)));
+        assert!(parsed.pointer("/storage").is_none());
+    }
+
+    #[test]
+    fn rollback_preserves_new_sibling_in_inserted_storage_object() {
+        let root = fixture_path("config-rollback-storage-sibling");
+        let config = root.join("subc.jsonc");
+        fs::write(&config, "{\n  \"version\": 1\n}\n").unwrap();
+        let change = plan_component(&config, Component::Core, &root)
+            .unwrap()
+            .unwrap();
+        apply(&change).unwrap();
+        let current = fs::read_to_string(&config).unwrap();
+        fs::write(
+            &config,
+            current.replace(
+                "\"backend\": \"sqlite\"",
+                "\"backend\": \"sqlite\", \"data_home\": \"/custom\" // operator setting",
+            ),
+        )
+        .unwrap();
+        assert!(rollback_change(&change).unwrap());
+        let restored = fs::read_to_string(&config).unwrap();
+        let parsed: Value = serde_json::from_str(&jsonc_to_json(&restored).unwrap()).unwrap();
+        assert_eq!(parsed.pointer("/version"), Some(&Value::from(1)));
+        assert!(parsed.pointer("/storage/backend").is_none());
+        assert_eq!(
+            parsed.pointer("/storage/data_home"),
+            Some(&Value::from("/custom"))
+        );
+        assert!(restored.contains("// operator setting"));
     }
 
     #[test]
@@ -674,8 +946,7 @@ mod tests {
             .expect("claustrum missing");
         apply(&claustrum).expect("write claustrum");
 
-        assert!(remove_component(&config, Component::Claustrum, &root, None)
-            .expect("remove failed component"));
+        assert!(rollback_change(&claustrum).expect("remove failed component"));
 
         let written: Value = serde_json::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
         assert!(written.pointer("/modules/aft").is_some());

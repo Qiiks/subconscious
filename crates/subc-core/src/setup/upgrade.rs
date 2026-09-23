@@ -812,24 +812,78 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
         let rollback = self
             .rollback_paths
             .get(target.label())
-            .ok_or_else(|| format!("no rollback copy exists for {target}"))?;
-        fs::copy(rollback, &destination).map_err(|error| {
-            format!(
-                "could not restore rollback copy {} to {}: {error}",
-                rollback.display(),
-                destination.display()
+            .ok_or_else(|| format!("no rollback copy exists for {target}"))?
+            .clone();
+        #[cfg(unix)]
+        if target.is_self_replacing() {
+            super::self_update_unix::replace_verified_candidate(&destination, &rollback)?;
+            fs::set_permissions(
+                &destination,
+                fs::metadata(&rollback)
+                    .map_err(|error| format!("could not read ck rollback mode: {error}"))?
+                    .permissions(),
             )
-        })?;
+            .map_err(|error| format!("could not restore ck rollback mode: {error}"))?;
+        } else {
+            restore_rollback_by_rename(&rollback, &destination)?;
+        }
+        #[cfg(not(unix))]
+        restore_rollback_by_rename(&rollback, &destination)?;
         let previous_archive = self
             .rollback_archive_sha256
             .remove(target.label())
             .flatten();
         self.record_replacement_digest(target, &destination, previous_archive.as_deref())?;
+        fs::remove_file(&rollback).map_err(|error| {
+            format!(
+                "restored {} but could not remove rollback copy {}: {error}",
+                destination.display(),
+                rollback.display()
+            )
+        })?;
+        self.rollback_paths.remove(target.label());
         Ok(format!(
-            "accepted; restored prior inode={}",
+            "accepted; restored prior binary at inode={}",
             destination_inode(&destination)?
         ))
     }
+}
+
+fn restore_rollback_by_rename(rollback: &Path, destination: &Path) -> Result<(), String> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| format!("{} has no parent", destination.display()))?;
+    let temporary = parent.join(format!(
+        ".{}.restore-{}-{}",
+        destination
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy(),
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_nanos()
+    ));
+    let result = (|| {
+        fs::copy(rollback, &temporary)
+            .map_err(|error| format!("could not stage rollback {}: {error}", rollback.display()))?;
+        let permissions = fs::metadata(rollback)
+            .map_err(|error| format!("could not read rollback mode: {error}"))?
+            .permissions();
+        fs::set_permissions(&temporary, permissions)
+            .map_err(|error| format!("could not restore rollback mode: {error}"))?;
+        fs::rename(&temporary, destination).map_err(|error| {
+            format!(
+                "could not rename rollback over {}: {error}",
+                destination.display()
+            )
+        })
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 pub fn render_execution_report(report: &UpgradeExecutionReport) {
@@ -933,6 +987,65 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         fs::write(path, format!("#!/bin/sh\necho 'binary {version}'\n")).expect("script");
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("executable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_replaces_running_executable_by_rename() {
+        let root = fixture_dir("rollback-running-executable");
+        let destination = root.join("ck-aft");
+        let rollback = root.join("ck-aft.rollback");
+        let candidate = root.join("candidate");
+        fs::copy("/bin/sleep", &destination).unwrap();
+        fs::copy("/bin/sleep", &rollback).unwrap();
+        fs::copy("/bin/sleep", &candidate).unwrap();
+        fs::rename(&candidate, &destination).unwrap();
+        let replaced_inode = destination_inode(&destination).unwrap();
+        let mut child = Command::new(&destination).arg("10").spawn().unwrap();
+        let aft = upgrade_target("ck-aft");
+        let mut inventory =
+            Inventory::load(root.join("installer-manifest.json"), "linux-x64").unwrap();
+        inventory.record("managed-binary", &destination, Map::new());
+        let mut backend = SystemUpgradeBackend {
+            platform: AlphaTarget::LinuxX64,
+            targets: BTreeMap::from([(
+                aft.label().to_string(),
+                ManagedUpgradeTarget {
+                    target: aft,
+                    destination: destination.clone(),
+                    installed_version: "1.0.0".to_string(),
+                    installed_archive_sha256: None,
+                },
+            )]),
+            executable: destination.clone(),
+            subc: None,
+            assets: ReleaseUpgradeAssetFetcher::from_index(ReleaseIndex {
+                schema: 1,
+                channel: "alpha".to_string(),
+                generated_at_ms: 0,
+                components: BTreeMap::new(),
+            }),
+            inventory,
+            prepared: BTreeMap::new(),
+            rollback_paths: BTreeMap::from([(aft.label().to_string(), rollback)]),
+            rollback_archive_sha256: BTreeMap::new(),
+            expected_versions: BTreeMap::new(),
+            planned_from: BTreeMap::new(),
+            supervised_modules: BTreeSet::new(),
+        };
+        let result = backend.rollback(aft);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        result.expect("rollback onto running executable");
+        assert!(
+            !root.join("ck-aft.rollback").exists(),
+            "successful rollback cleans its backup"
+        );
+        assert_ne!(
+            destination_inode(&destination).unwrap(),
+            replaced_inode,
+            "rollback must rename a new inode over the running executable"
+        );
     }
 
     #[cfg(unix)]

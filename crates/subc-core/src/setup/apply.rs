@@ -44,7 +44,7 @@ struct ComponentSteps {
     /// Files that existed before this run and were adopted as the release's
     /// bytes; rollback un-records them and never deletes them.
     adopted_binaries: Vec<PathBuf>,
-    configured: bool,
+    config_change: Option<config::ConfigChange>,
     configuration_inventory_created: bool,
 }
 
@@ -675,17 +675,15 @@ impl SetupExecutor for SetupBackend {
                 let configuration_inventory_created = !self
                     .inventory
                     .owns_path("configuration", &self.paths.config_path);
-                let changed = components::configure_component(
+                if let Some(change) = components::configure_component(
                     *component,
                     &self.paths.config_path,
                     &self.paths.binary_home,
                     self.paths.claustrum_key_path.as_deref(),
                     &mut self.inventory,
-                )?
-                .is_some();
-                if changed {
+                )? {
                     let steps = self.component_steps.entry(*component).or_default();
-                    steps.configured = true;
+                    steps.config_change = Some(change);
                     steps.configuration_inventory_created = configuration_inventory_created;
                 }
                 Ok(())
@@ -777,18 +775,16 @@ impl SetupExecutor for SetupBackend {
                 println!("rolled back ownership record: {}", path.display());
             }
         }
-        if steps.configured
-            && config::remove_component(
-                &self.paths.config_path,
-                component,
-                &self.paths.binary_home,
-                self.paths.claustrum_key_path.as_deref(),
-            )?
-        {
-            println!("rolled back: {}", self.paths.config_path.display());
+        if let Some(change) = &steps.config_change {
+            if config::rollback_change(change)? {
+                println!("rolled back: {}", self.paths.config_path.display());
+            }
         }
         if steps.configuration_inventory_created
-            && !self.component_steps.values().any(|other| other.configured)
+            && !self
+                .component_steps
+                .values()
+                .any(|other| other.config_change.is_some())
         {
             self.inventory
                 .remove_owned_path("configuration", &self.paths.config_path);

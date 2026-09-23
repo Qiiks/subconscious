@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::BTreeSet, time::Duration};
 
 use super::{
     model::{UpgradeOperation, UpgradeTarget},
@@ -100,6 +100,7 @@ pub fn execute_upgrade<B: UpgradeExecutionBackend>(
     backend: &mut B,
 ) -> Result<UpgradeExecutionReport, UpgradeExecutionFailure> {
     let mut report = UpgradeExecutionReport::default();
+    let mut replaced = BTreeSet::new();
     for operation in &plan.operations {
         let (target, stage, result) = match operation {
             UpgradeOperation::ObservePlatform => continue,
@@ -149,25 +150,7 @@ pub fn execute_upgrade<B: UpgradeExecutionBackend>(
                         stage: "post-verification",
                         detail: format!("failed: {reason}"),
                     });
-                    match backend.rollback_decision(*target) {
-                        RollbackDecision::Accepted => match backend.rollback(*target) {
-                            Ok(detail) => report.evidence.push(UpgradeEvidence {
-                                target: *target,
-                                stage: "rollback",
-                                detail,
-                            }),
-                            Err(rollback_reason) => report.evidence.push(UpgradeEvidence {
-                                target: *target,
-                                stage: "rollback",
-                                detail: format!("failed: {rollback_reason}"),
-                            }),
-                        },
-                        RollbackDecision::Declined => report.evidence.push(UpgradeEvidence {
-                            target: *target,
-                            stage: "rollback-offer",
-                            detail: "offered; declined; replacement remains in place (set CK_UPGRADE_ROLLBACK=accept to restore)".to_string(),
-                        }),
-                    }
+                    offer_rollback(backend, &mut report, *target);
                     return Err(UpgradeExecutionFailure {
                         target: *target,
                         stage: "post-verification",
@@ -175,17 +158,26 @@ pub fn execute_upgrade<B: UpgradeExecutionBackend>(
                         report,
                     });
                 }
+                replaced.remove(target);
                 backend.completed(*target);
                 (*target, "post-verification", result)
             }
         };
         match result {
-            Ok(detail) => report.evidence.push(UpgradeEvidence {
-                target,
-                stage,
-                detail,
-            }),
+            Ok(detail) => {
+                if stage == "destination-replacement" {
+                    replaced.insert(target);
+                }
+                report.evidence.push(UpgradeEvidence {
+                    target,
+                    stage,
+                    detail,
+                });
+            }
             Err(reason) => {
+                if replaced.contains(&target) {
+                    offer_rollback(backend, &mut report, target);
+                }
                 return Err(UpgradeExecutionFailure {
                     target,
                     stage,
@@ -196,6 +188,23 @@ pub fn execute_upgrade<B: UpgradeExecutionBackend>(
         }
     }
     Ok(report)
+}
+
+fn offer_rollback<B: UpgradeExecutionBackend>(
+    backend: &mut B,
+    report: &mut UpgradeExecutionReport,
+    target: UpgradeTarget,
+) {
+    match backend.rollback_decision(target) {
+        RollbackDecision::Accepted => match backend.rollback(target) {
+            Ok(detail) => report.evidence.push(UpgradeEvidence { target, stage: "rollback", detail }),
+            Err(reason) => report.evidence.push(UpgradeEvidence { target, stage: "rollback", detail: format!("failed: {reason}") }),
+        },
+        RollbackDecision::Declined => report.evidence.push(UpgradeEvidence {
+            target, stage: "rollback-offer",
+            detail: "offered; declined; replacement remains in place (set CK_UPGRADE_ROLLBACK=accept to restore)".to_string(),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -325,6 +334,26 @@ mod tests {
             );
         }
         plan_upgrade(&observed)
+    }
+
+    #[test]
+    fn failure_after_replacement_offers_rollback() {
+        let mut backend = RecordingBackend {
+            fail_warm: true,
+            rollback: true,
+            ..Default::default()
+        };
+        let failure = execute_upgrade(&update_plan(), &mut backend).expect_err("warm failure");
+        assert_eq!(failure.stage, "warm-execution");
+        assert!(
+            backend.calls.contains(&"rollback"),
+            "warm failure after replacement must offer rollback"
+        );
+        assert!(failure
+            .report
+            .evidence
+            .iter()
+            .any(|item| item.stage == "rollback"));
     }
 
     #[test]
