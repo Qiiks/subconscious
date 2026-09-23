@@ -922,7 +922,7 @@ mod tests {
 #[cfg(all(test, unix))]
 mod adoption_tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use crate::setup::test_exec::write_executable;
     use subc_daemon::test_support::TestTempDir;
 
     /// Rollback after a later refusal must delete only what this run wrote.
@@ -993,8 +993,7 @@ mod adoption_tests {
         let binary_home = root.join("bin");
         fs::create_dir_all(&binary_home).unwrap();
         let placed = binary_home.join("ck");
-        fs::write(&placed, "#!/bin/sh\necho 'ck 0.16.2'\n").unwrap();
-        fs::set_permissions(&placed, fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&placed, b"#!/bin/sh\necho 'ck 0.16.2'\n");
         let executable = fs::canonicalize(&placed).unwrap();
         let platform = RuntimePlatform::current();
         let mut inventory =
@@ -1057,8 +1056,7 @@ mod adoption_tests {
         let binary_home = root.join("bin");
         fs::create_dir_all(&binary_home).unwrap();
         let placed = binary_home.join("ck");
-        fs::write(&placed, "#!/bin/sh\necho 'ck 0.16.2'\n").unwrap();
-        fs::set_permissions(&placed, fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&placed, b"#!/bin/sh\necho 'ck 0.16.2'\n");
         let executable = fs::canonicalize(&placed).unwrap();
         let platform = RuntimePlatform::current();
         let mut inventory =

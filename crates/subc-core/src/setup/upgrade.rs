@@ -971,6 +971,8 @@ mod tests {
     use serde_json::{Map, Value};
 
     use super::*;
+    #[cfg(unix)]
+    use crate::setup::test_exec::{copy_executable, write_executable};
     use crate::setup::{components::ReleaseArtifactSource, planner::plan_upgrade};
     #[cfg(unix)]
     use subc_daemon::test_support::TestTempDir;
@@ -991,9 +993,10 @@ mod tests {
 
     #[cfg(unix)]
     fn version_binary(path: &Path, version: &str) {
-        use std::os::unix::fs::PermissionsExt;
-        fs::write(path, format!("#!/bin/sh\necho 'binary {version}'\n")).expect("script");
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("executable");
+        write_executable(
+            path,
+            format!("#!/bin/sh\necho 'binary {version}'\n").as_bytes(),
+        );
     }
 
     #[cfg(unix)]
@@ -1003,9 +1006,9 @@ mod tests {
         let destination = root.join("ck-aft");
         let rollback = root.join("ck-aft.rollback");
         let candidate = root.join("candidate");
-        fs::copy("/bin/sleep", &destination).unwrap();
-        fs::copy("/bin/sleep", &rollback).unwrap();
-        fs::copy("/bin/sleep", &candidate).unwrap();
+        copy_executable(Path::new("/bin/sleep"), &destination);
+        copy_executable(Path::new("/bin/sleep"), &rollback);
+        copy_executable(Path::new("/bin/sleep"), &candidate);
         fs::rename(&candidate, &destination).unwrap();
         let replaced_inode = destination_inode(&destination).unwrap();
         let mut child = Command::new(&destination).arg("10").spawn().unwrap();
@@ -1307,7 +1310,7 @@ mod tests {
         let root = fixture_dir("initiate-restart-module-id");
         let aft = upgrade_target("ck-aft");
         let ck = root.join("ck");
-        fs::write(
+        write_executable(
             &ck,
             r#"#!/bin/sh
 if [ "$1" = "module" ] && [ "$2" = "restart" ]; then
@@ -1320,15 +1323,12 @@ if [ "$1" = "module" ] && [ "$2" = "restart" ]; then
     fi
 fi
 exit 1
-"#,
-        )
-        .expect("write mock ck");
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&ck, fs::Permissions::from_mode(0o755)).expect("chmod mock ck");
+"#
+            .as_bytes(),
+        );
 
         let aft_path = root.join("ck-aft");
-        fs::write(&aft_path, "#!/bin/sh\necho 'ck-aft 1.0.0'\n").expect("write mock aft");
-        fs::set_permissions(&aft_path, fs::Permissions::from_mode(0o755)).expect("chmod mock aft");
+        write_executable(&aft_path, b"#!/bin/sh\necho 'ck-aft 1.0.0'\n");
 
         let mut inventory =
             Inventory::load(root.join("installer-manifest.json"), "linux-x64").expect("inventory");

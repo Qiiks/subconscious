@@ -939,14 +939,13 @@ mod tests {
             binary: &str,
             destination: &Path,
         ) -> Result<PlacementDigests, String> {
-            fs::write(destination, format!("#!/bin/sh\necho {binary} 1.2.3\n"))
-                .map_err(|error| error.to_string())?;
+            let script = format!("#!/bin/sh\necho {binary} 1.2.3\n");
+            // On unix the default verification executes this script, so it is
+            // written through a child process; see `test_exec` for why.
             #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(destination, fs::Permissions::from_mode(0o755))
-                    .map_err(|error| error.to_string())?;
-            }
+            crate::setup::test_exec::write_executable(destination, script.as_bytes());
+            #[cfg(not(unix))]
+            fs::write(destination, script).map_err(|error| error.to_string())?;
             fake_placement_digests(destination)
         }
 

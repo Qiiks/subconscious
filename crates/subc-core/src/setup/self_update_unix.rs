@@ -95,8 +95,8 @@ mod tests {
     use std::{
         env, fs,
         io::{BufRead, BufReader, Write},
-        os::unix::fs::{MetadataExt, PermissionsExt},
-        path::{Path, PathBuf},
+        os::unix::fs::MetadataExt,
+        path::PathBuf,
         process::{self, Command, Stdio},
         sync::mpsc::{self, Receiver},
         thread,
@@ -106,7 +106,7 @@ mod tests {
     use serde_json::Map;
 
     use super::*;
-    use crate::setup::{inventory::Inventory, self_update};
+    use crate::setup::{inventory::Inventory, self_update, test_exec::copy_executable};
     use subc_daemon::test_support::TestTempDir;
 
     const TEST_NAME: &str =
@@ -118,10 +118,6 @@ mod tests {
 
     fn fixture_dir(name: &str) -> TestTempDir {
         TestTempDir::new(name)
-    }
-
-    fn executable(path: &Path) {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("mark executable");
     }
 
     fn wait_for_helper_line(receiver: &Receiver<String>, prefix: &str) -> String {
@@ -219,10 +215,8 @@ mod tests {
         let candidate = root.join("candidate");
         let manifest = root.join("installer-manifest.json");
         let test_binary = env::current_exe().expect("test executable");
-        fs::copy(&test_binary, &destination).expect("copy installed ck");
-        fs::copy(&test_binary, &candidate).expect("copy replacement ck");
-        executable(&destination);
-        executable(&candidate);
+        copy_executable(&test_binary, &destination);
+        copy_executable(&test_binary, &candidate);
         let prior_inode = destination_inode(&destination).expect("prior inode");
 
         let mut inventory = Inventory::load(&manifest, "linux-x64").expect("inventory");

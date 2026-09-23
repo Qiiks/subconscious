@@ -14,6 +14,8 @@ mod self_update;
 mod self_update_unix;
 #[cfg(windows)]
 mod self_update_windows;
+#[cfg(all(test, unix))]
+mod test_exec;
 mod uninstall;
 mod update_cache;
 mod update_check;
