@@ -22,15 +22,17 @@ fn manifest_is_emitted_offline_without_module_setup() {
     assert_eq!(manifest["runtime_computed"], serde_json::json!([]));
     assert!(manifest.get("provenance").is_none());
     assert_eq!(manifest["module_id"], "ck-subc-mcp");
-    // Compare the captured pre-logger output independent of serde_json's
-    // preserve_order feature, enabled by other crates in workspace builds.
-    let normalized = String::from_utf8(output.stdout).unwrap().replace(
-        "\"module_version\":\"0.1.1\"",
-        "\"module_version\":\"0.1.0\"",
-    );
-    let baseline = "{\"consumes\":[{\"of\":[],\"role\":\"tool_client\"}],\"module_id\":\"ck-subc-mcp\",\"module_version\":\"0.1.0\",\"protocol_ver\":2,\"provides\":[],\"runtime_computed\":[]}";
+    // The version is the crate's own, so a release bump never needs this test
+    // edited; everything else is compared whole against the captured
+    // pre-logger manifest. Compared as parsed values, independent of
+    // serde_json's preserve_order feature, which other crates enable in
+    // workspace builds.
+    assert_eq!(manifest["module_version"], env!("CARGO_PKG_VERSION"));
+    let mut rest = manifest.clone();
+    rest.as_object_mut().unwrap().remove("module_version");
+    let baseline = "{\"consumes\":[{\"of\":[],\"role\":\"tool_client\"}],\"module_id\":\"ck-subc-mcp\",\"protocol_ver\":2,\"provides\":[],\"runtime_computed\":[]}";
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&normalized).unwrap(),
+        rest,
         serde_json::from_str::<serde_json::Value>(baseline).unwrap()
     );
 }
