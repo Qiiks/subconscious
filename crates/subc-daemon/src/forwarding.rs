@@ -502,10 +502,63 @@ impl ForwardingTable {
         concurrency: Concurrency,
         sink: FrameSink,
     ) -> Result<ModuleEndpointId, ForwardingError> {
+        self.register_module_connection_inner(
+            connection_id,
+            module_id,
+            negotiated_ver,
+            concurrency,
+            sink,
+            None,
+        )
+    }
+
+    /// Register a module connection and queue its HELLO_ACK as the first frame
+    /// on its sink, in the same write-lock critical section that makes the
+    /// endpoint visible.
+    ///
+    /// A module reads HELLO_ACK as the first frame after its HELLO and exits on
+    /// anything else. Once the endpoint is in `modules_by_id`, a `route.open`
+    /// on any other connection can queue a `route.bind` request onto this sink,
+    /// so the ack must already be queued by then. Every lookup that can queue a
+    /// frame for the module takes this lock, so nothing can get in ahead of it.
+    ///
+    /// If the ack cannot be queued (the sink is closed or full), the
+    /// registration fails with nothing inserted.
+    pub(crate) fn register_module_connection_acked(
+        &self,
+        connection_id: ConnectionId,
+        module_id: String,
+        negotiated_ver: u8,
+        concurrency: Concurrency,
+        sink: FrameSink,
+        hello_ack: Frame,
+    ) -> Result<ModuleEndpointId, ForwardingError> {
+        self.register_module_connection_inner(
+            connection_id,
+            module_id,
+            negotiated_ver,
+            concurrency,
+            sink,
+            Some(hello_ack),
+        )
+    }
+
+    fn register_module_connection_inner(
+        &self,
+        connection_id: ConnectionId,
+        module_id: String,
+        negotiated_ver: u8,
+        concurrency: Concurrency,
+        sink: FrameSink,
+        hello_ack: Option<Frame>,
+    ) -> Result<ModuleEndpointId, ForwardingError> {
         let mut inner = self.write_inner()?;
         if inner.daemon_draining || inner.closing_connections.contains(&connection_id) {
             return Err(ForwardingError::ConnectionClosing { connection_id });
         }
+        // Every refusal check has passed and nothing has been mutated yet, so
+        // a failed enqueue leaves the table exactly as it was.
+        enqueue_hello_ack_locked(&sink, connection_id, hello_ack)?;
         if let Some(old_endpoint) = inner.endpoint_by_connection.remove(&connection_id) {
             let _ = remove_module_connection_locked(&mut inner, old_endpoint);
         }
@@ -566,6 +619,11 @@ impl ForwardingTable {
     /// is still true. The breaker is reset at cutover instead, when the process
     /// behind the name actually changes. A second candidate for the same id is
     /// refused.
+    ///
+    /// Production registers candidates through
+    /// [`Self::register_candidate_module_connection_acked`]; this ack-less form
+    /// is for tests that build forwarding state directly.
+    #[cfg(test)]
     pub(crate) fn register_candidate_module_connection(
         &self,
         connection_id: ConnectionId,
@@ -574,6 +632,50 @@ impl ForwardingTable {
         concurrency: Concurrency,
         sink: FrameSink,
     ) -> Result<ModuleEndpointId, ForwardingError> {
+        self.register_candidate_module_connection_inner(
+            connection_id,
+            module_id,
+            negotiated_ver,
+            concurrency,
+            sink,
+            None,
+        )
+    }
+
+    /// The swap-candidate counterpart of
+    /// [`Self::register_module_connection_acked`]: the HELLO_ACK is queued on
+    /// the candidate's sink before its endpoint is inserted. No by-id lookup
+    /// sees a candidate, but its own connection's endpoint does become
+    /// resolvable here, and at cutover it becomes routable; the ack has to be
+    /// ahead of anything either can queue.
+    pub(crate) fn register_candidate_module_connection_acked(
+        &self,
+        connection_id: ConnectionId,
+        module_id: String,
+        negotiated_ver: u8,
+        concurrency: Concurrency,
+        sink: FrameSink,
+        hello_ack: Frame,
+    ) -> Result<ModuleEndpointId, ForwardingError> {
+        self.register_candidate_module_connection_inner(
+            connection_id,
+            module_id,
+            negotiated_ver,
+            concurrency,
+            sink,
+            Some(hello_ack),
+        )
+    }
+
+    fn register_candidate_module_connection_inner(
+        &self,
+        connection_id: ConnectionId,
+        module_id: String,
+        negotiated_ver: u8,
+        concurrency: Concurrency,
+        sink: FrameSink,
+        hello_ack: Option<Frame>,
+    ) -> Result<ModuleEndpointId, ForwardingError> {
         let mut inner = self.write_inner()?;
         if inner.daemon_draining || inner.closing_connections.contains(&connection_id) {
             return Err(ForwardingError::ConnectionClosing { connection_id });
@@ -581,6 +683,9 @@ impl ForwardingTable {
         if inner.candidates_by_id.contains_key(&module_id) {
             return Err(ForwardingError::CandidateSlotOccupied { module_id });
         }
+        // As in `register_module_connection_inner`: after every refusal check,
+        // before any mutation.
+        enqueue_hello_ack_locked(&sink, connection_id, hello_ack)?;
         if let Some(old_endpoint) = inner.endpoint_by_connection.remove(&connection_id) {
             let _ = remove_module_connection_locked(&mut inner, old_endpoint);
         }
@@ -2563,6 +2668,22 @@ fn abandoned_route_target(
     })
 }
 
+/// Queue a registering module's HELLO_ACK on its sink. Called with the
+/// forwarding write lock held, before the endpoint is inserted, which is what
+/// puts the ack ahead of any `route.bind` or control RPC routed to the module.
+/// `try_send` never waits, so holding the lock across it is safe.
+fn enqueue_hello_ack_locked(
+    sink: &FrameSink,
+    connection_id: ConnectionId,
+    hello_ack: Option<Frame>,
+) -> Result<(), ForwardingError> {
+    let Some(hello_ack) = hello_ack else {
+        return Ok(());
+    };
+    sink.try_send(hello_ack)
+        .map_err(|_| ForwardingError::ModuleEgressUnavailable { connection_id })
+}
+
 fn remove_module_connection_locked(
     inner: &mut ForwardingInner,
     endpoint: ModuleEndpointId,
@@ -2905,6 +3026,11 @@ pub enum ForwardingError {
     CandidateSlotOccupied {
         module_id: String,
     },
+    /// A registering module's HELLO_ACK could not be queued because its
+    /// outbound queue is closed or full.
+    ModuleEgressUnavailable {
+        connection_id: ConnectionId,
+    },
     Poisoned,
 }
 
@@ -2954,6 +3080,11 @@ impl fmt::Display for ForwardingError {
                 f,
                 "module_id '{module_id}' already has a swap candidate registered"
             ),
+            Self::ModuleEgressUnavailable { connection_id } => write!(
+                f,
+                "module connection {} egress is unavailable; HELLO_ACK could not be queued",
+                connection_id.get()
+            ),
             Self::Poisoned => write!(f, "forwarding table lock was poisoned"),
         }
     }
@@ -3001,6 +3132,132 @@ mod tests {
     fn drain_with_no_subscriptions_reports_zero_excluded() {
         let mut ledger = CreditLedger::default();
         assert_eq!(ledger.capture_subscription_exclusions(), 0);
+    }
+
+    fn test_hello_ack(corr: u64) -> Frame {
+        Frame::build(
+            FrameType::HelloAck,
+            Flags::new(false, Priority::Passive, false),
+            0,
+            0,
+            corr,
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    /// An acked registration whose HELLO_ACK cannot be queued must leave no
+    /// endpoint behind: a routable module that never got its ack would read a
+    /// route.bind first and exit. A closed queue and a full one both refuse.
+    #[test]
+    fn acked_registration_that_cannot_queue_its_hello_ack_inserts_nothing() {
+        let forwarding = ForwardingTable::default();
+
+        let (closed_tx, closed_rx) = mpsc::channel(8);
+        drop(closed_rx);
+        let closed = ConnectionId::new(1);
+        assert_eq!(
+            forwarding.register_module_connection_acked(
+                closed,
+                "closed".to_string(),
+                2,
+                Concurrency::ModuleManaged,
+                FrameSink::new(closed_tx),
+                test_hello_ack(1),
+            ),
+            Err(ForwardingError::ModuleEgressUnavailable {
+                connection_id: closed
+            })
+        );
+
+        let (full_tx, _full_rx) = mpsc::channel(1);
+        let full_sink = FrameSink::new(full_tx);
+        full_sink.try_send(test_hello_ack(99)).unwrap();
+        let full = ConnectionId::new(2);
+        assert_eq!(
+            forwarding.register_module_connection_acked(
+                full,
+                "full".to_string(),
+                2,
+                Concurrency::ModuleManaged,
+                full_sink.clone(),
+                test_hello_ack(2),
+            ),
+            Err(ForwardingError::ModuleEgressUnavailable {
+                connection_id: full
+            })
+        );
+        assert_eq!(
+            forwarding.register_candidate_module_connection_acked(
+                full,
+                "full".to_string(),
+                2,
+                Concurrency::ModuleManaged,
+                full_sink,
+                test_hello_ack(3),
+            ),
+            Err(ForwardingError::ModuleEgressUnavailable {
+                connection_id: full
+            })
+        );
+
+        for (connection, module_id) in [(closed, "closed"), (full, "full")] {
+            assert_eq!(
+                forwarding
+                    .module_endpoint_for_connection(connection)
+                    .unwrap(),
+                None
+            );
+            let (client_tx, _client_rx) = mpsc::channel(8);
+            assert_eq!(
+                forwarding
+                    .begin_route_bind_relay_for_test(
+                        ConnectionId::new(50),
+                        FrameSink::new(client_tx),
+                        1,
+                        module_id,
+                    )
+                    .err(),
+                Some(ForwardingError::NoModuleConnection)
+            );
+        }
+        assert!(forwarding.read_inner().unwrap().candidates_by_id.is_empty());
+    }
+
+    /// Both acked registration forms put the HELLO_ACK on the module's queue
+    /// by the time the endpoint can be resolved.
+    #[test]
+    fn acked_registration_queues_the_hello_ack_first() {
+        let forwarding = ForwardingTable::default();
+        let (active_tx, mut active_rx) = mpsc::channel(8);
+        forwarding
+            .register_module_connection_acked(
+                ConnectionId::new(1),
+                "acked".to_string(),
+                2,
+                Concurrency::ModuleManaged,
+                FrameSink::new(active_tx),
+                test_hello_ack(11),
+            )
+            .unwrap();
+        let (candidate_tx, mut candidate_rx) = mpsc::channel(8);
+        forwarding
+            .register_candidate_module_connection_acked(
+                ConnectionId::new(2),
+                "acked".to_string(),
+                2,
+                Concurrency::ModuleManaged,
+                FrameSink::new(candidate_tx),
+                test_hello_ack(12),
+            )
+            .unwrap();
+
+        let active_first = active_rx.try_recv().unwrap().frame;
+        assert_eq!(active_first.header.ty, FrameType::HelloAck);
+        assert_eq!(active_first.header.corr, 11);
+        let candidate_first = candidate_rx.try_recv().unwrap().frame;
+        assert_eq!(candidate_first.header.ty, FrameType::HelloAck);
+        assert_eq!(candidate_first.header.corr, 12);
     }
 
     #[test]

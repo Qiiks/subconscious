@@ -1733,6 +1733,9 @@ impl ControlHandler {
         }
 
         let control_ops = effective_module_control_ops(hello.control_ops);
+        // Built before anything is registered so an encoding failure leaves no
+        // registry or forwarding state behind.
+        let hello_ack = self.build_hello_ack(&frame, negotiated_ver, &hello.manifest.module_id)?;
         if swap_candidate {
             return self.register_swap_candidate(
                 connection_id,
@@ -1741,6 +1744,7 @@ impl ControlHandler {
                 hello.manifest,
                 negotiated_ver,
                 control_ops,
+                hello_ack,
             );
         }
         let registration = match self.registry.register_with_control_ops(
@@ -1775,7 +1779,7 @@ impl ControlHandler {
             }
         };
 
-        if let Some(sink) = sink {
+        let reply = if let Some(sink) = sink {
             // The forwarding table's module store is also the daemon-to-module
             // control-RPC lane, so every HELLO gets a live endpoint even when the
             // manifest has no routable provider role. Non-routable modules still
@@ -1784,13 +1788,21 @@ impl ControlHandler {
             // only production call to `begin_route_bind_relay_for` below that
             // route.open path. The remaining direct relay callers are unit tests
             // and benchmark harnesses that construct forwarding state explicitly.
+            //
+            // The HELLO_ACK is queued by the forwarding table itself, before the
+            // endpoint becomes visible, and is NOT returned as a reply. A module
+            // reads HELLO_ACK first and exits on anything else; a reply is only
+            // written after this handler returns, by which time a route.open on
+            // another connection could already have queued a route.bind request
+            // for this module ahead of it.
             let concurrency = manifest_concurrency(&registration.manifest);
-            if let Err(err) = self.forwarding.register_module_connection(
+            if let Err(err) = self.forwarding.register_module_connection_acked(
                 connection_id,
                 registration.manifest.module_id.clone(),
                 negotiated_ver,
                 concurrency,
                 sink,
+                hello_ack,
             ) {
                 // Forwarding registration failed, so there is no forwarding
                 // state to tear down. Remove the registry entry and signal the
@@ -1804,7 +1816,12 @@ impl ControlHandler {
                     err.to_string(),
                 )?]);
             }
-        }
+            Vec::new()
+        } else {
+            // No sink means no forwarding endpoint, so nothing can be routed
+            // ahead of the ack; it goes out as the reply.
+            vec![hello_ack]
+        };
 
         // Exposure over assumption: Concurrency's serde default is pinned to the
         // pre-field behavior (ModuleManaged), so a management surface that is
@@ -1832,7 +1849,7 @@ impl ControlHandler {
             "module registered"
         );
 
-        self.hello_ack(&frame, negotiated_ver, &registration.manifest.module_id)
+        Ok(reply)
     }
 
     /// Register a HELLO the swap gate admitted into the candidate slot of the
@@ -1844,6 +1861,7 @@ impl ControlHandler {
     /// a forwarding failure removes the registry entry again. The capability
     /// census is not run: it describes routable modules, and this one is not
     /// routable until promotion.
+    #[allow(clippy::too_many_arguments)]
     fn register_swap_candidate(
         &self,
         connection_id: ConnectionId,
@@ -1852,6 +1870,7 @@ impl ControlHandler {
         manifest: ModuleManifest,
         negotiated_ver: u8,
         control_ops: Vec<String>,
+        hello_ack: Frame,
     ) -> Result<Vec<Frame>, RouterError> {
         let module_id = manifest.module_id.clone();
         let registration = match self.registry.register_candidate_with_control_ops(
@@ -1885,14 +1904,18 @@ impl ControlHandler {
                 )?])
             }
         };
-        if let Some(sink) = sink {
+        let reply = if let Some(sink) = sink {
+            // Same ordering as an ordinary HELLO: the forwarding table queues
+            // the HELLO_ACK before the candidate endpoint is inserted, because
+            // a module exits if its first frame after HELLO is anything else.
             let concurrency = manifest_concurrency(&registration.manifest);
-            if let Err(err) = self.forwarding.register_candidate_module_connection(
+            if let Err(err) = self.forwarding.register_candidate_module_connection_acked(
                 connection_id,
                 module_id.clone(),
                 negotiated_ver,
                 concurrency,
                 sink,
+                hello_ack,
             ) {
                 if matches!(self.deregister_connection(connection_id), Ok(r) if !r.is_empty()) {
                     crate::supervise::notify_registration_release();
@@ -1903,7 +1926,10 @@ impl ControlHandler {
                     err.to_string(),
                 )?]);
             }
-        }
+            Vec::new()
+        } else {
+            vec![hello_ack]
+        };
         self.supervisor.mark_swap_candidate_admitted(&module_id);
         info!(
             module_id = %module_id,
@@ -1913,15 +1939,15 @@ impl ControlHandler {
             connection_id = connection_id.get(),
             "swap candidate registered; not routable until cutover"
         );
-        self.hello_ack(frame, negotiated_ver, &module_id)
+        Ok(reply)
     }
 
-    fn hello_ack(
+    fn build_hello_ack(
         &self,
         frame: &Frame,
         negotiated_ver: u8,
         module_id: &str,
-    ) -> Result<Vec<Frame>, RouterError> {
+    ) -> Result<Frame, RouterError> {
         let ack = ModuleHelloAckBody {
             negotiated_ver,
             subc_ops: module_subc_ops(),
@@ -1940,7 +1966,7 @@ impl ControlHandler {
             )
         })?;
 
-        Ok(vec![Frame::build_with_version(
+        Frame::build_with_version(
             negotiated_ver,
             FrameType::HelloAck,
             control_flags(),
@@ -1949,7 +1975,7 @@ impl ControlHandler {
             frame.header.corr,
             body,
         )
-        .map_err(RouterError::FrameBuild)?])
+        .map_err(RouterError::FrameBuild)
     }
 
     async fn handle_client_control_request(
@@ -5250,7 +5276,8 @@ fn forwarding_error_code(err: &ForwardingError) -> &'static str {
         ForwardingError::StaleModuleEndpoint
         | ForwardingError::UnknownReservation { .. }
         | ForwardingError::ConnectionClosing { .. }
-        | ForwardingError::ClientEgressClosed { .. } => "target_unavailable",
+        | ForwardingError::ClientEgressClosed { .. }
+        | ForwardingError::ModuleEgressUnavailable { .. } => "target_unavailable",
         // Only a swap candidate's registration can produce this, and it means
         // exactly what a second active HELLO for a live id means.
         ForwardingError::CandidateSlotOccupied { .. } => "duplicate_module_id",
@@ -5483,6 +5510,9 @@ mod tests {
                 connection_id: ConnectionId::new(1),
             },
             ForwardingError::ClientEgressClosed {
+                connection_id: ConnectionId::new(1),
+            },
+            ForwardingError::ModuleEgressUnavailable {
                 connection_id: ConnectionId::new(1),
             },
         ];
@@ -5751,6 +5781,29 @@ mod tests {
 
     fn parse_ack(frame: &Frame) -> ModuleHelloAckBody {
         serde_json::from_slice(&frame.body).unwrap()
+    }
+
+    /// Register a module over a connection that has a sink and return the
+    /// HELLO_ACK the module reads. A successful HELLO queues its ack on the
+    /// module's own sink rather than returning it as a reply, so the ack is
+    /// taken off `rx` here and whatever the test reads next is what followed it.
+    async fn hello_via_sink(
+        handler: &ControlHandler,
+        ctx: &RouteCtx,
+        rx: &mut mpsc::Receiver<crate::router::OutboundFrame>,
+        hello: Frame,
+    ) -> Frame {
+        let replies = handler.handle_control_frame(ctx, hello).await.unwrap();
+        assert!(
+            replies.is_empty(),
+            "a registered HELLO replies with nothing; its ack is already queued: {replies:?}"
+        );
+        let ack = rx
+            .try_recv()
+            .expect("HELLO_ACK is queued on the module sink")
+            .frame;
+        assert_eq!(ack.header.ty, FrameType::HelloAck);
+        ack
     }
 
     fn parse_error(frame: &Frame) -> Value {
@@ -6781,14 +6834,13 @@ mod tests {
         let handler =
             ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding));
         let (module_ctx, mut module_rx) = route_ctx(ConnectionId::new(10));
-        let responses = handler
-            .handle_control_frame(
-                &module_ctx,
-                hello_frame_with_control_ops("aft", PROTOCOL_VERSION, 7, None),
-            )
-            .await
-            .unwrap();
-        assert_eq!(responses[0].header.ty, FrameType::HelloAck);
+        hello_via_sink(
+            &handler,
+            &module_ctx,
+            &mut module_rx,
+            hello_frame_with_control_ops("aft", PROTOCOL_VERSION, 7, None),
+        )
+        .await;
 
         let (client_ctx, _client_rx) = route_ctx(ConnectionId::new(20));
         let responses = handler
@@ -6808,18 +6860,18 @@ mod tests {
         let handler =
             ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding));
         let (module_ctx, mut module_rx) = route_ctx(ConnectionId::new(30));
-        handler
-            .handle_control_frame(
-                &module_ctx,
-                hello_frame_with_control_ops(
-                    "aft",
-                    PROTOCOL_VERSION,
-                    7,
-                    Some(vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()]),
-                ),
-            )
-            .await
-            .unwrap();
+        hello_via_sink(
+            &handler,
+            &module_ctx,
+            &mut module_rx,
+            hello_frame_with_control_ops(
+                "aft",
+                PROTOCOL_VERSION,
+                7,
+                Some(vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()]),
+            ),
+        )
+        .await;
 
         let project_root = unique_project_root("demux");
         let (route_client_ctx, mut route_client_rx) = route_ctx(ConnectionId::new(31));
@@ -6983,10 +7035,13 @@ mod tests {
 
         let module_connection = ConnectionId::new(30);
         let (module_ctx, mut module_rx) = route_ctx(module_connection);
-        handler
-            .handle_control_frame(&module_ctx, hello_frame("aft", PROTOCOL_VERSION, 7))
-            .await
-            .unwrap();
+        hello_via_sink(
+            &handler,
+            &module_ctx,
+            &mut module_rx,
+            hello_frame("aft", PROTOCOL_VERSION, 7),
+        )
+        .await;
 
         let dying_client = ConnectionId::new(31);
         let (dying_ctx, mut dying_rx) = route_ctx(dying_client);
@@ -7193,11 +7248,14 @@ mod tests {
             ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding))
                 .with_supervisor(supervisor);
 
-        let (target_ctx, _target_rx) = route_ctx(ConnectionId::new(90));
-        handler
-            .handle_control_frame(&target_ctx, hello_frame("target", PROTOCOL_VERSION, 1))
-            .await
-            .unwrap();
+        let (target_ctx, mut target_rx) = route_ctx(ConnectionId::new(90));
+        hello_via_sink(
+            &handler,
+            &target_ctx,
+            &mut target_rx,
+            hello_frame("target", PROTOCOL_VERSION, 1),
+        )
+        .await;
 
         // A real supervised module id presenting the wrong nonce. This is the
         // impersonation case: the attacker knows a privileged module_id, which is
@@ -7283,10 +7341,13 @@ mod tests {
                 .with_supervisor(supervisor);
 
         let (target_ctx, mut target_rx) = route_ctx(ConnectionId::new(95));
-        handler
-            .handle_control_frame(&target_ctx, hello_frame("target", PROTOCOL_VERSION, 1))
-            .await
-            .unwrap();
+        hello_via_sink(
+            &handler,
+            &target_ctx,
+            &mut target_rx,
+            hello_frame("target", PROTOCOL_VERSION, 1),
+        )
+        .await;
 
         let (client_ctx, mut client_rx) = route_ctx(ConnectionId::new(96));
         let route_handler = handler.clone();
@@ -7359,10 +7420,13 @@ mod tests {
                 .with_supervisor(supervisor);
 
         let (target_ctx, mut target_rx) = route_ctx(ConnectionId::new(101));
-        handler
-            .handle_control_frame(&target_ctx, hello_frame("target", PROTOCOL_VERSION, 1))
-            .await
-            .unwrap();
+        hello_via_sink(
+            &handler,
+            &target_ctx,
+            &mut target_rx,
+            hello_frame("target", PROTOCOL_VERSION, 1),
+        )
+        .await;
 
         let (direct_ctx, mut direct_rx) = route_ctx(ConnectionId::new(102));
         let direct_handler = handler.clone();
@@ -7490,10 +7554,13 @@ mod tests {
         let forwarding = Arc::new(ForwardingTable::default());
         let handler = ControlHandler::with_forwarding(registry, forwarding);
         let (target_ctx, mut target_rx) = route_ctx(ConnectionId::new(301));
-        handler
-            .handle_control_frame(&target_ctx, hello_frame("target", PROTOCOL_VERSION, 1))
-            .await
-            .unwrap();
+        hello_via_sink(
+            &handler,
+            &target_ctx,
+            &mut target_rx,
+            hello_frame("target", PROTOCOL_VERSION, 1),
+        )
+        .await;
         let root = unique_project_root("live-roots-known");
         let path = ProjectRootId::from_path_allowing_missing(root.path())
             .unwrap()
@@ -7577,11 +7644,14 @@ mod tests {
         let forwarding = Arc::new(ForwardingTable::default());
         let handler =
             ControlHandler::with_forwarding(Arc::new(Registry::default()), Arc::clone(&forwarding));
-        let (target_ctx, _target_rx) = route_ctx(ConnectionId::new(311));
-        handler
-            .handle_control_frame(&target_ctx, hello_frame("target", PROTOCOL_VERSION, 1))
-            .await
-            .unwrap();
+        let (target_ctx, mut target_rx) = route_ctx(ConnectionId::new(311));
+        hello_via_sink(
+            &handler,
+            &target_ctx,
+            &mut target_rx,
+            hello_frame("target", PROTOCOL_VERSION, 1),
+        )
+        .await;
         let (client_ctx, _client_rx) = route_ctx(ConnectionId::new(312));
         let pending = forwarding
             .begin_route_bind_relay_for_test(
@@ -7619,22 +7689,97 @@ mod tests {
         );
     }
 
+    /// A module reads HELLO_ACK as its first frame and exits on anything else,
+    /// so the ack has to be on its outbound queue before the module is
+    /// routable. The connection loop writes a handler's replies only after the
+    /// handler returns; this test stops in exactly that gap, runs a real
+    /// route.open from another connection, and only then writes whatever the
+    /// HELLO handler returned, the way the loop would. If the ack were still a
+    /// reply, the route.bind request would reach the module first.
+    #[tokio::test(start_paused = true)]
+    async fn hello_ack_reaches_the_module_before_a_route_bind_raced_into_the_reply_gap() {
+        let forwarding = Arc::new(ForwardingTable::default());
+        let handler =
+            ControlHandler::with_forwarding(Arc::new(Registry::default()), Arc::clone(&forwarding));
+        let (module_ctx, mut module_rx) = route_ctx(ConnectionId::new(341));
+        let replies = handler
+            .handle_control_frame(&module_ctx, hello_frame("raced", PROTOCOL_VERSION, 7))
+            .await
+            .unwrap();
+        let queued_by_hello = module_rx.len();
+
+        let (client_ctx, mut client_rx) = route_ctx(ConnectionId::new(342));
+        let open_handler = handler.clone();
+        let open = tokio::spawn(async move {
+            open_handler
+                .handle_control_frame(
+                    &client_ctx,
+                    route_open_frame(2, "raced", unique_project_root("hello-ack-race")),
+                )
+                .await
+                .unwrap()
+        });
+        // Let the route.open run until its route.bind is on the module's queue.
+        let mut spins = 0;
+        while module_rx.len() == queued_by_hello {
+            spins += 1;
+            assert!(spins < 10_000, "route.open never queued a route.bind");
+            tokio::task::yield_now().await;
+        }
+
+        // Now the connection loop's half: write the HELLO handler's replies.
+        for reply in replies {
+            module_ctx.egress.send(reply).await.unwrap();
+        }
+
+        let first = module_rx.recv().await.unwrap().frame;
+        assert_eq!(
+            first.header.ty,
+            FrameType::HelloAck,
+            "the first frame a registering module reads must be its HELLO_ACK"
+        );
+        assert_eq!(first.header.corr, 7);
+        let second = module_rx.recv().await.unwrap().frame;
+        assert_eq!(second.header.ty, FrameType::Request);
+        assert!(
+            matches!(
+                serde_json::from_slice::<ModuleControlRequest>(&second.body).unwrap(),
+                ModuleControlRequest::RouteBind { .. }
+            ),
+            "the route.bind follows the ack"
+        );
+        assert!(module_rx.try_recv().is_err(), "nothing else was queued");
+
+        handler
+            .handle_control_frame(&module_ctx, route_bind_ack(second.header.corr))
+            .await
+            .unwrap();
+        assert!(open.await.unwrap().is_empty());
+        let _ = client_rx.recv().await.unwrap();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn supervisor_live_roots_cross_module_scope_uses_requesting_connection() {
         let handler = ControlHandler::with_forwarding(
             Arc::new(Registry::default()),
             Arc::new(ForwardingTable::default()),
         );
-        let (first_ctx, _first_rx) = route_ctx(ConnectionId::new(315));
+        let (first_ctx, mut first_rx) = route_ctx(ConnectionId::new(315));
         let (second_ctx, mut second_rx) = route_ctx(ConnectionId::new(316));
-        handler
-            .handle_control_frame(&first_ctx, hello_frame("first", PROTOCOL_VERSION, 1))
-            .await
-            .unwrap();
-        handler
-            .handle_control_frame(&second_ctx, hello_frame("second", PROTOCOL_VERSION, 2))
-            .await
-            .unwrap();
+        hello_via_sink(
+            &handler,
+            &first_ctx,
+            &mut first_rx,
+            hello_frame("first", PROTOCOL_VERSION, 1),
+        )
+        .await;
+        hello_via_sink(
+            &handler,
+            &second_ctx,
+            &mut second_rx,
+            hello_frame("second", PROTOCOL_VERSION, 2),
+        )
+        .await;
         let root = unique_project_root("second-only");
         let (client_ctx, _client_rx) = route_ctx(ConnectionId::new(317));
         let cloned = handler.clone();
@@ -7683,11 +7828,14 @@ mod tests {
             Arc::new(Registry::default()),
             Arc::new(ForwardingTable::default()),
         );
-        let (target_ctx, _target_rx) = route_ctx(ConnectionId::new(321));
-        handler
-            .handle_control_frame(&target_ctx, hello_frame("target", PROTOCOL_VERSION, 1))
-            .await
-            .unwrap();
+        let (target_ctx, mut target_rx) = route_ctx(ConnectionId::new(321));
+        hello_via_sink(
+            &handler,
+            &target_ctx,
+            &mut target_rx,
+            hello_frame("target", PROTOCOL_VERSION, 1),
+        )
+        .await;
         let actual = query_live_roots(&handler, &target_ctx).await;
         let ModuleControlResponseToModule::LiveRoots {
             roots,
@@ -7796,10 +7944,13 @@ mod tests {
                     );
 
             let (target_ctx, mut target_rx) = route_ctx(ConnectionId::new(90));
-            handler
-                .handle_control_frame(&target_ctx, hello_frame("target", PROTOCOL_VERSION, 1))
-                .await
-                .unwrap();
+            hello_via_sink(
+                &handler,
+                &target_ctx,
+                &mut target_rx,
+                hello_frame("target", PROTOCOL_VERSION, 1),
+            )
+            .await;
 
             let (client_ctx, _client_rx) = route_ctx(ConnectionId::new(91));
             let route_handler = handler.clone();
@@ -7861,15 +8012,21 @@ mod tests {
                 );
 
         let (target_ctx, mut target_rx) = route_ctx(ConnectionId::new(70));
-        handler
-            .handle_control_frame(&target_ctx, hello_frame("target", PROTOCOL_VERSION, 1))
-            .await
-            .unwrap();
-        let (other_ctx, _other_rx) = route_ctx(ConnectionId::new(71));
-        handler
-            .handle_control_frame(&other_ctx, hello_frame("other", PROTOCOL_VERSION, 2))
-            .await
-            .unwrap();
+        hello_via_sink(
+            &handler,
+            &target_ctx,
+            &mut target_rx,
+            hello_frame("target", PROTOCOL_VERSION, 1),
+        )
+        .await;
+        let (other_ctx, mut other_rx) = route_ctx(ConnectionId::new(71));
+        hello_via_sink(
+            &handler,
+            &other_ctx,
+            &mut other_rx,
+            hello_frame("other", PROTOCOL_VERSION, 2),
+        )
+        .await;
 
         let facts = json!({"schema": 1, "verified_class": "member", "org": "01H"});
         let expected_facts = facts.clone();
@@ -8018,11 +8175,14 @@ mod tests {
         let registry = Arc::new(Registry::default());
         let forwarding = Arc::new(ForwardingTable::default());
         let handler = ControlHandler::with_forwarding(registry, forwarding);
-        let (target_ctx, _) = route_ctx(ConnectionId::new(78));
-        handler
-            .handle_control_frame(&target_ctx, hello_frame("target", PROTOCOL_VERSION, 1))
-            .await
-            .unwrap();
+        let (target_ctx, mut target_rx) = route_ctx(ConnectionId::new(78));
+        hello_via_sink(
+            &handler,
+            &target_ctx,
+            &mut target_rx,
+            hello_frame("target", PROTOCOL_VERSION, 1),
+        )
+        .await;
 
         let responses = handler
             .handle_control_frame(
@@ -8050,10 +8210,13 @@ mod tests {
         let handler =
             ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding));
         let (module_ctx, mut module_rx) = route_ctx(ConnectionId::new(37));
-        handler
-            .handle_control_frame(&module_ctx, hello_frame("aft", PROTOCOL_VERSION, 7))
-            .await
-            .unwrap();
+        hello_via_sink(
+            &handler,
+            &module_ctx,
+            &mut module_rx,
+            hello_frame("aft", PROTOCOL_VERSION, 7),
+        )
+        .await;
 
         let expected = vec!["elicitation".to_string(), "roots".to_string()];
         let expected_for_request = expected.clone();
@@ -8108,10 +8271,13 @@ mod tests {
         let handler =
             ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding));
         let (module_ctx, mut module_rx) = route_ctx(ConnectionId::new(39));
-        handler
-            .handle_control_frame(&module_ctx, hello_frame("aft", PROTOCOL_VERSION, 7))
-            .await
-            .unwrap();
+        hello_via_sink(
+            &handler,
+            &module_ctx,
+            &mut module_rx,
+            hello_frame("aft", PROTOCOL_VERSION, 7),
+        )
+        .await;
 
         let project_root = unique_project_root("consumer-capabilities-absent");
         let (client_ctx, mut client_rx) = route_ctx(ConnectionId::new(40));
@@ -8157,18 +8323,17 @@ mod tests {
             ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding))
                 .with_health_probe_timeout(Duration::from_secs(5));
         let (module_ctx, mut module_rx) = route_ctx(ConnectionId::new(35));
-        let responses = handler
-            .handle_control_frame(
-                &module_ctx,
-                non_routable_hello_frame_with_control_ops(
-                    "mcp",
-                    300,
-                    Some(vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()]),
-                ),
-            )
-            .await
-            .unwrap();
-        assert_eq!(responses[0].header.ty, FrameType::HelloAck);
+        hello_via_sink(
+            &handler,
+            &module_ctx,
+            &mut module_rx,
+            non_routable_hello_frame_with_control_ops(
+                "mcp",
+                300,
+                Some(vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()]),
+            ),
+        )
+        .await;
         assert!(registry
             .get_module("mcp")
             .unwrap()
@@ -8465,10 +8630,13 @@ mod tests {
             ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding));
         let module_connection = ConnectionId::new(95);
         let (module_ctx, mut module_rx) = route_ctx(module_connection);
-        handler
-            .handle_control_frame(&module_ctx, hello_frame("aft", PROTOCOL_VERSION, 395))
-            .await
-            .unwrap();
+        hello_via_sink(
+            &handler,
+            &module_ctx,
+            &mut module_rx,
+            hello_frame("aft", PROTOCOL_VERSION, 395),
+        )
+        .await;
 
         let client_connection = ConnectionId::new(96);
         let (client_ctx, _client_rx) = route_ctx(client_connection);
@@ -8699,18 +8867,18 @@ mod tests {
             ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding))
                 .with_health_probe_timeout(Duration::from_millis(50));
         let (module_ctx, mut module_rx) = route_ctx(ConnectionId::new(40));
-        handler
-            .handle_control_frame(
-                &module_ctx,
-                hello_frame_with_control_ops(
-                    "aft",
-                    PROTOCOL_VERSION,
-                    7,
-                    Some(vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()]),
-                ),
-            )
-            .await
-            .unwrap();
+        hello_via_sink(
+            &handler,
+            &module_ctx,
+            &mut module_rx,
+            hello_frame_with_control_ops(
+                "aft",
+                PROTOCOL_VERSION,
+                7,
+                Some(vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()]),
+            ),
+        )
+        .await;
 
         let (client_ctx, _client_rx) = route_ctx(ConnectionId::new(41));
         let responses = handler
@@ -9306,17 +9474,11 @@ mod tests {
     async fn register_capability_manifest(
         handler: &ControlHandler,
         ctx: &RouteCtx,
+        rx: &mut mpsc::Receiver<crate::router::OutboundFrame>,
         manifest: ModuleManifest,
         corr: u64,
     ) {
-        let replies = handler
-            .handle_control_frame(ctx, hello_frame_with_manifest(manifest, corr))
-            .await
-            .expect("capability test HELLO succeeds");
-        assert!(
-            matches!(replies.as_slice(), [Frame { header, .. }] if header.ty == FrameType::HelloAck),
-            "capability test HELLO must register"
-        );
+        hello_via_sink(handler, ctx, rx, hello_frame_with_manifest(manifest, corr)).await;
     }
 
     async fn open_route_for_capability_test(
@@ -9398,10 +9560,11 @@ mod tests {
             ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding))
                 .with_supervisor(supervisor);
         let (target_ctx, mut target_rx) = route_ctx(ConnectionId::new(700));
-        let (opener_ctx, _opener_rx) = route_ctx(ConnectionId::new(701));
+        let (opener_ctx, mut opener_rx) = route_ctx(ConnectionId::new(701));
         register_capability_manifest(
             &handler,
             &target_ctx,
+            &mut target_rx,
             capability_manifest("target", &["credentials-provider/v1"], &[]),
             1,
         )
@@ -9409,6 +9572,7 @@ mod tests {
         register_capability_manifest(
             &handler,
             &opener_ctx,
+            &mut opener_rx,
             capability_manifest("opener", &[], &["credentials-provider/v1"]),
             2,
         )
@@ -9449,10 +9613,11 @@ mod tests {
             ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding))
                 .with_supervisor(supervisor);
         let (target_ctx, mut target_rx) = route_ctx(ConnectionId::new(710));
-        let (old_opener_ctx, _old_opener_rx) = route_ctx(ConnectionId::new(711));
+        let (old_opener_ctx, mut old_opener_rx) = route_ctx(ConnectionId::new(711));
         register_capability_manifest(
             &handler,
             &target_ctx,
+            &mut target_rx,
             capability_manifest("target", &["credentials-provider/v1"], &[]),
             1,
         )
@@ -9460,6 +9625,7 @@ mod tests {
         register_capability_manifest(
             &handler,
             &old_opener_ctx,
+            &mut old_opener_rx,
             capability_manifest("opener", &[], &[]),
             2,
         )
@@ -9482,10 +9648,11 @@ mod tests {
         handler
             .cleanup_connection(old_opener_ctx.connection_id)
             .expect("old opener registration cleans up");
-        let (new_opener_ctx, _new_opener_rx) = route_ctx(ConnectionId::new(713));
+        let (new_opener_ctx, mut new_opener_rx) = route_ctx(ConnectionId::new(713));
         register_capability_manifest(
             &handler,
             &new_opener_ctx,
+            &mut new_opener_rx,
             capability_manifest("opener", &[], &["credentials-provider/v1"]),
             4,
         )
@@ -9515,10 +9682,11 @@ mod tests {
             ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding))
                 .with_supervisor(supervisor);
         let (target_ctx, mut target_rx) = route_ctx(ConnectionId::new(720));
-        let (opener_ctx, _opener_rx) = route_ctx(ConnectionId::new(721));
+        let (opener_ctx, mut opener_rx) = route_ctx(ConnectionId::new(721));
         register_capability_manifest(
             &handler,
             &target_ctx,
+            &mut target_rx,
             capability_manifest("target", &[], &[]),
             1,
         )
@@ -9526,6 +9694,7 @@ mod tests {
         register_capability_manifest(
             &handler,
             &opener_ctx,
+            &mut opener_rx,
             capability_manifest("opener", &[], &["credentials-provider/v1"]),
             2,
         )
@@ -9587,10 +9756,11 @@ mod tests {
             ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding))
                 .with_supervisor(supervisor);
         let (target_ctx, mut target_rx) = route_ctx(ConnectionId::new(730));
-        let (opener_ctx, _opener_rx) = route_ctx(ConnectionId::new(731));
+        let (opener_ctx, mut opener_rx) = route_ctx(ConnectionId::new(731));
         register_capability_manifest(
             &handler,
             &target_ctx,
+            &mut target_rx,
             capability_manifest("target", &["credentials-provider/v1"], &[]),
             1,
         )
@@ -9598,6 +9768,7 @@ mod tests {
         register_capability_manifest(
             &handler,
             &opener_ctx,
+            &mut opener_rx,
             capability_manifest("opener", &[], &[]),
             2,
         )
@@ -9658,10 +9829,11 @@ mod tests {
             ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding))
                 .with_supervisor(supervisor);
         let (target_ctx, mut target_rx) = route_ctx(ConnectionId::new(740));
-        let (opener_ctx, _opener_rx) = route_ctx(ConnectionId::new(741));
+        let (opener_ctx, mut opener_rx) = route_ctx(ConnectionId::new(741));
         register_capability_manifest(
             &handler,
             &target_ctx,
+            &mut target_rx,
             capability_manifest("target", &["credentials-provider/v1"], &[]),
             1,
         )
@@ -9669,6 +9841,7 @@ mod tests {
         register_capability_manifest(
             &handler,
             &opener_ctx,
+            &mut opener_rx,
             capability_manifest("opener", &[], &["credentials-provider/v1"]),
             2,
         )
@@ -9706,6 +9879,7 @@ mod tests {
         register_capability_manifest(
             &handler,
             &self_ctx,
+            &mut self_rx,
             capability_manifest(
                 "self-provider",
                 &["credentials-provider/v1"],
@@ -9789,11 +9963,14 @@ mod tests {
             let forwarding = Arc::new(ForwardingTable::default());
             let handler =
                 ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding));
-            let (incumbent_ctx, incumbent_rx) = route_ctx(INCUMBENT);
-            handler
-                .handle_control_frame(&incumbent_ctx, hello_frame("aft", PROTOCOL_VERSION, 7))
-                .await
-                .unwrap();
+            let (incumbent_ctx, mut incumbent_rx) = route_ctx(INCUMBENT);
+            hello_via_sink(
+                &handler,
+                &incumbent_ctx,
+                &mut incumbent_rx,
+                hello_frame("aft", PROTOCOL_VERSION, 7),
+            )
+            .await;
             let (candidate_ctx, candidate_rx) = route_ctx(CANDIDATE);
             Swap {
                 registry,
