@@ -404,6 +404,27 @@ if command -v codesign >/dev/null; then
   live_sig=$(signing_posture "$DEST")
   [ "$staged_sig" = "$live_sig" ] || refuse "signing posture differs: staged [$staged_sig] vs running [$live_sig]"
   say "signing posture: $staged_sig(matches running)"
+
+  # TCC's own test, not an approximation of it: a macOS privacy grant is stored
+  # against the designated requirement of the binary it was granted to, and a new
+  # binary keeps the grant only if it SATISFIES that requirement. So check the
+  # staged file against the running file's designated requirement with
+  # `codesign -R`. The posture comparison above can pass where this fails (a
+  # requirement that names a certificate field the posture does not print), and
+  # when this fails the grant is gone with no prompt: ck-subc's identifier moved
+  # from "ck-subc" to "SIGNED.ck-subc" (codesign derives it from the file name
+  # when -i is omitted) and insula's Full Disk Access went dark, reading only as
+  # "not permitted". An ad-hoc running binary's requirement is a cdhash, which
+  # no rebuild can satisfy; that posture is already pinned above, so it is
+  # reported and skipped here.
+  live_dr=$(codesign -d -r- "$DEST" 2>&1 | sed -n 's/^designated => //p')
+  if [ -z "$live_dr" ]; then
+    say "designated requirement: running binary has none (ad-hoc, cdhash); TCC grants cannot survive any rebuild of it"
+  else
+    dr_check=$(codesign --verify -R="$live_dr" "$STAGED" 2>&1) \
+      || refuse "staged binary does not satisfy the running binary's designated requirement, so every macOS privacy grant (Full Disk Access, Accessibility) held by the running one would be silently revoked: [$live_dr] -- $dr_check"
+    say "designated requirement: staged satisfies the running binary's ($live_dr)"
+  fi
 fi
 
 # Marker differential. A marker that reads 0 on the staged file proves nothing about
