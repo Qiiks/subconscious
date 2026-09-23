@@ -217,6 +217,10 @@ pub struct ControlHandler {
     /// Central storage policy. When set, each registering module receives its
     /// resolved storage descriptor in HELLO_ACK; `None` leaves the field absent.
     storage_config: Option<crate::daemon_config::StorageConfig>,
+    /// The machine id established at boot, served on every HELLO_ACK and on
+    /// `server.describe`. Fixed for the daemon's lifetime: `ck machine adopt`
+    /// changes the file, never this value. `None` serves no id.
+    machine_id: Option<crate::machine_id::MachineId>,
     admission_facts_carrier_module_id: Option<String>,
     admission_facts_targets: Option<Vec<String>>,
     rescan: Option<SupervisorRescanContext>,
@@ -661,6 +665,7 @@ impl ControlHandler {
             route_bind_breaker_cooldown: DEFAULT_ROUTE_BIND_BREAKER_COOLDOWN,
             health_probe_timeout: DEFAULT_HEALTH_PROBE_TIMEOUT,
             storage_config: None,
+            machine_id: None,
             admission_facts_carrier_module_id: None,
             admission_facts_targets: None,
             rescan: None,
@@ -682,6 +687,13 @@ impl ControlHandler {
         storage_config: Option<crate::daemon_config::StorageConfig>,
     ) -> Self {
         self.storage_config = storage_config;
+        self
+    }
+
+    /// Set the machine id served to every registering module (HELLO_ACK) and on
+    /// `server.describe`.
+    pub fn with_machine_id(mut self, machine_id: Option<crate::machine_id::MachineId>) -> Self {
+        self.machine_id = machine_id;
         self
     }
 
@@ -1842,6 +1854,7 @@ impl ControlHandler {
                 .storage_config
                 .as_ref()
                 .map(|cfg| cfg.descriptor_for(module_id)),
+            machine_id: self.machine_id.as_ref().map(|id| id.as_str().to_owned()),
         };
         let body = serde_json::to_vec(&ack).map_err(|err| {
             RouterError::backend(
@@ -2106,6 +2119,7 @@ impl ControlHandler {
             build_git_sha: Some(env!("SUBC_BUILD_GIT_SHA").to_string()),
             build_lock_digest: Some(env!("SUBC_BUILD_LOCK_DIGEST").to_string()),
             capability_requirements: self.capability_requirement_statuses(),
+            machine_id: self.machine_id.as_ref().map(|id| id.as_str().to_owned()),
         };
         Ok(vec![control_response_body_frame(
             &frame,
@@ -6405,6 +6419,44 @@ mod tests {
             .unwrap();
         let ack = parse_ack(&responses[0]);
         assert_eq!(ack.storage, None, "no storage config -> no descriptor");
+        assert_eq!(ack.machine_id, None, "no machine id configured -> no field");
+    }
+
+    #[tokio::test]
+    async fn hello_ack_and_server_describe_carry_the_configured_machine_id() {
+        let id = crate::machine_id::MachineId::parse("0123456789abcdef0123456789abcdef").unwrap();
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::new(Arc::clone(&registry)).with_machine_id(Some(id.clone()));
+        let responses = handler
+            .handle_control(
+                ConnectionId::new(1),
+                hello_frame("aft", PROTOCOL_VERSION, 7),
+            )
+            .unwrap();
+        let ack = parse_ack(&responses[0]);
+        assert_eq!(ack.machine_id.as_deref(), Some(id.as_str()));
+
+        let described = handler
+            .handle_control_frame(
+                &route_ctx(ConnectionId::new(2)).0,
+                Frame::build(
+                    FrameType::Request,
+                    control_flags(),
+                    0,
+                    0,
+                    9,
+                    serde_json::to_vec(&ClientControlRequest::ServerDescribe {}).unwrap(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let ClientControlResponse::ServerDescribe { machine_id, .. } =
+            serde_json::from_slice(&described[0].body).unwrap()
+        else {
+            panic!("server.describe answered with another shape");
+        };
+        assert_eq!(machine_id.as_deref(), Some(id.as_str()));
     }
 
     #[test]

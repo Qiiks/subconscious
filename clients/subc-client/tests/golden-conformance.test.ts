@@ -22,6 +22,7 @@ import {
   PROTOCOL_VERSION,
   SUBSCRIPTION_FLAG,
 } from "../src/envelope";
+import { machineIdFromHelloAck, type ModuleHelloAckBody } from "../src/provider";
 
 // The Rust golden fixtures are canonical serializations of the wire shapes both
 // languages speak. Their README has always said the TypeScript client consumes
@@ -118,6 +119,8 @@ describe("Rust golden fixtures", () => {
     const relied = [
       "error_body",
       "error_body_module_removed",
+      "module_hello_ack_body",
+      "module_hello_ack_body_with_machine_id",
       "module_control_request_route_bind",
       "module_control_request_route_bind_without_consumer_capabilities",
       "module_control_request_health_check",
@@ -460,5 +463,23 @@ describe("Rust golden fixtures", () => {
 
     const decodedBody = wire.subarray(wire.length - body.length);
     expect(JSON.parse(Buffer.from(decodedBody).toString("utf8"))).toEqual(bind);
+  });
+
+  test("a hello ack carries the machine id when the daemon has one, and nothing otherwise", () => {
+    // The provider exposes this value as `machineId`. A daemon predating the
+    // machine id omits the key entirely, and the client must surface that as
+    // undefined rather than as an empty or invented id.
+    const withId = loadGolden<ModuleHelloAckBody>("module_hello_ack_body_with_machine_id");
+    const olderDaemon = loadGolden<ModuleHelloAckBody>("module_hello_ack_body");
+
+    expect(typeof withId.machine_id).toBe("string");
+    expect(machineIdFromHelloAck(withId)).toBe(withId.machine_id);
+    expect(machineIdFromHelloAck(withId)).toMatch(/^[0-9a-f]{32}$/);
+
+    expect("machine_id" in olderDaemon).toBe(false);
+    expect(machineIdFromHelloAck(olderDaemon)).toBeUndefined();
+
+    // A malformed value is not a machine id either.
+    expect(machineIdFromHelloAck({ ...withId, machine_id: "ABC" })).toBeUndefined();
   });
 });

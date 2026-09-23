@@ -101,6 +101,7 @@ export {
   type ManagementOperationKind,
   type ManagementSurfaceManifestOptions,
   type ManifestInput,
+  machineIdFromHelloAck,
   type ModuleHelloAckBody,
   type ObservabilityKind,
   type ObservabilitySurfaceInput,

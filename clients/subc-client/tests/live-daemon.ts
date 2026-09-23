@@ -13,6 +13,8 @@ export interface LiveDaemon {
   connFile: string;
   runtimeDir: string;
   configDir: string;
+  /** XDG_DATA_HOME of the spawned daemon; its machine id lives under it. */
+  dataDir: string;
   stderr: () => string;
   restart: () => Promise<void>;
   stop: () => void;
@@ -51,6 +53,9 @@ export async function startLiveDaemon(
 
   const runtimeDir = mkdtempSync(join(tmpdir(), `${prefix}-rt-`));
   const configDir = mkdtempSync(join(tmpdir(), `${prefix}-cfg-`));
+  // The daemon mints its machine id and writes its run directory under the
+  // data home, so it must never inherit the operator's real one.
+  const dataDir = mkdtempSync(join(tmpdir(), `${prefix}-data-`));
   if (options.subcJsonc !== undefined) {
     const cortexkitDir = join(configDir, "cortexkit");
     mkdirSync(cortexkitDir, { recursive: true });
@@ -68,6 +73,7 @@ export async function startLiveDaemon(
         ...process.env,
         XDG_RUNTIME_DIR: runtimeDir,
         XDG_CONFIG_HOME: configDir,
+        XDG_DATA_HOME: dataDir,
         SUBC_PORT: "0",
       },
       stdio: ["ignore", "ignore", "pipe"],
@@ -95,6 +101,7 @@ export async function startLiveDaemon(
     daemon.kill("SIGKILL");
     rmSync(runtimeDir, { recursive: true, force: true });
     rmSync(configDir, { recursive: true, force: true });
+    rmSync(dataDir, { recursive: true, force: true });
     throw err;
   }
 
@@ -102,6 +109,7 @@ export async function startLiveDaemon(
     connFile,
     runtimeDir,
     configDir,
+    dataDir,
     stderr: () => stderr,
     restart: async () => {
       daemon.kill("SIGKILL");
@@ -114,6 +122,7 @@ export async function startLiveDaemon(
       daemon.kill("SIGKILL");
       rmSync(runtimeDir, { recursive: true, force: true });
       rmSync(configDir, { recursive: true, force: true });
+      rmSync(dataDir, { recursive: true, force: true });
     },
   };
 }

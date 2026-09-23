@@ -85,7 +85,17 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
         "module_hello_body_with_provenance",
         &module_hello_body_with_provenance(),
     );
+    // Without a machine id: the reply an older daemon sends. Kept byte-identical
+    // to the pre-machine-id vector, which pins that an absent id serializes to no
+    // field at all rather than to null.
     assert_golden("module_hello_ack_body", &module_hello_ack_body());
+    assert_golden(
+        "module_hello_ack_body_with_machine_id",
+        &ModuleHelloAckBody {
+            machine_id: Some("0123456789abcdef0123456789abcdef".to_string()),
+            ..module_hello_ack_body()
+        },
+    );
     assert_golden(
         "module_control_request_route_bind",
         &module_control_request(
@@ -576,6 +586,27 @@ fn read_manifest_vector(name: &str) -> Value {
     .expect("self-signal vector is JSON")
 }
 
+#[test]
+fn hello_ack_machine_id_vectors_hold_a_valid_id_or_no_field() {
+    let with_id: Value = serde_json::from_str(
+        &fs::read_to_string(golden_path("module_hello_ack_body_with_machine_id")).unwrap(),
+    )
+    .unwrap();
+    let id = with_id["machine_id"]
+        .as_str()
+        .expect("the with-id vector carries machine_id as a string");
+    subc_protocol::MachineId::parse(id).expect("the vector's machine_id is well formed");
+
+    // The older-daemon vector must omit the key, not carry null: a module reads
+    // absence as "daemon predates the machine id".
+    let without_id: Value =
+        serde_json::from_str(&fs::read_to_string(golden_path("module_hello_ack_body")).unwrap())
+            .unwrap();
+    assert!(without_id.get("machine_id").is_none());
+    let decoded: ModuleHelloAckBody = serde_json::from_value(without_id).unwrap();
+    assert_eq!(decoded.machine_id, None);
+}
+
 fn golden_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -668,6 +699,7 @@ fn module_hello_ack_body() -> ModuleHelloAckBody {
         ],
         subc_capabilities: vec!["manifest_registration_v1".to_string()],
         storage: None,
+        machine_id: None,
     }
 }
 

@@ -34,7 +34,10 @@ use std::{error::Error, fmt, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+pub use machine_id::{MachineId, MachineIdError};
+
 pub mod frame;
+pub mod machine_id;
 pub mod manifest;
 pub mod session;
 pub mod tool_call;
@@ -329,6 +332,17 @@ pub struct ModuleHelloAckBody {
     /// `serde(default)` so an older module simply ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage: Option<serde_json::Value>,
+    /// The daemon's machine id (see [`MachineId`]): a name for this machine,
+    /// never an authority. Nothing may admit a peer, grant trust or skip a check
+    /// because two messages carry the same value.
+    ///
+    /// Carried as a plain string so one malformed value cannot fail the whole
+    /// registration reply; a module validates it with [`MachineId::parse`].
+    /// Absent from a daemon that predates the machine id, which a module must
+    /// read as exactly that, never as "no machine" and never as a reason to mint
+    /// its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
 }
 
 /// Frame kind (`type` byte at offset 5).

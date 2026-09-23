@@ -307,6 +307,25 @@ export interface ModuleHelloAckBody {
    * the storage library. Absent when no storage is configured.
    */
   storage?: unknown;
+  /**
+   * The daemon's machine id: 32 lowercase hex characters naming this machine.
+   * A name, never an authority: nothing may admit a peer, grant trust or skip a
+   * check because two messages carry the same value. Absent from a daemon that
+   * predates the machine id.
+   */
+  machine_id?: string;
+}
+
+const MACHINE_ID_PATTERN = /^[0-9a-f]{32}$/;
+
+/**
+ * The machine id carried by a HELLO_ACK, or `undefined` when the daemon sent
+ * none or sent a value that is not 32 lowercase hex characters. Never a
+ * substitute: a module that sees `undefined` has no machine id to report.
+ */
+export function machineIdFromHelloAck(ack: ModuleHelloAckBody): string | undefined {
+  const value: unknown = ack.machine_id;
+  return typeof value === "string" && MACHINE_ID_PATTERN.test(value) ? value : undefined;
 }
 
 class AsyncPermitPool {
@@ -436,13 +455,23 @@ export class SubcProvider {
    */
   storage: unknown;
 
+  /**
+   * The daemon's machine id from HELLO_ACK, or `undefined` when the daemon did
+   * not send one (it predates the machine id) or sent a malformed value. Read
+   * `undefined` as "the daemon has not named this machine", never as "no
+   * machine", and never mint a substitute. The id is a name, never an
+   * authority: nothing may grant trust because two parties report the same one.
+   */
+  machineId: string | undefined;
+
   private constructor(
     private sock: SubcSocket,
     private currentConn: ConnectionInfo,
     private readonly opts: NormalizedSubcProviderConnectOptions,
-    storage: unknown,
+    ack: ModuleHelloAckBody,
   ) {
-    this.storage = storage;
+    this.storage = ack.storage;
+    this.machineId = machineIdFromHelloAck(ack);
     this.closed = new Promise<void>((resolve) => {
       this.resolveClosed = resolve;
     });
@@ -554,7 +583,7 @@ export class SubcProvider {
 
     const normalized = normalizeProviderConnectOptions(opts);
     const opened = await SubcProvider.openConnection(normalized);
-    return new SubcProvider(opened.sock, opened.conn, normalized, opened.ack.storage);
+    return new SubcProvider(opened.sock, opened.conn, normalized, opened.ack);
   }
 
   async close(): Promise<void> {
@@ -1140,6 +1169,7 @@ export class SubcProvider {
     this.sock = opened.sock;
     this.currentConn = opened.conn;
     this.storage = opened.ack.storage;
+    this.machineId = machineIdFromHelloAck(opened.ack);
     this.closedErr = null;
     this.connectionEpoch += 1;
     this.connectionToken = newConnectionToken();

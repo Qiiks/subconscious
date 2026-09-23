@@ -23,6 +23,7 @@
     "route_release_stale_skipped": 7,
     "route_released_epoch_fenced": 6
   },
+  "machine_id": "fedcba9876543210fedcba9876543210",
   "op": "server.describe",
   "protocol_ver": 2,
   "subc_ops": [

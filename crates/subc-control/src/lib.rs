@@ -341,6 +341,12 @@ pub enum ClientControlResponse {
         /// required capability without parsing daemon logs.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         capability_requirements: Vec<CapabilityRequirementStatus>,
+        /// The daemon's machine id (`subc_protocol::MachineId`), the same value
+        /// every module receives on `HELLO_ACK`. A name for this machine, never
+        /// an authority: nothing may grant trust because two parties report the
+        /// same value. Absent from daemons predating the field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        machine_id: Option<String>,
     },
     #[serde(rename = "catalog.list")]
     CatalogList {

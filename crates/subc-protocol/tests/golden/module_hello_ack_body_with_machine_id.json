@@ -1,0 +1,14 @@
+{
+  "machine_id": "0123456789abcdef0123456789abcdef",
+  "negotiated_ver": 2,
+  "subc_capabilities": [
+    "manifest_registration_v1"
+  ],
+  "subc_ops": [
+    "server.describe",
+    "catalog.list",
+    "route.open",
+    "route.poll",
+    "catalog.update"
+  ]
+}

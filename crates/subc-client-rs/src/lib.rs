@@ -52,7 +52,7 @@ pub use subc_protocol::{
         PROVENANCE_SENTINELS,
     },
     session::{HealthReport, HealthStatus},
-    AdmissionClass, SUBC_PROTOCOL_CRATE_VERSION,
+    AdmissionClass, MachineId, SUBC_PROTOCOL_CRATE_VERSION,
 };
 pub use subc_transport::connection_file::{
     discover, discovery_candidates, Discovered, DiscoveryError,
@@ -224,6 +224,7 @@ struct ModuleHandleShared {
     supports_catalog_update: bool,
     supports_live_roots: bool,
     connection_token: u64,
+    machine_id: Option<MachineId>,
     live_routes: Mutex<HashMap<u16, RouteHandle>>,
     dropped_route_frames: AtomicU64,
     close_token: CancellationToken,
@@ -253,6 +254,12 @@ impl ModuleHandle {
                     .any(|op| op == MODULE_TO_SUBC_OP_CATALOG_UPDATE),
                 supports_live_roots: ack.subc_ops.iter().any(|op| op == "supervisor.live_roots"),
                 connection_token,
+                // A value that does not parse is treated like an absent one:
+                // the module learns nothing rather than a name that is wrong.
+                machine_id: ack
+                    .machine_id
+                    .as_deref()
+                    .and_then(|id| MachineId::parse(id).ok()),
                 live_routes: Mutex::new(HashMap::new()),
                 dropped_route_frames: AtomicU64::new(0),
                 close_token,
@@ -264,6 +271,16 @@ impl ModuleHandle {
                 }),
             }),
         }
+    }
+
+    /// The daemon's machine id, as delivered on HELLO_ACK.
+    ///
+    /// `None` means the daemon did not send one (it predates the machine id, or
+    /// was embedded without one) or sent a malformed value. Read that as "the
+    /// daemon has not named this machine", never as "no machine", and never mint
+    /// a substitute. The id is a name, never an authority: see [`MachineId`].
+    pub fn machine_id(&self) -> Option<&MachineId> {
+        self.shared.machine_id.as_ref()
     }
 
     /// Ask the daemon to replace this module's advertised provider roles in place.
@@ -1724,8 +1741,33 @@ mod tests {
             subc_ops: subc_ops.iter().map(|op| (*op).to_string()).collect(),
             subc_capabilities: Vec::new(),
             storage: None,
+            machine_id: None,
         };
         (ModuleHandle::new(&ack, tx, 1, CancellationToken::new()), rx)
+    }
+
+    #[test]
+    fn module_handle_exposes_the_acked_machine_id_and_none_otherwise() {
+        let handle_for = |machine_id: Option<&str>| {
+            let (tx, _rx) = mpsc::channel(1);
+            let ack = ModuleHelloAckBody {
+                negotiated_ver: PROTOCOL_VERSION,
+                subc_ops: Vec::new(),
+                subc_capabilities: Vec::new(),
+                storage: None,
+                machine_id: machine_id.map(str::to_owned),
+            };
+            ModuleHandle::new(&ack, tx, 1, CancellationToken::new())
+        };
+        assert_eq!(
+            handle_for(Some("0123456789abcdef0123456789abcdef"))
+                .machine_id()
+                .map(MachineId::as_str),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        // An older daemon sends nothing, and nothing is invented in its place.
+        assert_eq!(handle_for(None).machine_id(), None);
+        assert_eq!(handle_for(Some("not-a-machine-id")).machine_id(), None);
     }
 
     fn test_provider_role(tool_names: &[&str]) -> ProviderRole {

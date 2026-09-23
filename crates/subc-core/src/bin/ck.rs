@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse};
-use subc_daemon::{fleet_lint, read_frame, write_frame, Frame, DEFAULT_DRAIN_TIMEOUT};
+use subc_daemon::{fleet_lint, machine_id, read_frame, write_frame, Frame, DEFAULT_DRAIN_TIMEOUT};
 use subc_protocol::{BindIdentity, Flags, FrameType, Priority, RouteTarget};
 use subc_transport::{
     authenticate_client, connection_file, ConnectionInfo, DiscoveryError, TriedCandidate,
@@ -59,7 +59,8 @@ const CK_BUILD_SHAPE: &str = "test-support: off";
 const FRAME_DROP_ALERT_REQUIRED_NONZERO_MINUTES: u64 = 10;
 
 const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  setup     plan and apply the managed CortexKit installation\n  upgrade   plan managed component upgrades\n  module    supervised modules: list, status, stderr, terminals, restart, stop, start, rescan, release\n  catalog   what is registered on the wire (not the supervised roster)
-  routes    live consumers for one module or the whole daemon\n  provenance daemon-attested and module-declared build/process facts\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, connection info, offline triage, and CI lint";
+  routes    live consumers for one module or the whole daemon\n  provenance daemon-attested and module-declared build/process facts\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, connection info, offline triage, and CI lint
+  machine   this machine's id: show it, or adopt a restored one";
 
 const TOP_HELP_TAIL: &str = "flags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n  --verbose       include diagnostic detail and complete metrics\n\nrun 'ck <domain>' with no verb to see that domain's commands";
 
@@ -376,6 +377,8 @@ const QUOTA_HELP: &str = "ck quota - AI-provider quota and usage windows\n\nusag
 
 const HEALTH_HELP: &str = "ck health — module health\n\nusage: ck [--json] [--verbose] health [<module-id>]\n\n  ck health            one-line health for every supervised module (cached)\n  ck health <id>       fresh health.check probe with headline metrics\n  ck health <id> --verbose  fresh probe with the complete metrics tree";
 
+const MACHINE_HELP: &str = "ck machine — this machine's id, the name the daemon gives every module\n\nusage:\n  ck [--json] machine show\n  ck [--json] machine adopt <id> [--force]\n\n  show prints the id stored in <data home>/cortexkit/machine-id and the id the\n  running daemon serves, and says when they differ.\n  adopt replaces the stored id with <id> (32 lowercase hex characters), for\n  restoring a machine's identity. It takes effect at the next daemon start, and\n  every module on this machine then reports the new id. It refuses while the\n  daemon is running unless --force is given; even then the running daemon keeps\n  serving its current id until it restarts.";
+
 const DAEMON_HELP: &str = "ck daemon — daemon version, uptime, connection info, offline triage, and CI lint\n\nusage:\n  ck [--json] [--verbose] daemon\n  ck [--json] daemon triage\n  ck daemon lint [<config>] [--verbose]\n\n  triage reads only the local run directory; it never contacts the daemon.\n  lint reads module manifests without connecting to the daemon.";
 
 const SETUP_HELP: &str = "ck setup — plan managed CortexKit installation\n\nusage:\n  ck setup [aft|mc|insula|claustrum|synapse] [--with aft,mc,insula,claustrum,synapse] [--dry-run] [--verbose]\n  ck setup claustrum [--key-path <file>]\n  ck setup <aft|mc> --convert [--confirm]\n  ck setup --uninstall [--dry-run]\n\n  Bare setup installs core and offers optional components. --dry-run prints the\n  complete plan without changing anything. --convert is explicit and requires\n  --confirm before it can apply a conversion plan. --verbose includes plan outcomes\n  and download diagnostics when a network request fails.";
@@ -484,6 +487,14 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
     if matches!(&args.command, Command::DaemonTriage) {
         return daemon_triage(args.subc.as_deref(), args.json);
     }
+    // Both machine verbs work without a daemon: the stored id is a file, and
+    // adopting one is refused while a daemon IS reachable.
+    if matches!(&args.command, Command::MachineShow) {
+        return machine_show(args.subc.as_deref(), args.json).await;
+    }
+    if let Command::MachineAdopt { id, force } = &args.command {
+        return machine_adopt(args.subc.as_deref(), id, *force, args.json).await;
+    }
 
     let resolved = discover_connection_file(args.subc.as_deref())
         .map_err(|error| decorate_error(error, args.json, args.subc.as_deref()))?;
@@ -543,7 +554,9 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
             health_detail(&mut client, &module_id, args.json, args.verbose).await
         }
         Command::Daemon => daemon(&mut client, args.json, args.verbose).await,
-        Command::DaemonTriage => unreachable!("handled before connecting"),
+        Command::DaemonTriage | Command::MachineShow | Command::MachineAdopt { .. } => {
+            unreachable!("handled before connecting")
+        }
         Command::Quota {
             provider_id,
             verbose,
@@ -1051,6 +1064,13 @@ enum Command {
     },
     Daemon,
     DaemonTriage,
+    /// `ck machine show`: the stored machine id beside the running daemon's.
+    MachineShow,
+    /// `ck machine adopt <id> [--force]`: replace the stored machine id.
+    MachineAdopt {
+        id: String,
+        force: bool,
+    },
     Quota {
         provider_id: Option<String>,
         verbose: bool,
@@ -3925,6 +3945,10 @@ async fn daemon(client: &mut CkClient, json_output: bool, verbose: bool) -> Resu
         client.info.pid,
         daemon_frame_drop_summary(&describe)
     );
+    match describe.get("machine_id").and_then(Value::as_str) {
+        Some(id) => println!("machine id: {id}"),
+        None => println!("machine id: not reported by this daemon"),
+    }
     print_build_skew(&describe);
     if verbose {
         println!("protocol: {}", display_field(&describe, "protocol_ver"));
@@ -3935,6 +3959,164 @@ async fn daemon(client: &mut CkClient, json_output: bool, verbose: bool) -> Resu
                 .collect::<Vec<_>>();
             rows.sort_by(|left, right| left[0].cmp(&right[0]));
             print_table(&["counter", "value"], rows);
+        }
+    }
+    Ok(())
+}
+
+/// What `ck machine` learned about the daemon.
+enum RunningDaemon {
+    /// No daemon answered: no connection file, or nothing authenticated at it.
+    NotRunning,
+    Running {
+        pid: u32,
+        /// `None` when the daemon predates the machine id or `server.describe`
+        /// did not answer.
+        machine_id: Option<String>,
+    },
+}
+
+async fn probe_running_daemon(subc: Option<&Path>) -> RunningDaemon {
+    let Ok(resolved) = discover_connection_file(subc) else {
+        return RunningDaemon::NotRunning;
+    };
+    let Ok(mut client) = CkClient::connect(resolved).await else {
+        return RunningDaemon::NotRunning;
+    };
+    let machine_id = client
+        .rpc_value(ClientControlRequest::ServerDescribe {})
+        .await
+        .ok()
+        .and_then(|describe| describe.get("machine_id")?.as_str().map(str::to_owned));
+    RunningDaemon::Running {
+        pid: client.info.pid,
+        machine_id,
+    }
+}
+
+fn machine_id_path_or_error() -> Result<PathBuf, CkError> {
+    machine_id::default_machine_id_path().map_err(|error| CkError::Message(error.to_string()))
+}
+
+async fn machine_show(subc: Option<&Path>, json_output: bool) -> Result<(), CkError> {
+    let path = machine_id_path_or_error()?;
+    let stored = machine_id::read(&path);
+    let daemon = probe_running_daemon(subc).await;
+    let stored_id = stored.as_ref().ok().and_then(|id| id.as_ref());
+    let served_id = match &daemon {
+        RunningDaemon::Running { machine_id, .. } => machine_id.as_deref(),
+        RunningDaemon::NotRunning => None,
+    };
+    let differ = match (stored_id, served_id) {
+        (Some(stored), Some(served)) => stored.as_str() != served,
+        _ => false,
+    };
+
+    if json_output {
+        let file = match &stored {
+            Ok(id) => json!({
+                "path": path.display().to_string(),
+                "machine_id": id.as_ref().map(|id| id.as_str()),
+            }),
+            Err(error) => json!({
+                "path": path.display().to_string(),
+                "machine_id": null,
+                "error": error.to_string(),
+            }),
+        };
+        let daemon = match &daemon {
+            RunningDaemon::NotRunning => json!({ "running": false }),
+            RunningDaemon::Running { pid, machine_id } => json!({
+                "running": true,
+                "pid": pid,
+                "machine_id": machine_id,
+            }),
+        };
+        return print_json(&json!({ "file": file, "daemon": daemon, "differ": differ }));
+    }
+
+    match &stored {
+        Ok(Some(id)) => println!("file:   {id} ({})", path.display()),
+        Ok(None) => println!(
+            "file:   absent ({}); the daemon mints one at its next start",
+            path.display()
+        ),
+        Err(error) => println!("file:   unusable: {error}"),
+    }
+    match &daemon {
+        RunningDaemon::NotRunning => println!("daemon: not running"),
+        RunningDaemon::Running {
+            pid,
+            machine_id: Some(id),
+        } => println!("daemon: {id} (pid {pid})"),
+        RunningDaemon::Running {
+            pid,
+            machine_id: None,
+        } => println!(
+            "daemon: running (pid {pid}) but reports no machine id; it predates the machine id"
+        ),
+    }
+    if differ {
+        println!(
+            "they differ: modules see the daemon's id until the daemon restarts, then the file's"
+        );
+    }
+    Ok(())
+}
+
+async fn machine_adopt(
+    subc: Option<&Path>,
+    id: &str,
+    force: bool,
+    json_output: bool,
+) -> Result<(), CkError> {
+    let id = machine_id::MachineId::parse(id)
+        .map_err(|error| CkError::Usage(format!("'{id}' is not a machine id: {error}")))?;
+    let path = machine_id_path_or_error()?;
+    let daemon = probe_running_daemon(subc).await;
+    if let (RunningDaemon::Running { pid, .. }, false) = (&daemon, force) {
+        return Err(CkError::Message(format!(
+            "the daemon is running (pid {pid}); stop it, then run `ck machine adopt {id}` again. \
+             --force writes the file now, but the running daemon keeps serving its current id \
+             until it restarts"
+        )));
+    }
+    // The previous value is reported, never required: adopting over a corrupt
+    // file is exactly how an operator repairs one.
+    let previous = machine_id::read(&path);
+    machine_id::write(&path, &id).map_err(|error| CkError::Message(error.to_string()))?;
+
+    if json_output {
+        let (daemon_running, daemon_serves) = match &daemon {
+            RunningDaemon::NotRunning => (false, None),
+            RunningDaemon::Running { machine_id, .. } => (true, machine_id.clone()),
+        };
+        return print_json(&json!({
+            "path": path.display().to_string(),
+            "machine_id": id.as_str(),
+            "previous": previous.as_ref().ok().and_then(|id| id.as_ref()).map(|id| id.as_str()),
+            "takes_effect": "next_daemon_start",
+            "daemon_running": daemon_running,
+            "daemon_serves": daemon_serves,
+        }));
+    }
+
+    println!("wrote machine id {id} to {}", path.display());
+    match &previous {
+        Ok(Some(old)) if *old == id => println!("the file already held this id"),
+        Ok(Some(old)) => println!("it replaces {old}"),
+        Ok(None) => println!("there was no machine id file before"),
+        Err(error) => println!("it replaces an unusable file: {error}"),
+    }
+    println!(
+        "This takes effect at the next daemon start. From then on every module on this machine reports {id}."
+    );
+    if let RunningDaemon::Running { pid, machine_id } = &daemon {
+        match machine_id {
+            Some(current) => println!(
+                "The running daemon (pid {pid}) keeps serving {current} until it restarts."
+            ),
+            None => println!("The running daemon (pid {pid}) is unchanged until it restarts."),
         }
     }
     Ok(())
@@ -6843,6 +7025,7 @@ fn is_builtin_domain(domain: &str) -> bool {
             | "provenance"
             | "health"
             | "daemon"
+            | "machine"
             | "quota"
             | "help"
     )
@@ -6864,6 +7047,7 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
                 Some("quota") => QUOTA_HELP.into(),
                 Some("health") => HEALTH_HELP.into(),
                 Some("daemon") => DAEMON_HELP.into(),
+                Some("machine") => MACHINE_HELP.into(),
                 _ => top_help(),
             }))
         }
@@ -7052,6 +7236,7 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
                 _ => Ok(Command::Help(DAEMON_HELP.into())),
             }
         }
+        "machine" => parse_machine_command(tail),
         "quota" => {
             let mut provider_id = None;
             let mut verbose = false;
@@ -7079,6 +7264,48 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
             domain: domain.to_string(),
             tail: tail.to_vec(),
         }),
+    }
+}
+
+fn parse_machine_command(tail: &[OsString]) -> Result<Command, CkError> {
+    // A help request anywhere is a help request, so `ck machine adopt --help`
+    // explains itself instead of adopting.
+    if tail
+        .iter()
+        .any(|arg| arg == "-h" || arg == "--help" || arg == "help")
+    {
+        return Ok(Command::Help(MACHINE_HELP.into()));
+    }
+    let words = tail
+        .iter()
+        .filter(|arg| arg.as_os_str() != "--verbose")
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    match words.split_first() {
+        None => Ok(Command::Help(MACHINE_HELP.into())),
+        Some((verb, [])) if verb == "show" => Ok(Command::MachineShow),
+        Some((verb, rest)) if verb == "adopt" => {
+            let force = rest.iter().any(|arg| arg == "--force");
+            let operands = rest
+                .iter()
+                .filter(|arg| arg.as_str() != "--force")
+                .collect::<Vec<_>>();
+            match operands.as_slice() {
+                [id] if !id.starts_with('-') => Ok(Command::MachineAdopt {
+                    id: (*id).clone(),
+                    force,
+                }),
+                [] => Err(CkError::Usage(format!(
+                    "ck machine adopt needs a machine id\n\n{MACHINE_HELP}"
+                ))),
+                _ => Err(CkError::Usage(format!(
+                    "ck machine adopt takes one machine id and optionally --force\n\n{MACHINE_HELP}"
+                ))),
+            }
+        }
+        Some((verb, _)) => Err(CkError::Usage(format!(
+            "unknown verb 'machine {verb}'\n\n{MACHINE_HELP}"
+        ))),
     }
 }
 

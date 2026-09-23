@@ -730,6 +730,43 @@ async fn module_handle_catalog_update_refreshes_catalog_without_dropping_open_ro
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_registering_module_receives_the_daemons_machine_id_in_hello_ack() {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        binary_path(&workspace, "ck-subc"),
+        &["build", "-p", "subc-core", "--bins"],
+    );
+
+    let temp_dir = unique_temp_dir("subc-client-rs-machine-id");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    write_empty_config(&config_dir);
+
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    let (handle, serve_task) = spawn_inline_module(
+        &daemon.connection_file,
+        inline_module_manifest("subc-client-rs-machine-id", &["a"]),
+    )
+    .await;
+
+    // `spawn_daemon_child` points XDG_DATA_HOME at `<temp>/data`, so this is
+    // the file this daemon minted, not the operator's.
+    let stored = fs::read_to_string(temp_dir.join("data").join("cortexkit").join("machine-id"))
+        .expect("the daemon minted its machine id before accepting the module");
+    assert_eq!(
+        handle.machine_id().map(|id| id.as_str()),
+        Some(stored.trim_end_matches('\n')),
+        "the module handle carries the id from HELLO_ACK, equal to the daemon's file"
+    );
+
+    daemon.kill_and_wait();
+    assert!(serve_task.await.unwrap().is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn module_handle_catalog_update_surfaces_frozen_field_rejections() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(

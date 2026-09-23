@@ -285,6 +285,9 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                 build_git_sha: None,
                 build_lock_digest: None,
                 capability_requirements: Vec::new(),
+                // Absent for the same reason: a daemon predating the machine
+                // id sends no key.
+                machine_id: None,
             },
         ),
         (
@@ -315,6 +318,7 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                     "9d2c0d69cd82f2151bbb2b32ab9ac9d861063ffde2f8582afe767ec7e1f2145c".to_string(),
                 ),
                 capability_requirements: Vec::new(),
+                machine_id: Some("fedcba9876543210fedcba9876543210".to_string()),
             },
         ),
         (

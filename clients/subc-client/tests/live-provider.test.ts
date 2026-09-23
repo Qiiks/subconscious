@@ -1,4 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 import {
   managementSurfaceManifest,
@@ -155,6 +157,33 @@ describe.skipIf(!LIVE)("SubcProvider receives a delivered storage descriptor", (
         isolation: { kind: "module" },
         backend: { backend: "sqlite", path: `/data/cortexkit/${moduleId}/store.db` },
       });
+    } finally {
+      await provider.close();
+    }
+  });
+});
+
+describe.skipIf(!LIVE)("SubcProvider receives the daemon's machine id", () => {
+  let live: LiveDaemon;
+
+  beforeAll(async () => {
+    live = await startLiveDaemon("subc-machine-id-live");
+  });
+
+  afterAll(() => {
+    live?.stop();
+  });
+
+  test("the provider's machineId equals the id the daemon stored under its data home", async () => {
+    const provider = await SubcProvider.connect({
+      connectionFile: live.connFile,
+      manifest: managementSurfaceManifest({ moduleId: "machine-id-reader", operations: ["noop"] }),
+      handler: async (_routeChannel, body) => body,
+    });
+    try {
+      const stored = readFileSync(join(live.dataDir, "cortexkit", "machine-id"), "utf8").trimEnd();
+      expect(stored).toMatch(/^[0-9a-f]{32}$/);
+      expect(provider.machineId).toBe(stored);
     } finally {
       await provider.close();
     }

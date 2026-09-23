@@ -117,6 +117,12 @@ pub struct BootstrapConfig {
     /// directory explicitly.
     capture_logs_dir: Option<PathBuf>,
     terminal_journal_path: Option<PathBuf>,
+    /// Where the machine id is read from, or minted into when absent. `None`
+    /// serves no machine id. Absent by default for the same reason as
+    /// `capture_logs_dir`: an in-process daemon booted by a test must never
+    /// derive the operator's real data home and mint into it. The shipped binary
+    /// supplies `<data home>/cortexkit/machine-id` explicitly.
+    machine_id_path: Option<PathBuf>,
 }
 
 impl BootstrapConfig {
@@ -137,7 +143,16 @@ impl BootstrapConfig {
             cgroup_placement: CgroupPlacementConfig::default(),
             capture_logs_dir: None,
             terminal_journal_path: None,
+            machine_id_path: None,
         }
+    }
+
+    /// Serve the machine id stored at `path`, minting it there at startup when
+    /// the file is absent. Embedding daemons and tests pass a path inside their
+    /// own fixture tree.
+    pub fn with_machine_id_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.machine_id_path = Some(path.into());
+        self
     }
 
     /// Selects module cgroup placement. The default is disabled.
@@ -172,7 +187,11 @@ impl BootstrapConfig {
     /// struct for why an absent value must mean NO CAPTURE rather than the real
     /// directory.
     pub fn from_env_for_daemon_binary() -> Result<Self, BootstrapError> {
-        Ok(Self::from_env()?.with_capture_logs_dir(daemon_config::daemon_run_dir().join("logs")))
+        let machine_id_path =
+            crate::machine_id::default_machine_id_path().map_err(BootstrapError::MachineId)?;
+        Ok(Self::from_env()?
+            .with_capture_logs_dir(daemon_config::daemon_run_dir().join("logs"))
+            .with_machine_id_path(machine_id_path))
     }
 
     pub fn from_env_with_daemon_config_path(
@@ -352,6 +371,9 @@ pub struct BoundDaemon {
     pub connection_info: ConnectionInfo,
     pub connection_file_path: PathBuf,
     pub connection_file_source: ConnectionFileSource,
+    /// The machine id this daemon serves, established before any connection is
+    /// accepted. `None` when the config named no machine id path.
+    pub machine_id: Option<crate::machine_id::MachineId>,
 }
 
 /// Resolve subc's per-user TCP connection-file path.
@@ -591,6 +613,7 @@ async fn serve_bound_daemon(
         connection_file_source_reason = bound.connection_file_source.reason(),
         endpoints = ?bound.connection_info.endpoints,
         configured_modules = configured_modules.len(),
+        machine_id = bound.machine_id.as_ref().map(|id| id.as_str()).unwrap_or("none"),
         "subc daemon starting"
     );
 
@@ -663,6 +686,7 @@ async fn serve_bound_daemon(
         .with_supervisor(supervisor_handle)
         .with_connected_clients(connected_clients.clone())
         .with_storage_config(storage_config)
+        .with_machine_id(bound.machine_id.clone())
         .with_admission_facts_config(admission_facts.carrier_module_id, admission_facts.targets)
         .with_route_bind_relay_timeouts(route_bind_relay_timeouts)
         .with_daemon_provenance(
@@ -823,6 +847,16 @@ pub async fn ensure_singleton_with_config(
 
     remove_stale_connection_file_if_present(&path)?;
 
+    // Established under the start lock and before binding, so a corrupt file
+    // stops boot before anything is published, and two daemons racing to start
+    // cannot both mint.
+    let machine_id = config
+        .machine_id_path
+        .as_deref()
+        .map(crate::machine_id::load_or_mint)
+        .transpose()
+        .map_err(BootstrapError::MachineId)?;
+
     let (listeners, endpoints) = bind_loopback(config.port).await?;
     let connection_info = ConnectionInfo {
         schema: SCHEMA_VERSION,
@@ -844,6 +878,7 @@ pub async fn ensure_singleton_with_config(
         connection_info,
         connection_file_path: path,
         connection_file_source: config.connection_file_source,
+        machine_id,
     }))
 }
 
@@ -1128,6 +1163,9 @@ pub enum BootstrapError {
         source: io::Error,
     },
     DaemonConfig(DaemonConfigError),
+    /// The machine id could not be established: its file is corrupt, unreadable
+    /// or unwritable, or the data home is relative. The daemon does not start.
+    MachineId(crate::machine_id::MachineIdFileError),
     Serve(ServerError),
     ServeJoin(tokio::task::JoinError),
 }
@@ -1183,6 +1221,7 @@ impl fmt::Display for BootstrapError {
                 write!(f, "failed to read local address for {host}: {source}")
             }
             Self::DaemonConfig(err) => write!(f, "failed to load daemon config: {err}"),
+            Self::MachineId(err) => write!(f, "refusing to start: {err}"),
             Self::Serve(err) => write!(f, "daemon server failed: {err}"),
             Self::ServeJoin(err) => write!(f, "daemon server task failed: {err}"),
         }
@@ -1203,6 +1242,7 @@ impl Error for BootstrapError {
             | Self::Bind { source, .. }
             | Self::LocalAddr { source, .. } => Some(source),
             Self::DaemonConfig(err) => Some(err),
+            Self::MachineId(err) => Some(err),
             Self::Serve(err) => Some(err),
             Self::ServeJoin(err) => Some(err),
             Self::StartLockBusy { .. } => None,
