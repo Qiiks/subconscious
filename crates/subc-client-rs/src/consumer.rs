@@ -1534,6 +1534,24 @@ impl CallError {
         matches!(self, Self::NotSent(_))
     }
 
+    /// The daemon's refusal body when this failure is a route.open the daemon
+    /// refused, with its `code`, `message` and machine-readable `detail`
+    /// intact, for example `module_warming` with
+    /// `detail.reason = "required_capability_unprovided"`.
+    ///
+    /// When retryable refusals ran out the route-retry deadline, this is the
+    /// LAST refusal seen, so a caller can tell "the target stayed warming for
+    /// the whole window" from "the connection failed". The failure is still
+    /// `NotSent`: a refused route.open never delivered the request.
+    pub fn route_open_refusal(&self) -> Option<&ErrorBody> {
+        match self {
+            Self::NotSent(err) => err
+                .downcast_ref::<RouteOpenRefused>()
+                .map(|refused| &refused.body),
+            _ => None,
+        }
+    }
+
     fn subscription_backpressure(reason: impl Into<String>) -> Self {
         Self::SubscriptionBackpressure(Box::new(SimpleError(reason.into())))
     }
@@ -1582,6 +1600,33 @@ impl Error for CallError {
             | Self::CapabilityAmbiguous { .. }
             | Self::InvalidCapabilityIdentifier { .. } => None,
         }
+    }
+}
+
+/// A route.open the daemon refused, kept typed inside [`CallError::NotSent`]
+/// so the refusal's code and `detail` survive. Read it through
+/// [`CallError::route_open_refusal`].
+#[derive(Debug)]
+struct RouteOpenRefused {
+    target: String,
+    body: ErrorBody,
+}
+
+impl fmt::Display for RouteOpenRefused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "route.open failed for target {}: {} ({})",
+            self.target, self.body.code, self.body.message
+        )
+    }
+}
+
+impl Error for RouteOpenRefused {}
+
+impl CallError {
+    fn route_open_refused(target: String, body: ErrorBody) -> Self {
+        Self::NotSent(Box::new(RouteOpenRefused { target, body }))
     }
 }
 
@@ -2202,6 +2247,18 @@ impl Shared {
     ) -> Result<RouteState, CallError> {
         let route_deadline = (Instant::now() + opts.route_retry_deadline).min(call_deadline);
         let mut attempt = 0usize;
+        // The most recent retryable refusal. When the deadline ends the retries,
+        // the caller gets this refusal rather than a bare "deadline elapsed", so
+        // "the target stayed warming the whole time" stays distinguishable from
+        // "the connection failed".
+        let mut last_refusal: Option<ErrorBody> = None;
+        let expired =
+            |err: CallError, last_refusal: &mut Option<ErrorBody>| match last_refusal.take() {
+                Some(body) if err.is_not_sent() && Instant::now() >= route_deadline => {
+                    CallError::route_open_refused(key.target_label(), body)
+                }
+                _ => err,
+            };
         loop {
             attempt = attempt.saturating_add(1);
             let body = serde_json::to_vec(&ClientControlRequest::RouteOpen {
@@ -2304,24 +2361,24 @@ impl Shared {
                     // to 30s); capped per-attempt backoff bounds pressure.
                     if is_retryable_route_open_code(&body.code) && Instant::now() < route_deadline {
                         let delay = opts.route_retry.delay_after_attempt(attempt);
-                        self.sleep_until_retry(route_deadline, delay).await?;
+                        last_refusal = Some(body);
+                        if let Err(err) = self.sleep_until_retry(route_deadline, delay).await {
+                            return Err(expired(err, &mut last_refusal));
+                        }
                         continue;
                     }
-                    return Err(CallError::not_sent(format!(
-                        "route.open failed for target {}: {} ({})",
-                        key.target_label(),
-                        body.code,
-                        body.message
-                    )));
+                    return Err(CallError::route_open_refused(key.target_label(), body));
                 }
                 Ok(TerminalFrame::StreamEnd) => {
                     return Err(CallError::not_sent("route.open returned StreamEnd"));
                 }
                 Err(err) if err.is_not_sent() && Instant::now() < route_deadline => {
                     let delay = opts.route_retry.delay_after_attempt(attempt);
-                    self.sleep_until_retry(route_deadline, delay).await?;
+                    if let Err(err) = self.sleep_until_retry(route_deadline, delay).await {
+                        return Err(expired(err, &mut last_refusal));
+                    }
                 }
-                Err(err) => return Err(err),
+                Err(err) => return Err(expired(err, &mut last_refusal)),
             }
         }
 
@@ -3547,6 +3604,10 @@ impl From<&RouteTarget> for RouteTargetKey {
 struct SharedCallFailure {
     kind: FailureKind,
     message: String,
+    /// A route.open refusal travels typed, so every caller sharing this
+    /// failure (the single-flight leader and its waiters) still gets
+    /// `CallError::route_open_refusal`, not just the message text.
+    refusal: Option<(String, ErrorBody)>,
 }
 
 impl SharedCallFailure {
@@ -3554,13 +3615,17 @@ impl SharedCallFailure {
         Self {
             kind: FailureKind::NotSent,
             message: message.into(),
+            refusal: None,
         }
     }
 
     fn into_call_error(self) -> CallError {
-        match self.kind {
-            FailureKind::NotSent => CallError::not_sent(self.message),
-            FailureKind::OutcomeUnknown => CallError::outcome_unknown(self.message),
+        match (self.kind, self.refusal) {
+            (FailureKind::NotSent, Some((target, body))) => {
+                CallError::route_open_refused(target, body)
+            }
+            (FailureKind::NotSent, None) => CallError::not_sent(self.message),
+            (FailureKind::OutcomeUnknown, _) => CallError::outcome_unknown(self.message),
         }
     }
 }
@@ -3571,10 +3636,14 @@ impl From<CallError> for SharedCallFailure {
             CallError::NotSent(err) => Self {
                 kind: FailureKind::NotSent,
                 message: err.to_string(),
+                refusal: err
+                    .downcast_ref::<RouteOpenRefused>()
+                    .map(|refused| (refused.target.clone(), refused.body.clone())),
             },
             CallError::OutcomeUnknown(err) => Self {
                 kind: FailureKind::OutcomeUnknown,
                 message: err.to_string(),
+                refusal: None,
             },
             CallError::Module(body) => Self {
                 kind: FailureKind::OutcomeUnknown,
@@ -3582,20 +3651,24 @@ impl From<CallError> for SharedCallFailure {
                     "unexpected module error during route.open: {} ({})",
                     body.code, body.message
                 ),
+                refusal: None,
             },
             CallError::SubscriptionBackpressure(err) => Self {
                 kind: FailureKind::OutcomeUnknown,
                 message: err.to_string(),
+                refusal: None,
             },
             CallError::StaleRouteHandle(handle) => Self {
                 kind: FailureKind::NotSent,
                 message: format!("stale route handle: {handle:?}"),
+                refusal: None,
             },
             error @ (CallError::CapabilityUnprovided { .. }
             | CallError::CapabilityAmbiguous { .. }
             | CallError::InvalidCapabilityIdentifier { .. }) => Self {
                 kind: FailureKind::NotSent,
                 message: error.to_string(),
+                refusal: None,
             },
         }
     }

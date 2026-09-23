@@ -21,8 +21,9 @@ use subc_client_rs::{
 use subc_control::{ClientControlRequest, ClientControlResponse};
 use subc_protocol::{
     manifest::{
-        CapabilityDeclarations, Concurrency, ExecutionMode, IdentityScope, ManagementOperation,
-        ManagementOperationKind, ModuleManifest, ProviderRole, Tool,
+        CapabilityDeclarations, CapabilityNeed, CapabilityRequirement, Concurrency, ExecutionMode,
+        IdentityScope, ManagementOperation, ManagementOperationKind, ModuleManifest, ProviderRole,
+        Tool,
     },
     session::HealthStatus,
     BindIdentity, ErrorBody, Flags, Frame, FrameType, Priority, RouteTarget,
@@ -380,6 +381,95 @@ async fn subc_consumer_catalog_list_reads_tool_provider_without_open_routes() {
     assert!(!tool.name.is_empty());
     assert!(tool.schema.is_object());
 
+    daemon.kill_and_wait();
+}
+
+/// A route.open the daemon refuses surfaces its refusal body, `detail`
+/// included, through `CallError::route_open_refusal`. Two paths: a terminal
+/// refusal returns at once with its own body, and a retryable one that
+/// outlasts the retry deadline returns the LAST refusal rather than a bare
+/// "deadline elapsed", so a caller can tell a target that stayed warming from a
+/// connection that failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn route_open_refusal_keeps_the_daemons_code_and_detail() {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        binary_path(&workspace, "ck-subc"),
+        &["build", "-p", "subc-core", "--bins"],
+    );
+    let temp_dir = unique_temp_dir("subc-client-rs-route-open-refusal");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    write_empty_config(&config_dir);
+
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+
+    // Held not-ready by the daemon for as long as the test runs: it requires a
+    // capability no registered module provides.
+    let mut held = inline_module_manifest("refusal-held", &["capability.resolve"]);
+    held.capabilities = Some(CapabilityDeclarations {
+        provides: Vec::new(),
+        requires: vec![CapabilityRequirement {
+            capability: "refusal-nobody/v1".to_string(),
+            need: CapabilityNeed::Required,
+        }],
+        must_never_reach: Vec::new(),
+    });
+    let (_held_module, held_task) = spawn_inline_module(&daemon.connection_file, held).await;
+    wait_for_catalog_module(&daemon.connection_file, "refusal-held", START_TIMEOUT).await;
+
+    let consumer = SubcConsumer::connect(&daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    let identity = consumer_identity("route-open-refusal");
+
+    let warming = consumer
+        .call(
+            tool_target("refusal-held"),
+            identity.clone(),
+            br#"{"kind":"unary","value":"held"}"#.to_vec(),
+            CallOptions {
+                route_retry_deadline: Duration::from_millis(600),
+                ..fast_call_options()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(warming, CallError::NotSent(_)),
+        "a refused route.open must stay NotSent, got {warming:?}"
+    );
+    let refusal = warming
+        .route_open_refusal()
+        .unwrap_or_else(|| panic!("the last refusal must survive the deadline: {warming}"));
+    assert_eq!(refusal.code, "module_warming");
+    assert_eq!(
+        refusal.detail,
+        Some(serde_json::json!({
+            "reason": "required_capability_unprovided",
+            "capability": "refusal-nobody/v1",
+        }))
+    );
+
+    let absent = consumer
+        .call(
+            tool_target("refusal-never-registers"),
+            identity,
+            br#"{"kind":"unary","value":"missing"}"#.to_vec(),
+            fast_call_options(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(absent, CallError::NotSent(_)), "got {absent:?}");
+    assert_eq!(
+        absent.route_open_refusal().map(|body| body.code.as_str()),
+        Some("unknown_module")
+    );
+
+    held_task.abort();
     daemon.kill_and_wait();
 }
 
