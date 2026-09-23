@@ -41,6 +41,11 @@ use common::{
 };
 
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long supervisor_reload_rejects_new_work_during_drain's in-flight
+/// request holds the drain open. Every assertion in that test runs while the
+/// module is draining, so this must outlast the observe-then-act window; any
+/// read that can wait for the held Response must allow this PLUS its margin.
+const IN_FLIGHT_HOLD: Duration = Duration::from_millis(2000);
 /// Deadline for setup hang-guards (poll-until-subc-observable-state helpers:
 /// registration, binding count, stub events, status). These are deadlock
 /// detectors, NOT latency assertions — sized generously so a spawn/connect/auth
@@ -2450,7 +2455,11 @@ async fn supervisor_reload_rejects_new_work_during_drain() {
     // a code regression when the real fault was that it had outrun its subject.
     // Well inside DRAIN_BUDGET_COVERING_AN_INFLIGHT_REQUEST, so the drain still
     // completes and the `drained: true` assertion below is unchanged.
-    let slow_payload = br#"{"delay_ms":2000,"jsonrpc":"2.0","id":"reload-rejects"}"#;
+    let slow_payload = format!(
+        r#"{{"delay_ms":{},"jsonrpc":"2.0","id":"reload-rejects"}}"#,
+        IN_FLIGHT_HOLD.as_millis()
+    );
+    let slow_payload = slow_payload.as_bytes();
     write_frame(
         &mut route_client,
         &data_request(ack.route_channel, ack.route_epoch, slow_corr, slow_payload),
@@ -2517,18 +2526,23 @@ async fn supervisor_reload_rejects_new_work_during_drain() {
     .unwrap();
     route_client.flush().await.unwrap();
     // Five frames arrive: two channel-0 lifecycle pushes plus the
-    // in-flight slow Response (slow_corr, ~150ms) and the rejection ERROR
-    // (rejected_corr) race — the slow call was already in flight when drain began,
-    // so on a slow/oversubscribed runner its Response can land before the
+    // in-flight slow Response (slow_corr, held IN_FLIGHT_HOLD) and the rejection
+    // ERROR (rejected_corr) race -- the slow call was already in flight when drain
+    // began, so on a slow/oversubscribed runner its Response can land before the
     // rejection. The GOODBYE follows route.closed once the route drains. Classify by
     // corr/type instead of assuming arrival order (which flaked on Windows CI).
+    //
+    // Each read may wait for the slow Response, which lands a full
+    // IN_FLIGHT_HOLD after it was sent, so the per-frame wait is the hold PLUS
+    // the ordinary read margin. A bare READ_TIMEOUT equal to the hold made that
+    // read race its own timeout whenever the earlier frames arrived promptly.
     let mut saw_rejected = false;
     let mut saw_slow_response = false;
     let mut saw_goodbye = false;
     let mut saw_closing = false;
     let mut saw_closed = false;
     for _ in 0..5 {
-        let frame = read_frame_timeout(&mut route_client).await;
+        let frame = read_frame_timeout_for(&mut route_client, IN_FLIGHT_HOLD + READ_TIMEOUT).await;
         if frame.header.channel == 0 && frame.header.ty == FrameType::Push {
             if !saw_closing {
                 assert_route_lifecycle_push(

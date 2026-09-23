@@ -491,7 +491,6 @@ async fn connection_loop<R>(
 where
     R: AsyncRead + Unpin,
 {
-
     loop {
         while let Some(result) = route_open_tasks.try_join_next() {
             finish_route_open_task(result)?;
