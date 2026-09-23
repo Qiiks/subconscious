@@ -1856,13 +1856,14 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.20.10"
+version = "0.20.11"
 dependencies = [
  "cortexkit-log",
  "cortexkit-paths",
  "fs4",
  "getrandom 0.2.17",
  "loom",
+ "memchr",
  "rlimit",
  "rustix",
  "serde",

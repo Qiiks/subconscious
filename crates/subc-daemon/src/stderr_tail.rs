@@ -156,6 +156,10 @@ impl StderrTailSnapshot {
 pub struct StderrRing {
     config: StderrTailConfig,
     entries: VecDeque<TailEntry>,
+    // Count of `TailEntry::Line` entries, kept running because eviction checks
+    // it on every push and recounting would walk the whole ring under the
+    // mutex each time.
+    lines: usize,
     bytes: usize,
     dropped_lines: u64,
     capture: CaptureState,
@@ -166,6 +170,7 @@ impl StderrRing {
         Self {
             config,
             entries: VecDeque::new(),
+            lines: 0,
             bytes: 0,
             dropped_lines: 0,
             // Until a reader attaches, the honest answer is that nothing is
@@ -223,17 +228,15 @@ impl StderrRing {
 
     fn push_entry(&mut self, entry: TailEntry) {
         self.bytes += entry.cost();
+        if matches!(entry, TailEntry::Line { .. }) {
+            self.lines += 1;
+        }
         self.entries.push_back(entry);
         self.evict_to_fit();
     }
 
     fn evict_to_fit(&mut self) {
-        while self
-            .entries
-            .iter()
-            .filter(|entry| matches!(entry, TailEntry::Line { .. }))
-            .count()
-            > self.config.max_lines
+        while self.lines > self.config.max_lines
             || (self.bytes > self.config.max_bytes && self.entries.len() > 1)
         {
             let Some(evicted) = self.entries.pop_front() else {
@@ -241,6 +244,7 @@ impl StderrRing {
             };
             self.bytes -= evicted.cost();
             if matches!(evicted, TailEntry::Line { .. }) {
+                self.lines -= 1;
                 self.dropped_lines += 1;
             }
         }
@@ -433,6 +437,13 @@ async fn pump_lines_into<R, S>(
     }
 
     let mut pending: Vec<u8> = Vec::new();
+    // Bytes before `scanned_upto` are already known to hold no newline; searching
+    // them again would rescan the whole buffer on every chunk -- for a line with
+    // no newline that is about 64 MiB examined per MiB of module output.
+    let mut scanned_upto = 0usize;
+    // Bytes before `cursor` were emitted as complete lines. They are removed in
+    // one compaction per chunk rather than shifting the buffer once per line.
+    let mut cursor = 0usize;
     let mut chunk = [0u8; 8192];
     loop {
         let read = match source.read(&mut chunk).await {
@@ -449,19 +460,52 @@ async fn pump_lines_into<R, S>(
         };
         pending.extend_from_slice(&chunk[..read]);
 
-        while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
-            let line: Vec<u8> = pending.drain(..=newline).collect();
-            emit_line(ring, sink, &line[..line.len() - 1], true);
+        while let Some(relative) = find_newline(&pending[scanned_upto..]) {
+            let newline = scanned_upto + relative;
+            emit_line(ring, sink, &pending[cursor..newline], true);
+            cursor = newline + 1;
+            scanned_upto = cursor;
         }
+        scanned_upto = pending.len();
+
+        if cursor > 0 {
+            pending.drain(..cursor);
+            scanned_upto -= cursor;
+            cursor = 0;
+        }
+
         if pending.len() >= MAX_PENDING_LINE_BYTES {
             let line = std::mem::take(&mut pending);
             emit_line(ring, sink, &line, false);
+            scanned_upto = 0;
         }
     }
 
     if !pending.is_empty() {
         emit_line(ring, sink, &pending, false);
     }
+}
+
+/// Bytes examined by newline searches, summed across a pump. Tests use this to
+/// assert the reader does not rescan bytes it already knows contain no newline.
+#[cfg(test)]
+static SCANNED_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn take_scanned_bytes() -> usize {
+    SCANNED_BYTES.swap(0, Ordering::Relaxed)
+}
+
+/// Locate the next newline in `haystack`, counting the bytes examined so a
+/// test can observe how much of the pending buffer each search walks.
+fn find_newline(haystack: &[u8]) -> Option<usize> {
+    let found = memchr::memchr(b'\n', haystack);
+    #[cfg(test)]
+    SCANNED_BYTES.fetch_add(
+        found.map(|index| index + 1).unwrap_or(haystack.len()),
+        Ordering::Relaxed,
+    );
+    found
 }
 
 fn emit_line<S: OutputSink>(
@@ -782,6 +826,28 @@ mod tests {
         }
     }
 
+    /// Yields predetermined chunks, one per read, so a test controls exactly
+    /// where the byte stream is split.
+    struct ChunkedReader {
+        chunks: VecDeque<Vec<u8>>,
+    }
+
+    impl AsyncRead for ChunkedReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            match self.chunks.pop_front() {
+                None => Poll::Ready(Ok(())),
+                Some(chunk) => {
+                    buf.put_slice(&chunk);
+                    Poll::Ready(Ok(()))
+                }
+            }
+        }
+    }
+
     struct FailingReader {
         bytes: Vec<u8>,
         emitted: bool,
@@ -940,6 +1006,105 @@ mod tests {
             sink.writes,
             vec![vec![b'x'; MAX_PENDING_LINE_BYTES], vec![b'x'; 4096],],
             "forced flushes and EOF fragments must not invent delimiters"
+        );
+    }
+
+    #[tokio::test]
+    async fn boundaries_truncation_and_framing_do_not_depend_on_chunk_splits() {
+        // The same stream split at hostile boundaries -- mid-line, between a CR
+        // and its LF, and a line sitting exactly on the per-line cap -- must
+        // produce the same ring entries and forwarded bytes as any other split.
+        let ring = shared(100, 100_000, 8);
+        let source = ChunkedReader {
+            chunks: vec![
+                b"fir".to_vec(),
+                b"st\nsec".to_vec(),
+                b"ond\ncarry\r".to_vec(),
+                b"\nover\n".to_vec(),
+                b"12345678\n".to_vec(),
+                b"1234567".to_vec(),
+                b"89\n".to_vec(),
+                b"tail".to_vec(),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let mut sink = RecordingSink::default();
+        pump_stderr_into(source, Arc::clone(&ring), &mut sink).await;
+
+        let snapshot = lock_ring(&ring).snapshot(None, None);
+        assert_eq!(snapshot.capture, CaptureState::Captured);
+        assert_eq!(
+            snapshot.entries,
+            vec![
+                TailEntry::Line {
+                    text: "first".to_string(),
+                    truncated: false
+                },
+                TailEntry::Line {
+                    text: "second".to_string(),
+                    truncated: false
+                },
+                // The pump delimits on '\n' alone; a CR belongs to the line body.
+                TailEntry::Line {
+                    text: "carry\r".to_string(),
+                    truncated: false
+                },
+                TailEntry::Line {
+                    text: "over".to_string(),
+                    truncated: false
+                },
+                // Exactly at the per-line cap: kept whole.
+                TailEntry::Line {
+                    text: "12345678".to_string(),
+                    truncated: false
+                },
+                // One byte past the cap: cut, and marked as cut.
+                TailEntry::Line {
+                    text: "12345678".to_string(),
+                    truncated: true
+                },
+                TailEntry::Line {
+                    text: "tail".to_string(),
+                    truncated: false
+                },
+            ]
+        );
+        assert_eq!(
+            sink.writes,
+            vec![
+                b"first\n".to_vec(),
+                b"second\n".to_vec(),
+                b"carry\r\n".to_vec(),
+                b"over\n".to_vec(),
+                b"12345678\n".to_vec(),
+                b"123456789\n".to_vec(),
+                b"tail".to_vec(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_line_with_no_newline_is_not_rescanned_from_byte_zero_on_every_chunk() {
+        // One 1 MiB line arrives in 8192-byte reads. Searching the whole
+        // pending buffer for a newline on every chunk scans each byte once per
+        // chunk that arrived after it -- about 64 MiB examined per MiB of
+        // output. Searching only the bytes that arrived since the last search
+        // scans each byte once.
+        let input = vec![b'x'; MAX_PENDING_LINE_BYTES + 4096];
+        let ring = shared(10, 10_000_000, 4 * 1024 * 1024);
+        let source = std::io::Cursor::new(input.clone());
+        let mut sink = RecordingSink::default();
+
+        take_scanned_bytes();
+        pump_stderr_into(source, Arc::clone(&ring), &mut sink).await;
+        let scanned = take_scanned_bytes();
+
+        assert!(
+            scanned <= 2 * input.len(),
+            "newline searches examined {scanned} bytes for {} bytes of input; \
+             each chunk must search only newly arrived bytes",
+            input.len()
         );
     }
 
