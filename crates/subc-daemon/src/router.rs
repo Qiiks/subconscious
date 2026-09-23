@@ -1827,6 +1827,43 @@ mod tests {
         .unwrap()
     }
 
+    /// An awaited send (a control or error reply) is never refused by the byte
+    /// budget: it parks until the writer frees bytes. If a release could miss a
+    /// parked sender, that reply would hang for the connection's lifetime, so
+    /// this pins the wakeup: the send stays parked while the queue is full and
+    /// completes as soon as one frame leaves it.
+    #[tokio::test]
+    async fn awaited_send_parked_behind_a_full_byte_budget_wakes_when_bytes_free() {
+        let (tx, mut rx) = mpsc::channel(1024);
+        let sink = FrameSink::with_byte_budget(tx, 2_000);
+        let mut queued = 0u64;
+        while sink
+            .try_send(stream_frame(7, 1, queued, vec![b'x'; 200]))
+            .is_ok()
+        {
+            queued += 1;
+        }
+        assert!(queued > 0, "the budget admitted nothing");
+
+        let parked = tokio::spawn({
+            let sink = sink.clone();
+            async move { sink.send(stream_frame(0, 0, 999, vec![b'r'; 200])).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !parked.is_finished(),
+            "the awaited send must wait while the byte budget is full"
+        );
+
+        // The writer takes one frame and drops it, releasing its bytes.
+        drop(rx.recv().await.expect("a queued frame"));
+        tokio::time::timeout(Duration::from_secs(2), parked)
+            .await
+            .expect("the parked send was never woken after bytes were freed")
+            .unwrap()
+            .unwrap();
+    }
+
     /// A client multiplexing several token streams pauses its reader while the
     /// module keeps producing small frames. Far more frames than the old
     /// 64-frame queue allowed, but far fewer bytes than the budget, must all be
