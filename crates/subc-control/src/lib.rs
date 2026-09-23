@@ -193,6 +193,16 @@ pub enum ClientControlRequest {
     /// The cursor is one value copied from a snapshot or event. It includes the
     /// daemon incarnation so a restarted daemon rejects an earlier instance's
     /// sequence instead of treating it as a position in the current stream.
+    ///
+    /// Refusals and terminal errors, as `Error` frames on the request's corr:
+    /// - `spawn_cursor_incarnation_mismatch` (detail `current_daemon_incarnation`):
+    ///   `since` names another daemon incarnation.
+    /// - `spawn_cursor_too_old` (detail `oldest_retained_cursor`): `since`
+    ///   predates the retained event ring.
+    /// - `spawn_subscriber_lagged` (detail `first_undelivered_cursor`): the open
+    ///   stream fell too far behind and the daemon dropped it. It arrives after
+    ///   every event that was already queued and ends the stream; resubscribe
+    ///   with `since` set to the last cursor received.
     #[serde(rename = "supervisor.spawn_subscribe")]
     SupervisorSpawnSubscribe {
         #[serde(default, skip_serializing_if = "Option::is_none")]

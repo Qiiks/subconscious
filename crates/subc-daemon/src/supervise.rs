@@ -83,6 +83,11 @@ const STDERR_PUMP_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 /// Maximum number of supervised process spawn/exit facts retained per daemon incarnation.
 pub const SPAWN_EVENT_RING_CAPACITY: usize = 4096;
 const SPAWN_SUBSCRIBER_BUFFER: usize = SPAWN_EVENT_RING_CAPACITY + 1;
+/// Terminal Error code for a `supervisor.spawn_subscribe` stream the daemon
+/// dropped because the subscriber stopped draining its frames. The detail's
+/// `first_undelivered_cursor` names the first event it did not receive; the
+/// client resubscribes from the last cursor it did receive.
+pub(crate) const SPAWN_SUBSCRIBER_LAGGED_CODE: &str = "spawn_subscriber_lagged";
 
 struct SupervisedChild {
     child: Child,
@@ -757,6 +762,10 @@ type SpawnSubscriberKey = (ConnectionId, u64);
 struct SpawnSubscriber {
     version: u8,
     frames: mpsc::Sender<Frame>,
+    /// Tells this subscriber's forwarder that it was dropped for lagging, and
+    /// from which event. The full frame channel cannot carry that news, so it
+    /// travels beside it; see `SpawnEventFeed::subscribe`.
+    lagged: Option<oneshot::Sender<SpawnCursor>>,
 }
 
 #[derive(Debug)]
@@ -955,6 +964,9 @@ impl SpawnEventFeed {
                         true
                     } else {
                         warn!(connection_id = connection_id.get(), corr, "dropping lagged supervisor spawn subscriber");
+                        if let Some(lagged) = subscriber.lagged.take() {
+                            let _ = lagged.send(event.cursor.clone());
+                        }
                         false
                     }
                 }
@@ -975,6 +987,7 @@ impl SpawnEventFeed {
         sink: FrameSink,
     ) -> Result<(), SpawnSubscribeRefusal> {
         let (frames, mut receiver) = mpsc::channel(SPAWN_SUBSCRIBER_BUFFER);
+        let (lagged, mut lagged_rx) = oneshot::channel::<SpawnCursor>();
         {
             let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
             let replay = if let Some(since) = since {
@@ -1018,14 +1031,36 @@ impl SpawnEventFeed {
                 (connection_id, corr),
                 SpawnSubscriber {
                     version,
-                    frames: frames.clone(),
+                    frames,
+                    lagged: Some(lagged),
                 },
             );
         }
+        // The lagged terminal is sent here, by the forwarder, rather than by
+        // the emitter: at the moment of the drop the subscriber's own channel
+        // is full, and writing to the connection sink directly from the emitter
+        // would put the Error AHEAD of the events still queued in that channel
+        // (and the emitter holds the feed lock, so it cannot await the sink).
+        // Dropping the subscriber drops the only sender, so `recv` drains every
+        // queued event and then returns `None`; only then is the Error sent, so
+        // the client sees each event it can keep, then the reason it was cut.
+        // Cancel and connection removal drop the oneshot unsent, so they end
+        // the stream with no Error.
         tokio::spawn(async move {
             while let Some(frame) = receiver.recv().await {
                 if sink.send(frame).await.is_err() {
-                    break;
+                    return;
+                }
+            }
+            let Ok(first_undelivered) = lagged_rx.try_recv() else {
+                return;
+            };
+            match spawn_subscriber_lagged_frame(version, corr, first_undelivered) {
+                Ok(frame) => {
+                    let _ = sink.send(frame).await;
+                }
+                Err(error) => {
+                    error!(%error, corr, "failed to build lagged spawn subscriber terminal frame");
                 }
             }
         });
@@ -1082,6 +1117,25 @@ impl SpawnEventFeed {
 }
 
 /// Narrow process-liveness signal published by supervisors and consumed by passive liveness polls.
+/// The terminal Error a lagged spawn subscriber receives after its queued events.
+fn spawn_subscriber_lagged_frame(
+    version: u8,
+    corr: u64,
+    first_undelivered: SpawnCursor,
+) -> Result<Frame, String> {
+    let body = serde_json::to_vec(&subc_protocol::ErrorBody {
+        code: SPAWN_SUBSCRIBER_LAGGED_CODE.to_string(),
+        message: "spawn subscriber fell behind and was dropped; resubscribe from the last cursor received"
+            .to_string(),
+        detail: Some(serde_json::json!({
+            "first_undelivered_cursor": first_undelivered
+        })),
+    })
+    .map_err(|error| error.to_string())?;
+    Frame::build_with_version(version, FrameType::Error, control_flags(), 0, 0, corr, body)
+        .map_err(|error| error.to_string())
+}
+
 pub trait ModuleProcessLiveness: Send + Sync {
     fn process_live(&self, module_id: &str) -> Option<bool>;
 }
@@ -8769,6 +8823,79 @@ mod cgroup_placement_tests {
         assert!(
             reason.contains(&cgroup_path.display().to_string()),
             "a pre_exec spawn failure must name the cgroup path: {reason}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod spawn_subscriber_lag_tests {
+    use super::*;
+
+    /// A subscriber whose connection stops draining is dropped once its frame
+    /// channel fills. The client must learn that from a terminal Error frame
+    /// after the frames already queued for it, not from a stream that simply
+    /// goes quiet.
+    #[tokio::test]
+    async fn lagged_spawn_subscriber_receives_a_terminal_lagged_error_after_its_queued_frames() {
+        let feed = SpawnEventFeed::default();
+        feed.configure_incarnation("lag-incarnation".to_string());
+        // A one-slot connection queue that nobody reads until the emits are
+        // done: the forwarder parks on it and the subscriber channel fills.
+        let (tx, mut rx) = mpsc::channel(1);
+        feed.subscribe(ConnectionId::new(1), 7, 1, None, FrameSink::new(tx))
+            .expect("subscribe");
+        let emitted = SPAWN_SUBSCRIBER_BUFFER + 16;
+        for index in 0..emitted {
+            feed.emit_spawned(&format!("lag-module-{index}"), 1000, 0);
+            // Let the forwarder take what it can so the fill point is the
+            // subscriber channel, not a scheduling accident.
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            feed.subscriber_count(),
+            0,
+            "the lagged subscriber must be removed"
+        );
+
+        let mut data = Vec::new();
+        let mut last = None;
+        loop {
+            let next = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("the forwarder must finish once the subscriber is dropped");
+            let Some(outbound) = next else { break };
+            let frame = outbound.frame;
+            if frame.header.ty == FrameType::StreamData {
+                assert!(last.is_none(), "no data may follow the terminal frame");
+                let event: SpawnEvent = serde_json::from_slice(&frame.body).unwrap();
+                data.push(event.cursor.seq);
+            } else {
+                assert!(last.is_none(), "exactly one terminal frame");
+                last = Some(frame);
+            }
+        }
+        assert!(!data.is_empty(), "queued frames drain before the terminal");
+        for pair in data.windows(2) {
+            assert_eq!(
+                pair[1],
+                pair[0] + 1,
+                "queued frames arrive dense and in order"
+            );
+        }
+        let terminal = last.expect("a lagged subscriber must receive a terminal frame");
+        assert_eq!(terminal.header.ty, FrameType::Error);
+        assert_eq!(terminal.header.corr, 7);
+        let body: subc_protocol::ErrorBody = serde_json::from_slice(&terminal.body).unwrap();
+        assert_eq!(body.code, SPAWN_SUBSCRIBER_LAGGED_CODE);
+        let detail = body.detail.expect("lagged error carries detail");
+        assert_eq!(
+            detail["first_undelivered_cursor"]["seq"],
+            data.last().unwrap() + 1,
+            "the named cursor is the first event the subscriber did not receive"
+        );
+        assert_eq!(
+            detail["first_undelivered_cursor"]["daemon_incarnation"],
+            "lag-incarnation"
         );
     }
 }
