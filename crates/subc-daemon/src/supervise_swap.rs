@@ -167,6 +167,7 @@ async fn run_swap_inner(
         Some(&handle),
         &runtime.stderr_ring,
         runtime.capture_logs_dir.as_deref(),
+        &runtime.child_roster,
         #[cfg(target_os = "linux")]
         runtime.cgroup_placement.as_ref(),
         SpawnRole::SwapCandidate,

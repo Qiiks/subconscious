@@ -2,6 +2,7 @@
 
 use std::{
     fs,
+    os::unix::process::CommandExt,
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{Mutex, MutexGuard},
@@ -27,27 +28,57 @@ struct Fixture {
 
 impl Fixture {
     fn boot(busy: bool) -> Self {
+        Self::boot_with(busy, None)
+    }
+
+    /// `none_module` adds a `protocol: "none"` module named `wire-less` whose
+    /// stub never connects, with these extra environment entries.
+    fn boot_with(busy: bool, none_module: Option<Value>) -> Self {
         let permit = DAEMON_GATE.lock().unwrap_or_else(|p| p.into_inner());
         let root = TestTempDir::new("daemon-shutdown");
         for dir in ["config/cortexkit", "runtime", "data/cortexkit/run"] {
             fs::create_dir_all(root.join(dir)).unwrap();
         }
-        fs::write(root.join("config/cortexkit/subc.jsonc"), serde_json::to_vec(&json!({
-            "version": 1,
-            "modules": { "shutdown-observer": {
+        let mut modules = json!({ "shutdown-observer": {
+            "program": env!("CARGO_BIN_EXE_fake-aft-stub"),
+            "env": {
+                "FAKE_AFT_MODULE_ID": "shutdown-observer",
+                "FAKE_AFT_EVENTS_PATH": root.join("events.jsonl"),
+                "FAKE_AFT_PID_PATH": root.join("observer.pid"),
+                "FAKE_AFT_RECORD_EOF": "1",
+                "FAKE_AFT_EOF_TEARDOWN_MS": OBSERVER_TEARDOWN_MS.to_string(),
+                "FAKE_AFT_DELAY_FROM_BODY": "1",
+                "FAKE_AFT_SHUTDOWN_JOURNAL": root.join("data/cortexkit/run/terminals.jsonl"),
+                "FAKE_AFT_BUSY_GAUGES": "work",
+                "FAKE_AFT_HEALTH_METRICS": if busy { "{\"work\":1}" } else { "{\"work\":0}" }
+            }
+        }});
+        if let Some(extra_env) = &none_module {
+            let mut env = json!({
+                "FAKE_AFT_NEVER_CONNECT": "1",
+                "FAKE_AFT_PID_PATH": root.join("wire-less.pid"),
+                "FAKE_AFT_NEVER_CONNECT_READY_PATH": root.join("wire-less.ready"),
+            });
+            for (key, value) in extra_env.as_object().unwrap() {
+                env[key] = value.clone();
+            }
+            modules["wire-less"] = json!({
                 "program": env!("CARGO_BIN_EXE_fake-aft-stub"),
-                "env": {
-                    "FAKE_AFT_MODULE_ID": "shutdown-observer",
-                    "FAKE_AFT_EVENTS_PATH": root.join("events.jsonl"),
-                    "FAKE_AFT_RECORD_EOF": "1",
-                    "FAKE_AFT_DELAY_FROM_BODY": "1",
-                    "FAKE_AFT_SHUTDOWN_JOURNAL": root.join("data/cortexkit/run/terminals.jsonl"),
-                    "FAKE_AFT_BUSY_GAUGES": "work",
-                    "FAKE_AFT_HEALTH_METRICS": if busy { "{\"work\":1}" } else { "{\"work\":0}" }
-                }
-            }}
-        })).unwrap()).unwrap();
+                "protocol": "none",
+                "env": env,
+            });
+        }
+        fs::write(
+            root.join("config/cortexkit/subc.jsonc"),
+            serde_json::to_vec(&json!({ "version": 1, "modules": modules })).unwrap(),
+        )
+        .unwrap();
+        // The daemon leads its own process group, as it does under launchd
+        // (which starts each job in a new session). That is what lets a test
+        // compare a module's group against the daemon's, and reproduce the
+        // service manager's kill of that group after the daemon exits.
         let child = Command::new(env!("CARGO_BIN_EXE_ck-subc"))
+            .process_group(0)
             .env("XDG_DATA_HOME", root.join("data"))
             .env("XDG_CONFIG_HOME", root.join("config"))
             .env("XDG_RUNTIME_DIR", root.join("runtime"))
@@ -84,7 +115,36 @@ impl Fixture {
             assert!(Instant::now() < deadline, "module did not register");
             thread::sleep(Duration::from_millis(10));
         }
+        if none_module.is_some() {
+            // The ready file is written only after the stub's SIGTERM handler
+            // is installed; signalling earlier would meet the default
+            // disposition and say nothing about the daemon.
+            while !fixture.root.join("wire-less.ready").exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "protocol none module never parked"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
         fixture
+    }
+
+    fn pid_of(&self, file: &str) -> i32 {
+        fs::read_to_string(self.root.join(file))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    /// SIGKILL the daemon's process group, as launchd does to a job's group
+    /// once the job's main process has exited.
+    fn kill_daemon_group(&self) {
+        let _ = rustix::process::kill_process_group(
+            rustix::process::Pid::from_raw(self.child.id() as i32).unwrap(),
+            rustix::process::Signal::KILL,
+        );
     }
 
     fn connection(&self) -> PathBuf {
@@ -151,7 +211,111 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // A child that outlived the daemon (the failure these tests exist to
+        // catch) must not outlive the test as well.
+        for file in ["observer.pid", "wire-less.pid"] {
+            if let Some(pid) = fs::read_to_string(self.root.join(file))
+                .ok()
+                .and_then(|pid| pid.trim().parse::<i32>().ok())
+                .and_then(rustix::process::Pid::from_raw)
+            {
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+            }
+        }
     }
+}
+
+/// Simulated EOF teardown in the observer stub. Long enough that a group kill
+/// arriving with the EOF lands mid-teardown; short enough to fit the daemon's
+/// child-exit grace.
+const OBSERVER_TEARDOWN_MS: u64 = 200;
+
+fn process_alive(pid: i32) -> bool {
+    // Signal 0 checks existence without delivering anything.
+    rustix::process::test_kill_process(rustix::process::Pid::from_raw(pid).unwrap()).is_ok()
+}
+
+#[test]
+fn module_leads_its_own_process_group_not_the_daemons() {
+    let fixture = Fixture::boot(false);
+    let module = fixture.pid_of("observer.pid");
+    let pgid = rustix::process::getpgid(rustix::process::Pid::from_raw(module))
+        .unwrap()
+        .as_raw_nonzero()
+        .get();
+    assert_ne!(
+        pgid,
+        fixture.child.id() as i32,
+        "a module in the daemon's process group dies with the service manager's group kill"
+    );
+    assert_eq!(pgid, module, "a module must lead its own process group");
+}
+
+#[test]
+fn module_finishes_its_eof_teardown_before_the_service_manager_group_kill() {
+    let mut fixture = Fixture::boot(false);
+    fixture.term();
+    fixture.wait_exit(Duration::from_secs(5));
+    // What launchd does the moment the job's main process exits.
+    fixture.kill_daemon_group();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let kinds: Vec<String> = fixture
+            .events()
+            .into_iter()
+            .filter_map(|e| e["kind"].as_str().map(str::to_owned))
+            .filter(|kind| kind == "eof" || kind == "teardown_complete")
+            .collect();
+        if kinds == ["eof", "teardown_complete"] {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "module did not complete its EOF teardown across a daemon stop: {kinds:?}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn protocol_none_child_is_stopped_by_sigterm_not_left_running() {
+    let marker = TestTempDir::new("wire-less-marker");
+    let marker_path = marker.join("sigterm");
+    let mut fixture = Fixture::boot_with(
+        false,
+        Some(json!({ "FAKE_AFT_SIGTERM_MARKER_PATH": marker_path })),
+    );
+    let wire_less = fixture.pid_of("wire-less.pid");
+    fixture.term();
+    fixture.wait_exit(Duration::from_secs(5));
+    assert!(
+        !process_alive(wire_less),
+        "a protocol none child must not outlive the daemon"
+    );
+    assert_eq!(
+        fs::read_to_string(&marker_path).ok().as_deref(),
+        Some("sigterm\n"),
+        "the protocol none child must be asked to stop with SIGTERM"
+    );
+}
+
+#[test]
+fn child_ignoring_sigterm_is_killed_within_the_shutdown_bound() {
+    let mut fixture = Fixture::boot_with(false, Some(json!({ "FAKE_AFT_IGNORE_SIGTERM": "1" })));
+    let wire_less = fixture.pid_of("wire-less.pid");
+    let started = Instant::now();
+    fixture.term();
+    // Notice and drain return early for a quiescent module; the child stop
+    // adds at most 1 s + 0.5 s + 0.25 s.
+    fixture.wait_exit(Duration::from_secs(4));
+    assert!(
+        started.elapsed() >= Duration::from_millis(1400),
+        "the child was given no grace before the kill"
+    );
+    assert!(
+        !process_alive(wire_less),
+        "a child ignoring SIGTERM must still not outlive the daemon"
+    );
 }
 
 #[test]

@@ -165,6 +165,21 @@ const FAKE_AFT_IGNORE_SIGTERM_ENV: &str = "FAKE_AFT_IGNORE_SIGTERM";
 /// signal's DEFAULT disposition, and a cooperative-stop assertion would then
 /// fail for a reason that has nothing to do with the supervisor.
 const FAKE_AFT_NEVER_CONNECT_READY_PATH_ENV: &str = "FAKE_AFT_NEVER_CONNECT_READY_PATH";
+/// Where to write this process's pid at startup, in every mode.
+///
+/// A test needs the pid of a supervised child to ask the kernel about it (its
+/// process group, whether it is still alive), and neither `ck module status`
+/// nor a never-connecting child reports one.
+const FAKE_AFT_PID_PATH_ENV: &str = "FAKE_AFT_PID_PATH";
+/// Milliseconds of simulated teardown work after EOF on the control
+/// connection, followed by a `teardown_complete` event.
+///
+/// A real module's EOF teardown takes time (a store flush, a session
+/// close). An instant one cannot tell "ran its teardown before something
+/// killed it" from "was killed a moment after starting it", which is the
+/// difference between a daemon that lets modules tear down and a process-group
+/// kill that arrives with the EOF. Requires `FAKE_AFT_RECORD_EOF`.
+const FAKE_AFT_EOF_TEARDOWN_MS_ENV: &str = "FAKE_AFT_EOF_TEARDOWN_MS";
 /// Id used when `FAKE_AFT_MODULE_ID` is absent.
 ///
 /// TESTS THAT ASSERT A MODULE APPEARS IN THE CATALOG MUST CONFIGURE AN ID THAT
@@ -201,6 +216,9 @@ async fn main() -> Result<(), StubError> {
     // Before every branch, so the witness is available on the normal supervised
     // path and not only to the exit-only shapes.
     echo_requested_env();
+    if let Ok(path) = env::var(FAKE_AFT_PID_PATH_ENV) {
+        fs::write(path, std::process::id().to_string()).map_err(StubError::Io)?;
+    }
 
     if let Some(fixture) = fixture_from_sidecar()? {
         return run_fixture(fixture).await;
@@ -640,6 +658,13 @@ async fn handle_frame(
     let Some(frame) = frame else {
         if env_flag("FAKE_AFT_RECORD_EOF") {
             record_event(config, json!({"kind": "eof"}))?;
+            if let Some(teardown) = env::var(FAKE_AFT_EOF_TEARDOWN_MS_ENV)
+                .ok()
+                .and_then(|raw| raw.parse::<u64>().ok())
+            {
+                sleep(Duration::from_millis(teardown)).await;
+                record_event(config, json!({"kind": "teardown_complete"}))?;
+            }
         }
         return Ok(false);
     };

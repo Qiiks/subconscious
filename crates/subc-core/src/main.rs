@@ -78,10 +78,12 @@ async fn main() {
         eprintln!("subc-core: {err}");
         process::exit(1);
     }
-    // The bounded SIGTERM path has already announced the cut. Do not drop the
-    // Tokio runtime: supervised Child handles use kill_on_drop, which would
-    // kill modules instead of letting their established sockets reach EOF and
-    // trigger their own teardown. Process exit closes the daemon's descriptors.
+    // The bounded SIGTERM path has already announced the cut, closed every
+    // connection so modules saw EOF, and ended any child still running after a
+    // short grace. Exit without dropping the Tokio runtime: tearing down every
+    // task adds nothing at this point, and supervised Child handles use
+    // kill_on_drop, so a destructor would be a second, unbounded-order kill
+    // path next to the deliberate one. Process exit closes the descriptors.
     process::exit(0);
 }
 

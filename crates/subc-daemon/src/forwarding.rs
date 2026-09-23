@@ -415,6 +415,21 @@ impl ForwardingTable {
         self.lock_close_registry().remove(&connection_id);
     }
 
+    /// Close every established connection, modules and clients alike, as the
+    /// last step of an announced daemon shutdown. A module learns the daemon is
+    /// gone by EOF on its control connection; delivering that EOF while the
+    /// daemon is still alive lets the daemon wait for the modules' own
+    /// teardowns before it ends whatever is left.
+    #[cfg(unix)]
+    pub(crate) fn close_all_connections(&self, reason: &CloseReason) -> usize {
+        let senders: Vec<_> = self.lock_close_registry().drain().collect();
+        let count = senders.len();
+        for (_, sender) in senders {
+            let _ = sender.send(reason.clone());
+        }
+        count
+    }
+
     pub(crate) fn request_connection_close(
         &self,
         connection_id: ConnectionId,

@@ -116,11 +116,27 @@ pub fn runtime_paths(platform: RuntimePlatform, home: &Path, data_home: &Path) -
 pub fn desired_definition(platform: RuntimePlatform, paths: &RuntimePaths) -> String {
     let daemon = paths.daemon.to_string_lossy();
     match platform {
+        // NO AbandonProcessGroup, deliberately. launchd's default kills what is
+        // left in the job's process group when the daemon exits. Supervised
+        // modules lead their own process groups, so that kill no longer reaches
+        // them (the daemon closes their connections and ends any stragglers
+        // itself before exiting). What it still reaches is any process the
+        // daemon started that is not a supervised module, which is a cleanup
+        // worth keeping.
         RuntimePlatform::Macos => format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>cortexkit.subc</string><key>ProgramArguments</key><array><string>{daemon}</string></array><key>RunAtLoad</key><true/></dict></plist>\n"
         ),
+        // KillMode=mixed: stopping the unit sends SIGTERM to the daemon only,
+        // and SIGKILLs the rest of the cgroup after the daemon has exited.
+        // The default (control-group) signals every process in the cgroup at
+        // once, and module cgroups are delegated subgroups of this unit's, so
+        // modules were hit at the same moment the daemon was asked to
+        // announce the shutdown, before the notice, the drain, or the EOF
+        // teardown that follows. With mixed, the daemon runs that sequence and
+        // ends its own children first; the final SIGKILL only catches what it
+        // could not.
         RuntimePlatform::Linux => format!(
-            "[Unit]\nDescription=CortexKit subconscious daemon\n\n[Service]\nExecStart={daemon}\nRestart=on-failure\nDelegate=yes\nDelegateSubgroup=daemon\n\n[Install]\nWantedBy=default.target\n"
+            "[Unit]\nDescription=CortexKit subconscious daemon\n\n[Service]\nExecStart={daemon}\nRestart=on-failure\nDelegate=yes\nDelegateSubgroup=daemon\nKillMode=mixed\n\n[Install]\nWantedBy=default.target\n"
         ),
         // The Task Scheduler schema namespace is not decoration: `schtasks
         // /Create /XML` refuses a Task element without it ("contains an
@@ -956,6 +972,24 @@ mod tests {
         assert!(
             definition.contains("Delegate=yes\nDelegateSubgroup=daemon\n"),
             "the systemd unit must delegate the daemon's cgroup subtree: {definition}"
+        );
+    }
+
+    #[test]
+    fn linux_runtime_stops_the_daemon_before_the_rest_of_its_cgroup() {
+        let paths = runtime_paths(
+            RuntimePlatform::Linux,
+            Path::new("/home/test/bin"),
+            Path::new("/home/test"),
+        );
+        let definition = desired_definition(RuntimePlatform::Linux, &paths);
+
+        // Under the default KillMode=control-group, systemd signals every
+        // module at the same moment as the daemon, ahead of the daemon's
+        // shutdown notice and its own bounded stop of its children.
+        assert!(
+            definition.contains("\nKillMode=mixed\n"),
+            "the systemd unit must signal only the daemon first: {definition}"
         );
     }
 

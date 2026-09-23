@@ -21,12 +21,35 @@ after the 2026-09-18 cut:
 - CEREB's teardown is connection-driven and completes six browser sessions in
   ~100 ms
 
-**Children are not killed with the daemon.** They observe EOF on their control
-connection, run their own graceful stop, and exit — the shape specified on
-2026-09-06, which five seats have now independently confirmed they implement.
+~~**Children are not killed with the daemon.**~~ **CORRECTED 2026-09-23: this
+was not established by the evidence above, and at a measured cut it was false.**
+Modules ran in the daemon's process group (every module's pgid was the daemon's
+pid), and the launchd plist sets no `AbandonProcessGroup`, so when the daemon
+exited launchd killed the whole group. "Zero orphans" is exactly what a group
+kill leaves, and BROCA's seal came from its own SIGTERM handler, so neither
+item could tell "tore down on EOF" from "killed with the group". At the
+16:52:57Z cut, astrocyte and callosum, which log a teardown pair on EOF and do
+so on `ck module stop`, logged nothing. systemd's default
+`KillMode=control-group` had the same shape on Linux.
 
-So "the daemon sends nothing" is true and "nothing graceful happens" is false,
-and they are different statements.
+What is built now:
+
+- each supervised module leads its own process group (`process_group(0)` at
+  spawn), so the service manager's group kill does not reach it;
+- after the notice and the drain, the daemon closes every connection, so each
+  module sees EOF while the daemon is still alive, and sends SIGTERM to every
+  `protocol: "none"` child, which has no connection to see EOF on;
+- it then waits at most 1 s for children to exit, sends SIGTERM to any still
+  running, waits at most 0.5 s more, and sends SIGKILL (bounds in
+  `child_roster.rs`; a second SIGTERM goes straight to the kill). Without this
+  a child that ignores EOF would outlive the daemon, and a surviving
+  `nats-server` would fight the next daemon's for its port;
+- the systemd unit sets `KillMode=mixed`: SIGTERM to the daemon only, and
+  SIGKILL for the rest of the cgroup only after the daemon exits.
+
+The acceptance test for this asserts the module's own EOF and
+teardown-complete markers after a simulated group kill, not process absence,
+because absence is what the group kill produced too.
 
 ## What is actually lost on a cut
 
@@ -200,8 +223,10 @@ reading source against the prose.
 
 ## Non-goals, stated so nobody reads this as more
 
-- **It does not make a cut graceful.** It already is, for modules that hang
-  teardown off connection close. It makes it *announced*.
+- **It does not make a cut graceful by itself.** The notice makes it
+  *announced*; the EOF teardown is graceful only because the daemon now
+  delivers the EOF and keeps modules out of its process group (see the
+  correction above).
 - **It does not guarantee any module finishes.** See the budgets.
 - **It does not help a SIGKILLed daemon.** Nothing runs. The journal's
   durability is what covers that case, and covers it only up to the last

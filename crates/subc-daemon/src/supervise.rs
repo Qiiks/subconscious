@@ -31,6 +31,7 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 
 use crate::{
+    child_roster::{ChildRoster, RosterEntry},
     daemon_config::{
         CAPTURE_KEEP_ENV, CAPTURE_MAX_AGE_DAYS_ENV, CAPTURE_MAX_FILE_MB_ENV, CK_LOG_ENV,
     },
@@ -100,6 +101,9 @@ struct SupervisedChild {
     process_start_time: Option<u64>,
     process_identity: Option<ProcessIdentity>,
     pid: u32,
+    /// This process's entry in the daemon's child roster, released when the
+    /// process is reaped or this handle is dropped.
+    roster_guard: Option<crate::child_roster::RosterGuard>,
 }
 
 impl SupervisedChild {
@@ -113,6 +117,11 @@ impl SupervisedChild {
 
     async fn wait(&mut self) -> io::Result<ExitStatus> {
         let result = self.child.wait().await;
+        if result.is_ok() {
+            // Reaped: the pid is free for reuse, so shutdown must stop
+            // seeing it as one of ours.
+            self.roster_guard = None;
+        }
         #[cfg(target_os = "linux")]
         if result.is_ok() {
             if let Some(placement) = self.cgroup_placement.take() {
@@ -1155,6 +1164,7 @@ struct SupervisorRuntimeConfig {
     stderr_ring: Arc<Mutex<StderrRing>>,
     terminal_ring: Arc<Mutex<TerminalRing>>,
     spawn_events: SpawnEventFeed,
+    child_roster: ChildRoster,
     #[cfg(target_os = "linux")]
     cgroup_placement: Option<subc_cgroup::Placement>,
     #[cfg(test)]
@@ -1813,6 +1823,9 @@ pub struct Supervisor {
     terminal_journal: Option<Arc<crate::terminal_journal::TerminalJournal>>,
     spawn_events: SpawnEventFeed,
     provenance_probe: ExecutableIdentityProbe,
+    /// Every process spawned through this supervisor (and its clones) and not
+    /// yet reaped, so daemon shutdown can end them.
+    child_roster: ChildRoster,
     #[cfg(target_os = "linux")]
     cgroup_placement: Option<subc_cgroup::Placement>,
 }
@@ -1927,6 +1940,35 @@ impl Supervisor {
         Ok(())
     }
 
+    /// The last step of an announced daemon shutdown, after the notice and the
+    /// drain: close every connection so each subc module sees EOF and starts
+    /// its own teardown, then end every supervised child that has not exited
+    /// within a short bound. Modules lead their own process groups, so a
+    /// service manager's group kill no longer reaches them; without this a
+    /// child that does not stop on EOF (every `protocol: "none"` child, which
+    /// has no connection) would outlive the daemon. Every wait is bounded (see
+    /// `child_roster`), and `escalate` resolving (a second SIGTERM) cuts them.
+    #[cfg(unix)]
+    pub(crate) async fn end_children_for_daemon_shutdown(
+        &self,
+        already_escalated: bool,
+        escalate: impl std::future::Future<Output = ()>,
+    ) {
+        if let Some(forwarding) = &self.forwarding {
+            let closed = forwarding.close_all_connections(&CloseReason::new(
+                "daemon_shutdown",
+                "the daemon is exiting after its shutdown notice and drain",
+            ));
+            debug!(closed, "closed established connections for daemon shutdown");
+        }
+        crate::child_roster::end_children_for_daemon_shutdown(
+            &self.child_roster,
+            already_escalated,
+            escalate,
+        )
+        .await;
+    }
+
     pub fn new(registry: Arc<Registry>, restart_policy: RestartPolicy) -> Self {
         Self {
             registry,
@@ -1942,6 +1984,7 @@ impl Supervisor {
             terminal_journal: None,
             spawn_events: SpawnEventFeed::default(),
             provenance_probe: ExecutableIdentityProbe::default(),
+            child_roster: ChildRoster::default(),
             #[cfg(target_os = "linux")]
             cgroup_placement: None,
         }
@@ -2026,6 +2069,7 @@ impl Supervisor {
             self.supervisor_handle.as_ref(),
             &runtime.stderr_ring,
             runtime.capture_logs_dir.as_deref(),
+            &runtime.child_roster,
             #[cfg(target_os = "linux")]
             runtime.cgroup_placement.as_ref(),
         )?;
@@ -2061,6 +2105,7 @@ impl Supervisor {
             self.supervisor_handle.as_ref(),
             &runtime.stderr_ring,
             runtime.capture_logs_dir.as_deref(),
+            &runtime.child_roster,
             #[cfg(target_os = "linux")]
             runtime.cgroup_placement.as_ref(),
         ) {
@@ -2120,6 +2165,7 @@ impl Supervisor {
             self.supervisor_handle.as_ref(),
             &runtime.stderr_ring,
             runtime.capture_logs_dir.as_deref(),
+            &runtime.child_roster,
             #[cfg(target_os = "linux")]
             runtime.cgroup_placement.as_ref(),
         ) {
@@ -2172,6 +2218,7 @@ impl Supervisor {
                 .with_journal(self.terminal_journal.clone()),
             )),
             spawn_events: self.spawn_events.clone(),
+            child_roster: self.child_roster.clone(),
             #[cfg(target_os = "linux")]
             cgroup_placement: self.cgroup_placement.clone(),
             #[cfg(test)]
@@ -5224,6 +5271,7 @@ fn spawn_child(
     handle: Option<&SupervisorHandle>,
     ring: &Arc<Mutex<StderrRing>>,
     capture_logs_dir: Option<&std::path::Path>,
+    roster: &ChildRoster,
     #[cfg(target_os = "linux")] cgroup_placement: Option<&subc_cgroup::Placement>,
 ) -> Result<SupervisedChild, SuperviseError> {
     spawn_child_in_slot(
@@ -5232,6 +5280,7 @@ fn spawn_child(
         handle,
         ring,
         capture_logs_dir,
+        roster,
         #[cfg(target_os = "linux")]
         cgroup_placement,
         SpawnRole::Plain,
@@ -5258,10 +5307,18 @@ fn spawn_child_in_slot(
     handle: Option<&SupervisorHandle>,
     ring: &Arc<Mutex<StderrRing>>,
     capture_logs_dir: Option<&std::path::Path>,
+    roster: &ChildRoster,
     #[cfg(target_os = "linux")] cgroup_placement: Option<&subc_cgroup::Placement>,
     role: SpawnRole,
     alternate_slot: bool,
 ) -> Result<SupervisedChild, SuperviseError> {
+    if roster.is_closed() {
+        return Err(SuperviseError::Spawn {
+            program: spec.program.clone(),
+            source: io::Error::other("the daemon is shutting down; not starting a new process"),
+            cgroup_path: None,
+        });
+    }
     #[cfg(target_os = "linux")]
     let cgroup_name = swap::cgroup_name(&spec.module_id, alternate_slot);
     #[cfg(not(target_os = "linux"))]
@@ -5342,6 +5399,25 @@ fn spawn_child_in_slot(
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     command.kill_on_drop(true);
+    // EACH MODULE LEADS ITS OWN PROCESS GROUP (the child calls setpgid(0, 0)
+    // before exec). In the daemon's group, a service manager that kills the
+    // job's process group when the daemon exits (launchd's default) killed
+    // every module at the same moment its control connection closed, so no
+    // module ever ran its EOF teardown on a daemon stop. Outside that group a
+    // module is reached only by the daemon: the EOF it sees when its
+    // connection closes, and the bounded stop in `child_roster` for anything
+    // still running after that. On Linux this composes with the cgroup
+    // placement above: that is a pre_exec write to cgroup.procs, std performs
+    // setpgid in the child before running pre_exec callbacks, and the two
+    // change independent process attributes.
+    //
+    // stdin is /dev/null because a process outside the terminal's foreground
+    // group is stopped (SIGTTIN) if it reads the terminal, which a daemon run
+    // by hand would otherwise hand down. Under a service manager stdin is
+    // already /dev/null.
+    #[cfg(unix)]
+    command.process_group(0);
+    command.stdin(Stdio::null());
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(source) => {
@@ -5366,6 +5442,12 @@ fn spawn_child_in_slot(
     })?;
     let process_start_time = crate::provenance::process_start_time(pid);
     let process_identity = process_start_time.map(|start_time| ProcessIdentity { pid, start_time });
+    let roster_guard = roster.admit(RosterEntry {
+        module_id: spec.module_id.clone(),
+        pid,
+        protocol: spec.protocol,
+        start_time: process_start_time,
+    });
 
     let stdout_pump = match child.stdout.take() {
         Some(stdout) => Some(tokio::spawn(pump_stdout_to(stdout, output_sink.clone()))),
@@ -5418,6 +5500,7 @@ fn spawn_child_in_slot(
         process_start_time,
         process_identity,
         pid,
+        roster_guard: Some(roster_guard),
     })
 }
 
@@ -5505,6 +5588,7 @@ fn spawn_and_mark_running(
         runtime.supervisor_handle.as_ref(),
         &runtime.stderr_ring,
         runtime.capture_logs_dir.as_deref(),
+        &runtime.child_roster,
         #[cfg(target_os = "linux")]
         runtime.cgroup_placement.as_ref(),
     )?;
@@ -8623,6 +8707,7 @@ mod cgroup_placement_tests {
             process_start_time: None,
             process_identity: None,
             pid,
+            roster_guard: None,
         };
 
         child.wait().await.expect("reap short-lived child");

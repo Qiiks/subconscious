@@ -787,15 +787,27 @@ async fn serve_bound_daemon(
         // Dropping the listener stops new accepts, not established connections:
         // their detached tasks must remain live throughout notice and drain.
         drop(serve_task);
-        tokio::select! {
+        let escalated = tokio::select! {
             biased;
-            _ = terminate.recv() => info!("second SIGTERM: abandoning daemon shutdown wait"),
+            _ = terminate.recv() => {
+                info!("second SIGTERM: abandoning daemon shutdown wait");
+                true
+            }
             result = supervisor.drain_for_daemon_shutdown() => {
                 if let Err(error) = result {
                     warn!(%error, "daemon shutdown drain failed; exiting anyway");
                 }
+                false
             }
-        }
+        };
+        // Supervised modules lead their own process groups, so the service
+        // manager's kill of this process's group does not reach them. The
+        // daemon ends them itself: EOF first, then signals on short bounds.
+        supervisor
+            .end_children_for_daemon_shutdown(escalated, async {
+                terminate.recv().await;
+            })
+            .await;
         Ok(())
     }
     #[cfg(not(unix))]
