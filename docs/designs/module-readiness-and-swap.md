@@ -174,14 +174,18 @@ the same length; every call inside it is cheap and honest.
 
 **How long a not-ready window callers will actually wait.** Rust consumers
 retry a retryable refusal until `route_retry_deadline` (30 s) or the call's own
-deadline, whichever is sooner; that path has no attempt cap. Node consumers on
-`@cortexkit/subc-client` 0.11.0 and later do the same. Node consumers on an
-older client give up after about 3.1 s: a six-attempt cap (0/100/300/700/1500/
-3100 ms) sat beside the deadline until 388536cb made the deadline the only
-binder. A 0.x caret pins the minor (`^0.8.1` never resolves 0.11), so those
-pins stay on the old behaviour until the range is edited; five repos carried
-one when this was measured (2026-09-23). A module declaring `ready: false` for
-longer than ~3 s will fail those consumers' opens outright.
+deadline, whichever is sooner; that path has no attempt cap. Node consumers
+that open routes through the managed path (`client.call()` and managed
+requests, which go through `openCachedRoute`) do the same on
+`@cortexkit/subc-client` 0.11.0 and later. On an older client that path gives up
+after about 3.1 s: a six-attempt cap (0/100/300/700/1500/3100 ms) sat beside
+the deadline until 388536cb made the deadline the only binder, and a 0.x caret
+pins the minor (`^0.8.1` never resolves 0.11), so those pins keep the old
+behaviour until the range is edited. A module declaring `ready: false` for
+longer than ~3 s will fail such consumers' opens outright. A consumer that
+calls `routeOpen()` directly gets one attempt and the refusal back, and its own
+loop decides how long to wait whatever the SDK version: aft's bridge retries
+for up to 15 s.
 
 **Whether warming is worth it at all is the module's measurement.** aft
 measured it against a burst of 144-170 first calls over 24 real roots and
