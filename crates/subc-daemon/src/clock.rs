@@ -54,6 +54,24 @@ pub(crate) struct ClockStep {
     pub(crate) new_offset_ms: i128,
 }
 
+impl ClockStep {
+    /// What the pre-step clock would read at `wall_now`, the corrected reading.
+    ///
+    /// Lines written before the step were stamped, and filed into day segments,
+    /// by that clock, so a marker describing them has to be stamped by it too
+    /// to land in their segment and sort beside them.
+    pub(crate) fn old_clock_reading(&self, wall_now: SystemTime) -> SystemTime {
+        let delta =
+            Duration::from_millis(self.delta_ms.unsigned_abs().try_into().unwrap_or(u64::MAX));
+        if self.delta_ms > 0 {
+            // The clock jumped forward, so the old clock reads earlier.
+            wall_now.checked_sub(delta).unwrap_or(UNIX_EPOCH)
+        } else {
+            wall_now.checked_add(delta).unwrap_or(wall_now)
+        }
+    }
+}
+
 impl ClockStepDetector {
     pub(crate) fn new() -> Self {
         Self {
@@ -80,6 +98,30 @@ impl ClockStepDetector {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn old_clock_reading_undoes_the_step_in_both_directions() {
+        let now = UNIX_EPOCH + Duration::from_millis(1_790_000_000_000);
+        let backward = ClockStep {
+            delta_ms: -7_200_000,
+            old_offset_ms: 0,
+            new_offset_ms: -7_200_000,
+        };
+        // A step BACKWARD (a fast RTC corrected) means the old clock read later.
+        assert_eq!(
+            backward.old_clock_reading(now),
+            now + Duration::from_millis(7_200_000)
+        );
+        let forward = ClockStep {
+            delta_ms: 9_000,
+            old_offset_ms: 0,
+            new_offset_ms: 9_000,
+        };
+        assert_eq!(
+            forward.old_clock_reading(now),
+            now - Duration::from_millis(9_000)
+        );
+    }
+
     use super::*;
 
     fn seconds(value: u64) -> Duration {

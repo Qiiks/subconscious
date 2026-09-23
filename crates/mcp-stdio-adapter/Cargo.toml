@@ -1,6 +1,6 @@
 [package]
 name = "mcp-stdio-adapter"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -11,7 +11,7 @@ name = "ck-mcp-stdio-adapter"
 path = "src/main.rs"
 
 [dependencies]
-cortexkit-log = { version = "0.3.1", git = "https://github.com/cortexkit/commons.git", rev = "b13e7fcee60b42accc256e9c05284ad044b9f8f6" }
+cortexkit-log = { version = "0.3.2", git = "https://github.com/cortexkit/commons.git", rev = "4bfcb4924ac9efea5825e74beed2e39807bfdd17" }
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

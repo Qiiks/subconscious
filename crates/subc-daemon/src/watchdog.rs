@@ -35,22 +35,71 @@ pub(crate) fn spawn_clock_step_monitor() -> JoinHandle<()> {
         loop {
             interval.tick().await;
             if let Some(step) = detector.check_now() {
-                let direction = if step.delta_ms > 0 {
-                    "forward"
-                } else {
-                    "backward"
-                };
-                warn!(
-                    step_ms = step.delta_ms.abs(),
-                    direction,
-                    old_offset_ms = step.old_offset_ms,
-                    new_offset_ms = step.new_offset_ms,
-                    "wall clock stepped; timestamps around this point in the log may not be monotonic"
-                );
+                record_clock_step(&step, std::time::SystemTime::now());
             }
         }
     })
 }
+/// Log a wall-clock step where a reader will find it.
+///
+/// Day segments are named by the wall clock at write time, so a step that
+/// crosses UTC midnight files the lines before it under one day and the lines
+/// after it under another. The ordinary `warn!` lands in the corrected day's
+/// segment; when the pre-step clock names a different segment, the same record
+/// is also written there, stamped with the pre-step clock, so it sits beside
+/// the lines that clock stamped. Without it, a reader opening that segment finds
+/// the lines and not the warning, and a boot recorded under the wrong clock
+/// reads as a real boot at the wrong time.
+fn record_clock_step(step: &crate::clock::ClockStep, wall_now: std::time::SystemTime) {
+    let direction = if step.delta_ms > 0 {
+        "forward"
+    } else {
+        "backward"
+    };
+    let pre_step = pre_step_copy(step, wall_now);
+    warn!(
+        step_ms = step.delta_ms.abs(),
+        direction,
+        old_offset_ms = step.old_offset_ms,
+        new_offset_ms = step.new_offset_ms,
+        pre_step_segment = pre_step.as_ref().map(|(_, segment)| segment.as_str()),
+        "wall clock stepped; timestamps around this point in the log may not be monotonic"
+    );
+    let Some((old_clock_now, _)) = pre_step else {
+        return;
+    };
+    if let Some(logger) = cortexkit_log::installed() {
+        logger.emit_at(
+            old_clock_now,
+            tracing::Level::WARN,
+            "subc",
+            "wall clock stepped; this copy is stamped with the pre-step clock so it sits beside the lines that clock filed here",
+            &[
+                ("step_ms".to_owned(), step.delta_ms.abs().to_string()),
+                ("direction".to_owned(), direction.to_owned()),
+                (
+                    "corrected_segment".to_owned(),
+                    cortexkit_log::segment_name("subc", wall_now),
+                ),
+            ],
+        );
+    }
+}
+
+/// The instant and segment for the pre-step copy of a step marker, or `None`
+/// when the pre-step clock names the same day segment as the corrected one
+/// (then the ordinary marker is already beside the lines, and a second copy
+/// would only duplicate it).
+fn pre_step_copy(
+    step: &crate::clock::ClockStep,
+    wall_now: std::time::SystemTime,
+) -> Option<(std::time::SystemTime, String)> {
+    let old_clock_now = step.old_clock_reading(wall_now);
+    let pre_step_segment = cortexkit_log::segment_name("subc", old_clock_now);
+    (pre_step_segment != cortexkit_log::segment_name("subc", wall_now))
+        .then_some((old_clock_now, pre_step_segment))
+}
+
 pub const DEFAULT_SELF_WATCHDOG_DEADLINE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
@@ -494,5 +543,51 @@ impl fmt::Display for DaemonSelfWatchdogConfig {
 impl fmt::Display for WatchdogStage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod clock_step_tests {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    use super::pre_step_copy;
+    use crate::clock::ClockStep;
+
+    fn at(ms: u64) -> std::time::SystemTime {
+        UNIX_EPOCH + Duration::from_millis(ms)
+    }
+
+    /// The boot this was found on: an RTC holding local time (UTC+2) booted at
+    /// 22:14Z on 09-20, so the clock read 09-21 00:14 until NTP stepped it back
+    /// two hours at 22:15:17Z. Lines before the step went to the 09-21 segment;
+    /// the marker, written after, would land in 09-20's.
+    #[test]
+    fn a_step_across_utc_midnight_places_a_copy_in_the_pre_step_segment() {
+        let corrected = at(1_789_942_517_000); // 2026-09-20T22:15:17Z
+        let step = ClockStep {
+            delta_ms: -7_200_000,
+            old_offset_ms: 0,
+            new_offset_ms: -7_200_000,
+        };
+        let (instant, segment) = pre_step_copy(&step, corrected)
+            .expect("a midnight-crossing step needs a pre-step copy");
+        assert_eq!(segment, "subc.2026-09-21.log");
+        assert_eq!(instant, at(1_789_949_717_000)); // 2026-09-21T00:15:17Z
+        assert_eq!(
+            cortexkit_log::segment_name("subc", corrected),
+            "subc.2026-09-20.log",
+            "the ordinary marker lands in the other day's segment"
+        );
+    }
+
+    #[test]
+    fn a_step_inside_one_utc_day_writes_no_second_copy() {
+        let corrected = at(1_789_905_600_000); // 2026-09-20T12:00:00Z
+        let step = ClockStep {
+            delta_ms: 9_000,
+            old_offset_ms: 0,
+            new_offset_ms: 9_000,
+        };
+        assert_eq!(pre_step_copy(&step, corrected), None);
     }
 }
