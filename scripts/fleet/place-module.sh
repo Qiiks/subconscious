@@ -98,7 +98,7 @@ set -euo pipefail
 
 STAGING="${CK_STAGING:-$HOME/.local/share/cortexkit/staging}"
 BIN_DIR="${CK_BIN_DIR:-$HOME/.local/share/cortexkit/bin}"
-MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; OLD_CONTROL=""; GONE=""; RESTART=1; PLACE=0; OLDER=0; MIGRATES=""
+MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; OLD_CONTROL=""; GONE=""; RESTART=1; PLACE=0; OLDER=0; MIGRATES=""; NEW_REQUIREMENT=""
 
 while (($# > 0)); do
   case "$1" in
@@ -112,6 +112,7 @@ while (($# > 0)); do
     --gone) GONE="$2"; shift 2 ;;
     --place) PLACE=1; shift ;;
     --older) OLDER=1; shift ;;
+    --new-requirement) NEW_REQUIREMENT="$2"; shift 2 ;;
     --before) BEFORE_CMD="$2"; shift 2 ;;
     # A card that MIGRATES THE STORE cannot be rolled back by binary alone: the
     # old binary meets a newer schema and refuses on store_ahead, which is the
@@ -402,7 +403,16 @@ signing_posture() {
 if command -v codesign >/dev/null; then
   staged_sig=$(signing_posture "$STAGED")
   live_sig=$(signing_posture "$DEST")
-  [ "$staged_sig" = "$live_sig" ] || refuse "signing posture differs: staged [$staged_sig] vs running [$live_sig]"
+  if [ -n "$NEW_REQUIREMENT" ]; then
+    # A requested requirement change may rename the identifier; every other
+    # posture field (signer, team, ad-hoc-ness, hardened runtime) must still match.
+    staged_sig_cmp=$(signing_posture "$STAGED" | sed -E 's/Identifier=[^ ]+ //')
+    live_sig_cmp=$(signing_posture "$DEST" | sed -E 's/Identifier=[^ ]+ //')
+  else
+    staged_sig_cmp=$staged_sig
+    live_sig_cmp=$live_sig
+  fi
+  [ "$staged_sig_cmp" = "$live_sig_cmp" ] || refuse "signing posture differs: staged [$staged_sig] vs running [$live_sig]"
   say "signing posture: $staged_sig(matches running)"
 
   # TCC's own test, not an approximation of it: a macOS privacy grant is stored
@@ -418,13 +428,27 @@ if command -v codesign >/dev/null; then
   # no rebuild can satisfy; that posture is already pinned above, so it is
   # reported and skipped here.
   live_dr=$(codesign -d -r- "$DEST" 2>&1 | sed -n 's/^designated => //p')
-  if [ -z "$live_dr" ]; then
+  staged_dr=$(codesign -d -r- "$STAGED" 2>&1 | sed -n 's/^designated => //p')
+  if [ -n "$NEW_REQUIREMENT" ]; then
+    # An INTENDED requirement change (a rename, or moving a grant from one
+    # certificate to the team) revokes the running binary's privacy grants by
+    # design, so it cannot pass the check below. The caller names the new
+    # requirement exactly, and the staged binary must carry that requirement
+    # and satisfy it. The grants still need re-granting once after placement,
+    # which is why this is an explicit flag and never a default.
+    [ "$staged_dr" = "$NEW_REQUIREMENT" ] \
+      || refuse "--new-requirement names [$NEW_REQUIREMENT] but the staged binary's designated requirement is [$staged_dr]"
+    codesign --verify -R="$NEW_REQUIREMENT" "$STAGED" >/dev/null 2>&1 \
+      || refuse "staged binary does not satisfy its own named requirement [$NEW_REQUIREMENT]"
+    say "designated requirement: CHANGING by request from [$live_dr] to [$NEW_REQUIREMENT]; macOS privacy grants held by the running binary (Full Disk Access, Accessibility) must be re-granted once after placement"
+  elif [ -z "$live_dr" ]; then
     say "designated requirement: running binary has none (ad-hoc, cdhash); TCC grants cannot survive any rebuild of it"
   else
     dr_check=$(codesign --verify -R="$live_dr" "$STAGED" 2>&1) \
       || refuse "staged binary does not satisfy the running binary's designated requirement, so every macOS privacy grant (Full Disk Access, Accessibility) held by the running one would be silently revoked: [$live_dr] -- $dr_check"
     say "designated requirement: staged satisfies the running binary's ($live_dr)"
   fi
+
 fi
 
 # Marker differential. A marker that reads 0 on the staged file proves nothing about
