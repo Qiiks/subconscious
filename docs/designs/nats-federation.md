@@ -169,6 +169,18 @@ What does inherit the pairing is the Noise IK session. So:
 - Both removal paths — the tombstone and a local `roster retire` — clear the key
   record, and it joins the trust export/import set so a restored machine keeps
   its peers' keys under the same rules.
+- **This machine's own generation is carried in the trust document** too (CALLO).
+  A restored box that reset its counter would publish fresh keys at a low
+  generation, every peer would keep the stale record, and those are exactly the
+  keys lost with the old box.
+- **Rotation needs the two machines to meet** (CKCRED). A new key record reaches
+  A only in A's next session with B, direct or relayed through callosum; the hub
+  cannot carry it, because nothing it relays is signed by anything A trusts.
+  Until then A keeps sealing to B's old key. So B keeps the old generation's key
+  able to open until every peer has acknowledged the new one, not until B
+  rotates. An emergency rotation (a key suspected leaked) is therefore not
+  immediate: senders keep using the leaked key until they next meet B, and the
+  bound is how often machines meet.
 
 ### Per message (CKCRED)
 
@@ -234,6 +246,20 @@ CKCRED prefers 1 or 3 on custody. Signing happens only at connect and reconnect,
 which split tolerance already absorbs. Shape 3 is the recommendation, pending a
 check that `SignatureCB` is in the `nats-server` version we pin.
 
+What shape 3 commits us to (CKCRED):
+
+- The Go binary is a vault caller, so it needs its own identity: a supervised
+  module whose `route.open` carries `ConsumerIdentity`, with an exact `sign`
+  grant on the leaf key, or a callback that goes through ck-bus instead. Either
+  way it needs a Go subc client that sends the identity; without it `sign`
+  answers `not_found`, identical to "no such key", and reads like a missing grant.
+- The callback runs at every connect and reconnect, so a vault outage during a
+  hub reconnect keeps the leaf down until the vault returns. The connect error
+  must name the signer, so "vault unavailable" and "hub refused us" read
+  differently.
+- It is no longer stock `nats-server`: an upstream security fix reaches users
+  only when we rebuild and ship our binary. That is a release-cadence commitment.
+
 ## Callosum and NATS: who does what
 
 | Concern | Owner | State |
@@ -269,8 +295,21 @@ check that `SignatureCB` is in the `nats-server` version we pin.
    - **(b) Cross-machine rooms need the owner online to read.** Posts still arrive
      late but safe; reading the room waits for the owner. No foundation change.
 2. **Who mints the stable box id.** It must survive re-keys and trust
-   export/import, be opaque, and exist before any stream is created. Callosum
-   (it owns machine identity and export/import) or ck-bus (it owns `{acct}`).
+   export/import, be opaque, and exist before any stream is created. CALLO's
+   case for callosum, which SUBC shares: it can mint the id at store creation, a
+   re-key leaves a separate id column in place, the trust export already carries
+   its tables, and peers learn the id inside the paired session like the keys.
+   ck-bus would need its own durable store and backup contract, and could never
+   tie the id to a paired machine. Two constraints either way:
+   - **It is a name, never an authority.** Nothing may admit, route trust or skip
+     a check because two messages carry the same box id; authority stays on the
+     roster row's key. The id outlives a compromise re-key by design, so treating
+     it as proof would let a revoked key's history vouch for its replacement.
+   - **A clone must be detectable.** One trust export imported on two machines
+     gives two live boxes with one id and different transport keys. A box id
+     announced over a session whose key differs from the key already bound to it
+     is a conflict to refuse and surface, not a rotation. Only callosum holds the
+     key to see this.
 
 ## Remaining checks
 
