@@ -197,23 +197,27 @@ fn external_domain_candidates() -> BTreeMap<String, ExternalDomainCandidate> {
             if !executable {
                 continue;
             }
-            let absolute = fs::canonicalize(&path).unwrap_or_else(|_| {
-                if path.is_absolute() {
-                    path
-                } else {
-                    env::current_dir()
-                        .map(|current| current.join(path))
-                        .unwrap_or_else(|_| PathBuf::from(name))
-                }
-            });
-            if own_executable.as_ref() == Some(&absolute) {
+            // Resolved only to recognise ck itself. The candidate is probed and
+            // run by the name it has on PATH, never by the file a symlink points
+            // to: one binary can carry several faces chosen by argv[0]
+            // (`ck-projects` and `ck-workspaces` both link to `ck-entorhinal`),
+            // and running the link target would hand every face the module's
+            // own name.
+            if own_executable.is_some() && own_executable == fs::canonicalize(&path).ok() {
                 continue;
             }
+            let invoked = if path.is_absolute() {
+                path
+            } else {
+                env::current_dir()
+                    .map(|current| current.join(&path))
+                    .unwrap_or_else(|_| PathBuf::from(name))
+            };
             candidates.insert(
                 name.to_string(),
                 ExternalDomainCandidate {
                     name: name.to_string(),
-                    path: absolute,
+                    path: invoked,
                 },
             );
         }

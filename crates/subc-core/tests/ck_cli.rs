@@ -1556,6 +1556,47 @@ fn a_copy_of_ck_on_path_is_neither_probed_recursively_nor_listed() {
     );
 }
 
+/// One program can carry several faces chosen by argv[0], installed as
+/// symlinks (entorhinal's `ck-projects` and `ck-workspaces` both link to
+/// `ck-entorhinal`). ck must probe and run the name it found on PATH, not the
+/// file the link points to, or every face arrives as the module and the
+/// domain can never answer its handshake.
+#[cfg(unix)]
+#[test]
+fn a_domain_installed_as_a_symlink_is_probed_and_run_by_its_own_name() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let temp = TempDir::new("ck-domain-symlink-face");
+    let bin = temp.path().join("bin");
+    let store = temp.path().join("store");
+    fs::create_dir_all(&bin).expect("create fake PATH");
+    fs::create_dir_all(&store).expect("create program dir");
+    // Answers as a domain only under the face name; under its own file name
+    // it refuses the probe exactly as a module binary does. `${0##*/}` rather
+    // than basename: PATH holds only the fake bin, so no external command runs.
+    let program = store.join("multi-face");
+    fs::write(
+        &program,
+        "#!/bin/sh\ncase \"${0##*/}\" in\n  ck-faced)\n    if [ \"$1\" = \"--ck-domain\" ]; then echo \"faced domain headline\"; exit 0; fi\n    echo \"ran as ck-faced: $*\"; exit 0 ;;\n  *) echo \"unknown flag\" >&2; exit 64 ;;\nesac\n",
+    )
+    .expect("write multi-face program");
+    let mut permissions = fs::metadata(&program).expect("metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&program, permissions).expect("mark executable");
+    symlink(&program, bin.join("ck-faced")).expect("link the face");
+
+    let cache = temp.path().join("update-metadata.json");
+    let dispatched = ck_command()
+        .args(["faced", "list"])
+        .env("PATH", &bin)
+        .env("CK_UPDATE_CACHE_PATH", &cache)
+        .env("CK_TEST_DOMAIN_PROBE_TIMEOUT_MS", "8000")
+        .output()
+        .expect("dispatch the symlinked face");
+    assert_exit(&dispatched, 0);
+    assert_eq!(text(&dispatched.stdout).trim(), "ran as ck-faced: list");
+}
+
 #[cfg(unix)]
 #[test]
 fn external_domains_opt_in_dispatch_and_cache_their_probe() {
