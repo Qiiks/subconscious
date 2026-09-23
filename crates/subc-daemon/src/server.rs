@@ -357,13 +357,24 @@ where
         egress: egress.clone(),
     };
 
+    let mut route_open_tasks = JoinSet::new();
     let loop_result = connection_loop(
         &mut read_half,
         Arc::clone(&router),
         ctx.clone(),
         close_receiver,
+        &mut route_open_tasks,
     )
     .await;
+
+    // Every in-flight route.open must have FINISHED before `connection` drops,
+    // because that drop runs the forwarding cleanup for this id, and cleanup is
+    // also where the id's closing mark is lifted. Dropping a JoinSet only
+    // requests abort: a task already running on another worker keeps going
+    // until its next await, and could commit a route for this connection after
+    // cleanup has cleared it, with nothing left to refuse it and nothing to
+    // clean it up. shutdown() aborts and then waits.
+    route_open_tasks.shutdown().await;
 
     drop(ctx);
     drop(egress);
@@ -475,11 +486,11 @@ async fn connection_loop<R>(
     router: Arc<Router>,
     ctx: RouteCtx,
     mut close_receiver: ConnectionCloseReceiver,
+    route_open_tasks: &mut JoinSet<Result<(), RouterError>>,
 ) -> Result<ConnectionLoopExit, ConnectionError>
 where
     R: AsyncRead + Unpin,
 {
-    let mut route_open_tasks = JoinSet::new();
 
     loop {
         while let Some(result) = route_open_tasks.try_join_next() {
