@@ -1087,7 +1087,8 @@ impl SubcConsumer {
             let route = self
                 .shared
                 .ensure_route(&route_key, &route_open, &opts, call_deadline)
-                .await?;
+                .await
+                .map_err(request_not_sent_after_route_open_failure)?;
             let permit =
                 match timeout_at(call_deadline, Arc::clone(&route.sem).acquire_owned()).await {
                     Ok(Ok(permit)) => permit,
@@ -1206,7 +1207,8 @@ impl SubcConsumer {
             let route = self
                 .shared
                 .ensure_route(&route_key, &route_open, &route_opts, open_deadline)
-                .await?;
+                .await
+                .map_err(request_not_sent_after_route_open_failure)?;
             let permit =
                 match timeout_at(open_deadline, Arc::clone(&route.sem).acquire_owned()).await {
                     Ok(Ok(permit)) => permit,
@@ -4257,6 +4259,27 @@ fn epoch_millis() -> u64 {
     .unwrap_or(u64::MAX)
 }
 
+/// Reclassify a route-open failure seen by a managed `call` or `subscribe`.
+///
+/// `ensure_route` reports the route.open control request's own outcome, which
+/// is `OutcomeUnknown` when that request was written but its reply did not
+/// arrive before the deadline: the daemon may or may not have opened the
+/// channel. The caller's request body, however, is only written after a route
+/// is in hand, so when no route came back the body provably never left the
+/// client. From the caller's point of view that is `NotSent`, and reporting
+/// `OutcomeUnknown` would wrongly tell it a non-idempotent operation might
+/// have run. A route.open reply that arrives after its waiter gave up is still
+/// cleaned up: `settle_pending` sends that channel a GOODBYE instead of caching
+/// it, so reporting `NotSent` here leaves no route open behind.
+fn request_not_sent_after_route_open_failure(err: CallError) -> CallError {
+    match err {
+        CallError::OutcomeUnknown(source) => CallError::not_sent(format!(
+            "request not sent: route.open did not complete ({source})"
+        )),
+        other => other,
+    }
+}
+
 fn classify_failure(accepted: bool, reason: impl Into<String>) -> CallError {
     if accepted {
         CallError::outcome_unknown(reason)
@@ -5863,6 +5886,105 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "a timed-out route.open waiter must not write a control frame"
+        );
+    }
+
+    // A route.open whose control reply never arrives before the deadline has an
+    // unknown outcome of its own (the daemon may have opened the channel), but
+    // the managed call's request body was never written. The call and the
+    // subscription must therefore report NotSent, not OutcomeUnknown: callers
+    // use that distinction to decide whether a non-idempotent retry is safe.
+    async fn managed_op_with_unanswered_route_open(subscribe: bool) -> CallError {
+        let shared = Arc::new(Shared::new(
+            PathBuf::from("/tmp/does-not-exist"),
+            ConsumerOptions::default(),
+        ));
+        let (writer, mut rx) = mpsc::channel(4);
+        {
+            let mut inner = shared.lock_inner();
+            inner.writer = Some(writer);
+        }
+        let consumer = SubcConsumer {
+            shared: Arc::clone(&shared),
+        };
+        let target = RouteTarget::ToolProvider {
+            module_id: "slow-route-open".to_string(),
+        };
+        let identity = BindIdentity::new(
+            PathBuf::from("/tmp/project"),
+            "test".to_string(),
+            "slow-route-open".to_string(),
+        );
+        let task = tokio::spawn(async move {
+            if subscribe {
+                consumer
+                    .subscribe(
+                        target,
+                        identity,
+                        b"{}".to_vec(),
+                        SubscribeOptions {
+                            route_open_timeout: Duration::from_millis(200),
+                            route_retry_deadline: Duration::from_millis(100),
+                            ..SubscribeOptions::default()
+                        },
+                    )
+                    .await
+                    .map(|_| ())
+            } else {
+                consumer
+                    .call(
+                        target,
+                        identity,
+                        b"{}".to_vec(),
+                        CallOptions {
+                            timeout: Duration::from_millis(200),
+                            route_retry_deadline: Duration::from_millis(100),
+                            ..CallOptions::default()
+                        },
+                    )
+                    .await
+                    .map(|_| ())
+            }
+        });
+
+        // Play the writer task: accept the route.open onto the wire (so the
+        // consumer knows the control frame left) and then never answer it,
+        // which is what a daemon under load looks like from the client.
+        let command = rx.recv().await.expect("route.open must be queued");
+        assert_eq!(command.frame.header.channel, 0);
+        let request: ClientControlRequest = serde_json::from_slice(&command.frame.body).unwrap();
+        assert!(matches!(request, ClientControlRequest::RouteOpen { .. }));
+        assert!(shared.mark_pending_accepted(command.pending.expect("route.open is tracked")));
+
+        let err = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("the managed op must settle at its own deadline")
+            .unwrap()
+            .expect_err("an unanswered route.open cannot yield a route");
+        while let Ok(command) = rx.try_recv() {
+            assert_eq!(
+                command.frame.header.channel, 0,
+                "no data-plane frame may be written without an open route"
+            );
+        }
+        err
+    }
+
+    #[tokio::test]
+    async fn call_whose_route_open_times_out_after_send_is_not_sent() {
+        let err = managed_op_with_unanswered_route_open(false).await;
+        assert!(
+            matches!(err, CallError::NotSent(_)),
+            "call body never left the client, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_whose_route_open_times_out_after_send_is_not_sent() {
+        let err = managed_op_with_unanswered_route_open(true).await;
+        assert!(
+            matches!(err, CallError::NotSent(_)),
+            "subscription request never left the client, got {err:?}"
         );
     }
 
