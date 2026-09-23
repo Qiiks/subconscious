@@ -39,11 +39,21 @@ What is built now:
 - after the notice and the drain, the daemon closes every connection, so each
   module sees EOF while the daemon is still alive, and sends SIGTERM to every
   `protocol: "none"` child, which has no connection to see EOF on;
-- it then waits at most 1 s for children to exit, sends SIGTERM to any still
-  running, waits at most 0.5 s more, and sends SIGKILL (bounds in
-  `child_roster.rs`; a second SIGTERM goes straight to the kill). Without this
-  a child that ignores EOF would outlive the daemon, and a surviving
-  `nats-server` would fight the next daemon's for its port;
+- each child gets that one stop request and then escalation only at its own
+  deadline: its resolved drain budget (per-module `drain_timeout_ms`, else
+  30 s), capped at 25 s. A subc module still running then gets SIGTERM, and
+  SIGKILL 0.5 s later; a `protocol: "none"` child gets SIGKILL. Children are
+  waited on concurrently, and the stop returns as soon as all have exited
+  (bounds in `child_roster.rs`; a second SIGTERM goes straight to the kill).
+  A single short bound for everyone would have SIGKILLed BROCA mid-seal on
+  any cut with a run in flight (its seal finished 12 s after the 16:52:57Z
+  cut). Without escalation a child that ignores its stop would outlive the
+  daemon, and a surviving `nats-server` would fight the next daemon's for its
+  port;
+- the whole shutdown (0.5 s notice, 2 s drain, up to 25.75 s of child stop)
+  fits inside the stop timeout `ck setup` now writes: launchd `ExitTimeOut`
+  and systemd `TimeoutStopSec` of 35 s (launchd's default was 20 s). A daemon
+  killed first would leave its `protocol: "none"` children orphaned;
 - the systemd unit sets `KillMode=mixed`: SIGTERM to the daemon only, and
   SIGKILL for the rest of the cgroup only after the daemon exits.
 

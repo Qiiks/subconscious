@@ -37,7 +37,7 @@ impl Fixture {
     /// connects, merged the same way.
     fn boot_with(busy: bool, observer: Value, none_module: Option<Value>) -> Self {
         let permit = DAEMON_GATE.lock().unwrap_or_else(|p| p.into_inner());
-        let root = TestTempDir::new("daemon-shutdown");
+        let root = fresh_dir("daemon-shutdown");
         for dir in ["config/cortexkit", "runtime", "data/cortexkit/run"] {
             fs::create_dir_all(root.join(dir)).unwrap();
         }
@@ -239,6 +239,29 @@ fn merge_module(module: &mut Value, extra: &Value) {
     }
 }
 
+/// A scratch directory no other test, and no earlier run, can share.
+///
+/// `TestTempDir` names a directory `<label>-<pid>-<counter>`, which is unique
+/// among live test processes, but it keeps a failed test's directory on disk
+/// and `create_dir_all` accepts an existing one. A later run whose pid and
+/// counter repeat would then read a stale `events.jsonl`, and a leftover
+/// `teardown_complete` or pid file would pass or fail a test for reasons that
+/// have nothing to do with the daemon. The nanosecond stamp makes the name new,
+/// and the emptiness check refuses to run if it somehow is not.
+fn fresh_dir(label: &str) -> TestTempDir {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = TestTempDir::new(&format!("{label}-{nanos}"));
+    assert!(
+        fs::read_dir(&*dir).unwrap().next().is_none(),
+        "scratch directory {} already has contents",
+        dir.display()
+    );
+    dir
+}
+
 fn unix_ms_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -395,7 +418,7 @@ fn eof_ignoring_module_is_sigtermed_at_its_deadline_then_killed() {
 
 #[test]
 fn protocol_none_child_is_stopped_by_sigterm_not_left_running() {
-    let marker = TestTempDir::new("wire-less-marker");
+    let marker = fresh_dir("wire-less-marker");
     let marker_path = marker.join("sigterm");
     let mut fixture = Fixture::boot_with(
         false,
