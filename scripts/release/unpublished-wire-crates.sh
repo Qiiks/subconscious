@@ -36,11 +36,17 @@ if [[ -n "$registry_json_dir" && ! -d "$registry_json_dir" ]]; then
   exit 2
 fi
 
+# Every published crate, in dependency order: a crate is listed after
+# everything it depends on, which is the order the publish jobs run in.
 wire_crates=(
   subc-protocol
   subc-transport
   subc-control
   subc-client-rs
+  subc-jsonc
+  subc-cgroup
+  subc-uptime
+  subc-daemon
 )
 unpublished=()
 tmp_dir=$(mktemp -d)

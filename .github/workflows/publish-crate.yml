@@ -62,7 +62,9 @@ jobs:
             if echo "$out" | grep -q "already exists"; then
               echo "already published; treating as success"; exit 0
             fi
-            if echo "$out" | grep -q "failed to select a version for the requirement"; then
+            # "no matching package named" is the same race for a dependency's first
+            # ever version, which the index has not listed yet.
+            if echo "$out" | grep -qE "failed to select a version for the requirement|no matching package named"; then
               echo "dependency not yet resolvable on the index (attempt $attempt); retrying in 60s"
               sleep 60; continue
             fi

@@ -1,9 +1,10 @@
 [package]
 name = "subc-cgroup"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "MIT"
-publish = false
+publish = true
+repository = "https://github.com/cortexkit/subconscious"
 description = "Linux cgroup placement for supervised subc module children."
 
 [dependencies]

@@ -23,6 +23,10 @@ jobs:
       transport_version: ${{ steps.versions.outputs.transport_version }}
       control_version: ${{ steps.versions.outputs.control_version }}
       client_version: ${{ steps.versions.outputs.client_version }}
+      jsonc_version: ${{ steps.versions.outputs.jsonc_version }}
+      cgroup_version: ${{ steps.versions.outputs.cgroup_version }}
+      uptime_version: ${{ steps.versions.outputs.uptime_version }}
+      daemon_version: ${{ steps.versions.outputs.daemon_version }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -46,6 +50,10 @@ jobs:
             echo "transport_version=$(find_version subc-transport)"
             echo "control_version=$(find_version subc-control)"
             echo "client_version=$(find_version subc-client-rs)"
+            echo "jsonc_version=$(find_version subc-jsonc)"
+            echo "cgroup_version=$(find_version subc-cgroup)"
+            echo "uptime_version=$(find_version subc-uptime)"
+            echo "daemon_version=$(find_version subc-daemon)"
           } >> "$GITHUB_OUTPUT"
 
   publish_protocol:
@@ -118,5 +126,70 @@ jobs:
     with:
       crate: subc-client-rs
       version: ${{ needs.detect.outputs.client_version }}
+    secrets:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  publish_jsonc:
+    name: Publish subc-jsonc
+    needs: detect
+    if: ${{ needs.detect.outputs.jsonc_version != '' }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      crate: subc-jsonc
+      version: ${{ needs.detect.outputs.jsonc_version }}
+    secrets:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  publish_cgroup:
+    name: Publish subc-cgroup
+    needs: detect
+    if: ${{ needs.detect.outputs.cgroup_version != '' }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      crate: subc-cgroup
+      version: ${{ needs.detect.outputs.cgroup_version }}
+    secrets:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  publish_uptime:
+    name: Publish subc-uptime
+    needs: detect
+    if: ${{ needs.detect.outputs.uptime_version != '' }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      crate: subc-uptime
+      version: ${{ needs.detect.outputs.uptime_version }}
+    secrets:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # The daemon depends on every crate above except subc-client-rs, so it runs
+  # only after each of them either published or had nothing to publish.
+  publish_daemon:
+    name: Publish subc-daemon
+    needs: [detect, publish_protocol, publish_transport, publish_control, publish_jsonc, publish_cgroup, publish_uptime]
+    if: >-
+      ${{
+        always() &&
+        needs.detect.result == 'success' &&
+        (needs.publish_protocol.result == 'success' || needs.publish_protocol.result == 'skipped') &&
+        (needs.publish_transport.result == 'success' || needs.publish_transport.result == 'skipped') &&
+        (needs.publish_control.result == 'success' || needs.publish_control.result == 'skipped') &&
+        (needs.publish_jsonc.result == 'success' || needs.publish_jsonc.result == 'skipped') &&
+        (needs.publish_cgroup.result == 'success' || needs.publish_cgroup.result == 'skipped') &&
+        (needs.publish_uptime.result == 'success' || needs.publish_uptime.result == 'skipped') &&
+        needs.detect.outputs.daemon_version != ''
+      }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      crate: subc-daemon
+      version: ${{ needs.detect.outputs.daemon_version }}
     secrets:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

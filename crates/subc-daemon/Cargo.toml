@@ -1,6 +1,6 @@
 [package]
 name = "subc-daemon"
-version = "0.20.20"
+version = "0.20.21"
 edition = "2021"
 publish = true
 description = "Embeddable subc daemon: bootstrap, module supervision, and opaque-byte splice routing."
@@ -13,7 +13,7 @@ loom = []
 test-support = []
 
 [dependencies]
-cortexkit-log = { version = "0.3.2", git = "https://github.com/cortexkit/commons.git", rev = "4bfcb4924ac9efea5825e74beed2e39807bfdd17" }
+cortexkit-log = { version = "0.3.3" }
 cortexkit-paths = "0.1.1"
 fs4 = "1"
 getrandom = "0.2"
@@ -26,12 +26,12 @@ subc-control = { path = "../subc-control", version = "0.17" }
 subc-jsonc = { path = "../subc-jsonc", version = "0.1.0" }
 subc-protocol = { path = "../subc-protocol", version = "0.24.0" }
 subc-transport = { path = "../subc-transport", version = "0.7.0" }
-subc-uptime = { path = "../subc-uptime" }
+subc-uptime = { path = "../subc-uptime", version = "0.1.0" }
 tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "io-util", "sync", "time", "process", "signal"] }
 tracing = "0.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-subc-cgroup = { path = "../subc-cgroup" }
+subc-cgroup = { path = "../subc-cgroup", version = "0.1.1" }
 
 [target.'cfg(unix)'.dependencies]
 # SIGTERM for `protocol: "none"` teardown. This crate forbids unsafe code, so
