@@ -214,42 +214,7 @@ fn download_index(
 ) -> Result<Option<String>, String> {
     let body = body_path.to_string_lossy().into_owned();
     let headers = header_path.to_string_lossy().into_owned();
-    // curl takes fractional seconds; Invoke-WebRequest takes whole seconds
-    // and treats 0 as infinite, so the floor is one second there.
-    let curl_seconds = format!("{:.3}", deadline.as_secs_f64().max(0.001));
-    let powershell_seconds = deadline.as_secs().max(1);
-    let (program, args) = if cfg!(windows) {
-        (
-            "powershell.exe",
-            vec![
-                "-NoProfile".to_string(),
-                "-NonInteractive".to_string(),
-                "-Command".to_string(),
-                format!(
-                    "$r = Invoke-WebRequest -Uri '{url}' -OutFile '{body}' -PassThru -UseBasicParsing -TimeoutSec {powershell_seconds}; $lines = @(); foreach ($key in $r.Headers.Keys) {{ $lines += \"${{key}}: $($r.Headers[$key])\" }}; Set-Content -LiteralPath '{headers}' -Value ($lines -join \"`n\")"
-                ),
-            ],
-        )
-    } else {
-        (
-            "curl",
-            vec![
-                "--fail".to_string(),
-                "--location".to_string(),
-                "--silent".to_string(),
-                "--show-error".to_string(),
-                "--max-time".to_string(),
-                curl_seconds,
-                "--dump-header".to_string(),
-                headers,
-                "--output".to_string(),
-                body,
-                url.to_string(),
-            ],
-        )
-    };
-    let output = Command::new(program)
-        .args(args)
+    let output = index_download_command(url, &body, &headers, deadline)
         .output()
         .map_err(|error| format!("could not download {url}: {error}"))?;
     if !output.status.success() {
@@ -259,6 +224,60 @@ fn download_index(
     }
     let header_text = fs::read_to_string(header_path).unwrap_or_default();
     Ok(signature_from_dump_header(&header_text))
+}
+
+fn index_download_command(url: &str, body: &str, headers: &str, deadline: Duration) -> Command {
+    if cfg!(windows) {
+        windows_index_download_command(url, body, headers, deadline)
+    } else {
+        unix_index_download_command(url, body, headers, deadline)
+    }
+}
+
+fn windows_index_download_command(
+    url: &str,
+    body: &str,
+    headers: &str,
+    deadline: Duration,
+) -> Command {
+    // Invoke-WebRequest takes whole seconds and treats 0 as infinite, so the
+    // floor is one second.
+    let powershell_seconds = deadline.as_secs().max(1);
+    let mut command = Command::new("powershell.exe");
+    command.args([
+        "-NoProfile".to_string(),
+        "-NonInteractive".to_string(),
+        "-Command".to_string(),
+        format!(
+            "$r = Invoke-WebRequest -Uri '{url}' -OutFile '{body}' -PassThru -UseBasicParsing -TimeoutSec {powershell_seconds}; $lines = @(); foreach ($key in $r.Headers.Keys) {{ $lines += \"${{key}}: $($r.Headers[$key])\" }}; Set-Content -LiteralPath '{headers}' -Value ($lines -join \"`n\")"
+        ),
+    ]);
+    command
+}
+
+fn unix_index_download_command(
+    url: &str,
+    body: &str,
+    headers: &str,
+    deadline: Duration,
+) -> Command {
+    // curl takes fractional seconds.
+    let curl_seconds = format!("{:.3}", deadline.as_secs_f64().max(0.001));
+    let mut command = Command::new("curl");
+    command.args([
+        "--fail".to_string(),
+        "--location".to_string(),
+        "--silent".to_string(),
+        "--show-error".to_string(),
+        "--max-time".to_string(),
+        curl_seconds,
+        "--dump-header".to_string(),
+        headers.to_string(),
+        "--output".to_string(),
+        body.to_string(),
+        url.to_string(),
+    ]);
+    command
 }
 
 /// Last matching header wins so a redirected dump still yields the final
@@ -317,32 +336,7 @@ fn verify_and_parse(
 
 pub(super) fn download(url: &str, destination: &Path) -> Result<(), String> {
     let destination = destination.to_string_lossy().into_owned();
-    let (program, args) = if cfg!(windows) {
-        (
-            "powershell.exe",
-            vec![
-                "-NoProfile".to_string(),
-                "-NonInteractive".to_string(),
-                "-Command".to_string(),
-                format!("Invoke-WebRequest -Uri '{url}' -OutFile '{destination}' -UseBasicParsing"),
-            ],
-        )
-    } else {
-        (
-            "curl",
-            vec![
-                "--fail".to_string(),
-                "--location".to_string(),
-                "--silent".to_string(),
-                "--show-error".to_string(),
-                "--output".to_string(),
-                destination,
-                url.to_string(),
-            ],
-        )
-    };
-    let output = Command::new(program)
-        .args(args)
+    let output = download_command(url, &destination)
         .output()
         .map_err(|error| format!("could not download {url}: {error}"))?;
     if output.status.success() {
@@ -352,6 +346,39 @@ pub(super) fn download(url: &str, destination: &Path) -> Result<(), String> {
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         Err(format!("could not download {url}: {stderr} {stdout}"))
     }
+}
+
+fn download_command(url: &str, destination: &str) -> Command {
+    if cfg!(windows) {
+        windows_download_command(url, destination)
+    } else {
+        unix_download_command(url, destination)
+    }
+}
+
+fn windows_download_command(url: &str, destination: &str) -> Command {
+    let mut command = Command::new("powershell.exe");
+    command.args([
+        "-NoProfile".to_string(),
+        "-NonInteractive".to_string(),
+        "-Command".to_string(),
+        format!("Invoke-WebRequest -Uri '{url}' -OutFile '{destination}' -UseBasicParsing"),
+    ]);
+    command
+}
+
+fn unix_download_command(url: &str, destination: &str) -> Command {
+    let mut command = Command::new("curl");
+    command.args([
+        "--fail".to_string(),
+        "--location".to_string(),
+        "--silent".to_string(),
+        "--show-error".to_string(),
+        "--output".to_string(),
+        destination.to_string(),
+        url.to_string(),
+    ]);
+    command
 }
 
 /// Unique per call within this process and across processes. The pid
@@ -741,6 +768,80 @@ mod tests {
             "transport ignored its deadline: {elapsed:?} (includes process start; \
              the hold is 300s, so an ignored deadline lands above it)"
         );
+    }
+
+    /// The `-Command` argument of a Windows download command, with the
+    /// command's environment as name/value pairs.
+    fn script_and_env(command: &Command) -> (String, BTreeMap<String, String>) {
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let position = args
+            .iter()
+            .position(|arg| arg == "-Command")
+            .expect("a powershell command carries -Command");
+        let env = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value
+                        .map(|value| value.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        (args[position + 1].clone(), env)
+    }
+
+    /// A Windows profile can put an apostrophe in every path `ck` hands to
+    /// powershell.exe (user name `O'Neil`), and an interpolated `'...'` value
+    /// then ends the quoted segment early: the download breaks, and a value
+    /// containing `'; ...` runs as PowerShell. The script text must be FIXED
+    /// and every value must reach the child through its environment instead.
+    #[test]
+    fn windows_index_download_keeps_values_out_of_the_script_text() {
+        let url = "https://releases.example/index.json'; Write-Output INJECTED; '";
+        let body = "C:\\Users\\O'Neil\\AppData\\Local\\Temp\\index.json";
+        let headers = "C:\\Users\\O'Neil\\AppData\\Local\\Temp\\index.headers";
+        let command = windows_index_download_command(url, body, headers, Duration::from_secs(30));
+        assert_eq!(command.get_program().to_string_lossy(), "powershell.exe");
+        let (script, env) = script_and_env(&command);
+        for value in [url, body, headers] {
+            assert!(
+                !script.contains(value),
+                "script must not interpolate a value: {script}"
+            );
+        }
+        assert!(
+            !script.contains("INJECTED"),
+            "no value byte may reach the script text: {script}"
+        );
+        assert_eq!(env.get("CK_URL").map(String::as_str), Some(url));
+        assert_eq!(env.get("CK_BODY").map(String::as_str), Some(body));
+        assert_eq!(env.get("CK_HEADERS").map(String::as_str), Some(headers));
+    }
+
+    #[test]
+    fn windows_asset_download_keeps_values_out_of_the_script_text() {
+        let url = "https://releases.example/ck.zip'; Write-Output INJECTED; '";
+        let destination = "C:\\Users\\O'Neil\\AppData\\Local\\Temp\\ck.zip";
+        let command = windows_download_command(url, destination);
+        assert_eq!(command.get_program().to_string_lossy(), "powershell.exe");
+        let (script, env) = script_and_env(&command);
+        for value in [url, destination] {
+            assert!(
+                !script.contains(value),
+                "script must not interpolate a value: {script}"
+            );
+        }
+        assert!(
+            !script.contains("INJECTED"),
+            "no value byte may reach the script text: {script}"
+        );
+        assert_eq!(env.get("CK_URL").map(String::as_str), Some(url));
+        assert_eq!(env.get("CK_OUT").map(String::as_str), Some(destination));
     }
 
     #[test]

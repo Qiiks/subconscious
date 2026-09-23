@@ -210,33 +210,12 @@ fn temporary_workspace(target: UpgradeTarget) -> Result<PathBuf, UpgradeAssetErr
 }
 
 fn extract(archive: &Path, destination: &Path) -> Result<(), String> {
-    let (program, args) = if cfg!(windows) {
-        (
-            "powershell.exe",
-            vec![
-                "-NoProfile".to_string(),
-                "-NonInteractive".to_string(),
-                "-Command".to_string(),
-                format!(
-                    "Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force",
-                    archive.display(),
-                    destination.display()
-                ),
-            ],
-        )
+    let program = if cfg!(windows) {
+        "powershell.exe"
     } else {
-        (
-            "unzip",
-            vec![
-                "-q".to_string(),
-                archive.to_string_lossy().into_owned(),
-                "-d".to_string(),
-                destination.to_string_lossy().into_owned(),
-            ],
-        )
+        "unzip"
     };
-    let output = Command::new(program)
-        .args(args)
+    let output = extract_command(archive, destination)
         .output()
         .map_err(|error| format!("could not run {program}: {error}"))?;
     if output.status.success() {
@@ -244,6 +223,40 @@ fn extract(archive: &Path, destination: &Path) -> Result<(), String> {
     } else {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
     }
+}
+
+fn extract_command(archive: &Path, destination: &Path) -> Command {
+    if cfg!(windows) {
+        windows_extract_command(archive, destination)
+    } else {
+        unix_extract_command(archive, destination)
+    }
+}
+
+fn windows_extract_command(archive: &Path, destination: &Path) -> Command {
+    let mut command = Command::new("powershell.exe");
+    command.args([
+        "-NoProfile".to_string(),
+        "-NonInteractive".to_string(),
+        "-Command".to_string(),
+        format!(
+            "Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force",
+            archive.display(),
+            destination.display()
+        ),
+    ]);
+    command
+}
+
+fn unix_extract_command(archive: &Path, destination: &Path) -> Command {
+    let mut command = Command::new("unzip");
+    command.args([
+        "-q".to_string(),
+        archive.to_string_lossy().into_owned(),
+        "-d".to_string(),
+        destination.to_string_lossy().into_owned(),
+    ]);
+    command
 }
 
 fn platform_binary(binary: &str) -> String {
@@ -273,6 +286,7 @@ mod tests {
         assets: BTreeMap<String, Vec<u8>>,
         digests: BTreeMap<String, String>,
         calls: Vec<String>,
+        destinations: Vec<PathBuf>,
     }
 
     impl UpgradeAssetFetcher for MemoryFetcher {
@@ -284,6 +298,7 @@ mod tests {
         ) -> Result<String, UpgradeAssetError> {
             let names = convention_asset_names(target, platform);
             self.calls.push(names.archive.clone());
+            self.destinations.push(destination.to_path_buf());
             let bytes = self.assets.get(&names.archive).ok_or_else(|| {
                 UpgradeAssetError::ReleaseIncomplete {
                     missing_asset: names.archive.clone(),
@@ -350,6 +365,97 @@ mod tests {
             }
         );
         assert_eq!(fetcher.calls, vec![names.archive]);
+    }
+
+    /// The `-Command` argument of a Windows command, with the command's
+    /// environment as name/value pairs.
+    fn script_and_env(command: &Command) -> (String, BTreeMap<String, String>) {
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let position = args
+            .iter()
+            .position(|arg| arg == "-Command")
+            .expect("a powershell command carries -Command");
+        let env = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value
+                        .map(|value| value.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        (args[position + 1].clone(), env)
+    }
+
+    /// A Windows profile can put an apostrophe in the temp paths handed to
+    /// `Expand-Archive` (user name `O'Neil`), and an interpolated `'...'`
+    /// value then ends the quoted segment early. The script text must be
+    /// FIXED and both paths must reach the child through its environment.
+    #[test]
+    fn windows_expand_archive_keeps_paths_out_of_the_script_text() {
+        let archive = PathBuf::from("C:\\Users\\O'Neil\\AppData\\Local\\Temp\\ck.zip'; Write-Output INJECTED; '");
+        let destination = PathBuf::from("C:\\Users\\O'Neil\\AppData\\Local\\Temp\\extracted");
+        let command = windows_extract_command(&archive, &destination);
+        assert_eq!(command.get_program().to_string_lossy(), "powershell.exe");
+        let (script, env) = script_and_env(&command);
+        for value in [
+            archive.to_string_lossy().into_owned(),
+            destination.to_string_lossy().into_owned(),
+        ] {
+            assert!(
+                !script.contains(&value),
+                "script must not interpolate a value: {script}"
+            );
+        }
+        assert!(
+            !script.contains("INJECTED"),
+            "no value byte may reach the script text: {script}"
+        );
+        assert_eq!(
+            env.get("CK_ARCHIVE").map(String::as_str),
+            Some(archive.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            env.get("CK_DEST").map(String::as_str),
+            Some(destination.to_string_lossy().as_ref())
+        );
+    }
+
+    /// A failed preparation must not leave its temporary workspace behind:
+    /// every early return between creating it and handing it to the caller
+    /// still owes a `remove_dir_all`.
+    #[test]
+    fn a_failed_preparation_removes_its_temporary_workspace() {
+        let mut fetcher = MemoryFetcher::default();
+        let names = convention_asset_names(upgrade_target("ck-subc-mcp"), AlphaTarget::LinuxX64);
+        fetcher
+            .assets
+            .insert(names.archive.clone(), b"corrupted".to_vec());
+        fetcher
+            .digests
+            .insert(names.archive.clone(), "0".repeat(64));
+
+        let error = prepare_upgrade_asset(
+            &mut fetcher,
+            upgrade_target("ck-subc-mcp"),
+            AlphaTarget::LinuxX64,
+        )
+        .expect_err("digest mismatch must refuse");
+        assert!(matches!(error, UpgradeAssetError::DigestMismatch { .. }));
+        let workspace = fetcher.destinations[0]
+            .parent()
+            .expect("the archive lives inside the workspace")
+            .to_path_buf();
+        assert!(
+            !workspace.exists(),
+            "a refused preparation leaks its workspace: {}",
+            workspace.display()
+        );
     }
 
     #[test]

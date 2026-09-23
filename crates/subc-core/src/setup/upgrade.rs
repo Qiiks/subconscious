@@ -1136,6 +1136,46 @@ mod tests {
         );
     }
 
+    /// A segment of `.`-separated numeric text is only a version component
+    /// when it is non-empty ASCII digits: an empty segment ("1..2") or a
+    /// non-ASCII digit (Arabic-Indic "١" below) must refuse, because the
+    /// accepted text is recorded and rendered as the installed version.
+    #[test]
+    fn version_output_with_an_empty_segment_is_refused() {
+        assert!(
+            version_from_output(b"ck 1..2").is_err(),
+            "an empty minor segment is not a version"
+        );
+        assert!(
+            version_from_output(b"ck 1.2.").is_err(),
+            "an empty patch segment is not a version"
+        );
+    }
+
+    #[test]
+    fn version_output_with_non_ascii_digits_is_refused() {
+        assert!(
+            version_from_output("ck ١.٢.٣".as_bytes()).is_err(),
+            "non-ASCII digits are not a version"
+        );
+        assert!(
+            version_from_output("ck 1.٢.3".as_bytes()).is_err(),
+            "a single non-ASCII digit segment is not a version"
+        );
+    }
+
+    #[test]
+    fn version_output_accepts_plain_and_prerelease_versions() {
+        assert_eq!(
+            version_from_output(b"ck 1.2.3").expect("plain version"),
+            "1.2.3"
+        );
+        assert_eq!(
+            version_from_output(b"ck 1.2.3-rc.1").expect("prerelease version"),
+            "1.2.3"
+        );
+    }
+
     #[test]
     fn missing_aft_archive_is_typed_release_incomplete() {
         let aft = upgrade_target("ck-aft");
