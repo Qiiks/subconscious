@@ -136,6 +136,25 @@ describe("request cancellation via AbortSignal", () => {
     client.close();
   });
 
+  test("a settled request removes its abort listener from a reused signal", async () => {
+    // A process-wide signal (prefrontal's stop button) is reused across many
+    // requests. If each request's listener outlives its request, the signal
+    // accumulates one closure per request forever.
+    const { client, daemon } = await connectClient();
+    const handle = await client.routeOpen(TOOL_TARGET, IDENTITY);
+
+    const controller = new AbortController();
+    const counts = countAbortListeners(controller.signal);
+
+    const requests = 5;
+    for (let i = 0; i < requests; i += 1) {
+      await client.request(handle, { name: `call-${i}`, arguments: {} }, { signal: controller.signal });
+    }
+    expect(counts.added).toBe(requests);
+    expect(counts.removed).toBe(requests);
+    client.close();
+  });
+
   test("a signal cancels only its own request, never a sibling on the same connection", async () => {
     // prefrontal holds ONE connection process-wide with unrelated requests in
     // flight on it (a board write, a work-graph read, a wake delivery). Cancelling
@@ -410,6 +429,22 @@ function writeConnectionFile(path: string, port: number): void {
     { mode: 0o600 },
   );
   chmodSync(path, 0o600);
+}
+
+/** Wraps a signal so the test can count abort listeners added and removed. */
+function countAbortListeners(signal: AbortSignal): { added: number; removed: number } {
+  const counts = { added: 0, removed: 0 };
+  const originalAdd = signal.addEventListener.bind(signal);
+  const originalRemove = signal.removeEventListener.bind(signal);
+  signal.addEventListener = ((type: string, listener: unknown, options?: unknown) => {
+    if (type === "abort") counts.added += 1;
+    originalAdd(type, listener as EventListener, options as AddEventListenerOptions);
+  }) as typeof signal.addEventListener;
+  signal.removeEventListener = ((type: string, listener: unknown, options?: unknown) => {
+    if (type === "abort") counts.removed += 1;
+    originalRemove(type, listener as EventListener, options as EventListenerOptions);
+  }) as typeof signal.removeEventListener;
+  return counts;
 }
 
 async function waitFor(predicate: () => boolean, label: string): Promise<void> {

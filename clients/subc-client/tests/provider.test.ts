@@ -500,6 +500,75 @@ describe("SubcProvider serve loop", () => {
     expect(provider.liveRoutes.get(8)?.epoch).toBe(5);
   });
 
+  // onRouteGone is consumer code awaited inside the read loop. A throw from it
+  // must be reported and absorbed there: letting it escape rejects dispatch(),
+  // which the read loop treats as an unexpected drop and tears down every route
+  // on the connection.
+  test("a throwing onRouteGone is reported and the connection keeps serving other routes", async () => {
+    const writes: Frame[] = [];
+    const sock = fakeWritableSocket(writes);
+    const token = newConnectionToken();
+    const provider = Object.create(SubcProvider.prototype) as {
+      ingressEpochDropCount: number;
+      inflight: Map<string, AbortController>;
+      pending: Map<string, unknown>;
+      liveRoutes: Map<number, RouteHandle>;
+      connectionToken: object;
+      opts: { onRouteGone: (handle: RouteHandle) => void };
+      dispatch(frame: Frame, sock: unknown, generation: number): Promise<boolean>;
+    };
+    provider.ingressEpochDropCount = 0;
+    provider.inflight = new Map();
+    provider.pending = new Map();
+    provider.liveRoutes = new Map();
+    provider.connectionToken = token;
+
+    const first = createRouteHandle(7, 1, token);
+    const second = createRouteHandle(8, 1, token);
+    provider.liveRoutes.set(first.channel, first);
+    provider.liveRoutes.set(second.channel, second);
+
+    const warnings: unknown[][] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args);
+    };
+
+    const gone: number[] = [];
+    let brokenCalls = 0;
+    provider.opts = {
+      onRouteGone: (handle) => {
+        gone.push(handle.channel);
+        if (brokenCalls === 0) {
+          brokenCalls += 1;
+          throw new Error("consumer callback broke");
+        }
+      },
+    };
+
+    const goodbye = (handle: RouteHandle) =>
+      buildFrameWithVersion(
+        PROTOCOL_VERSION,
+        FrameType.Goodbye,
+        CONTROL_FLAGS,
+        handle.channel,
+        handle.epoch,
+        0n,
+        new Uint8Array(0),
+      );
+
+    try {
+      await expect(provider.dispatch(goodbye(first), sock, 1)).resolves.toBe(true);
+      expect(provider.liveRoutes.has(second.channel)).toBe(true);
+      // The loop kept reading: the other route's GOODBYE still dispatches.
+      await expect(provider.dispatch(goodbye(second), sock, 1)).resolves.toBe(true);
+      expect(gone).toEqual([first.channel, second.channel]);
+      expect(warnings).toHaveLength(1);
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
   test("cancel handles write rejection and still sends on a healthy socket", async () => {
     const failed = providerControlHarness(rejectingWritableSocket());
     const unhandled = await recordUnhandledRejections(() => {

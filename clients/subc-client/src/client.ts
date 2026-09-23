@@ -832,6 +832,17 @@ export class SubcClient {
       return;
     }
     signal.addEventListener("abort", emit, { once: true });
+    // `once` removes the listener only when abort fires; a request that
+    // settles first would otherwise leave its closure on the signal, and a
+    // long-lived signal reused across calls would accumulate one per request.
+    const pending = this.pending.get(key);
+    if (pending) {
+      const previous = pending.onSettle;
+      pending.onSettle = () => {
+        previous?.();
+        signal.removeEventListener("abort", emit);
+      };
+    }
   }
 
   /** Send a pure-header cancellation for an in-flight request. */

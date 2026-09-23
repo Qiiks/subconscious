@@ -669,7 +669,7 @@ export class SubcProvider {
         if (!handle) return false;
         this.liveRoutes.delete(handle.channel);
         this.abortHandle(handle);
-        await this.opts.onRouteGone?.(handle);
+        await this.reportRouteGone(handle);
         return true;
       case FrameType.Cancel:
         if (handle) this.inflight.get(routeKey(handle, frame.header.corr))?.abort();
@@ -687,6 +687,22 @@ export class SubcProvider {
         return true;
       default:
         return true;
+    }
+  }
+
+  /**
+   * Invoke the consumer's route-gone callback without letting it break the
+   * read loop. Every call site is awaited on the read loop's path, so a throw
+   * escaping from it is read as an unexpected connection drop and tears down
+   * every route on the connection; report and absorb it here instead, the same
+   * way a failing request handler is reported.
+   */
+  private async reportRouteGone(handle: RouteHandle): Promise<void> {
+    if (!this.opts.onRouteGone) return;
+    try {
+      await this.opts.onRouteGone(handle);
+    } catch (error) {
+      console.warn("SubcProvider route-gone callback failed", error);
     }
   }
 
@@ -762,7 +778,7 @@ export class SubcProvider {
       }
       this.liveRoutes.delete(stale.channel);
       this.abortHandle(stale);
-      await this.opts.onRouteGone?.(stale);
+      await this.reportRouteGone(stale);
     }
     const tentative = createRouteHandle(boundChannel, boundEpoch, this.connectionToken);
     const bindRequest: RouteBindRequest = {
@@ -787,7 +803,7 @@ export class SubcProvider {
           generation,
         );
       } finally {
-        await this.opts.onRouteGone?.(tentative);
+        await this.reportRouteGone(tentative);
       }
       return;
     }
@@ -796,7 +812,7 @@ export class SubcProvider {
       try {
         await this.sendError(frame, rejection.code, rejection.message, controlFlags(), sock, generation);
       } finally {
-        await this.opts.onRouteGone?.(tentative);
+        await this.reportRouteGone(tentative);
       }
       return;
     }
@@ -816,12 +832,12 @@ export class SubcProvider {
         ),
       );
     } catch (error) {
-      await this.opts.onRouteGone?.(tentative);
+      await this.reportRouteGone(tentative);
       throw error;
     }
 
     if (this.sock !== sock || this.generation !== generation || this.closeStarted || this.closedErr) {
-      await this.opts.onRouteGone?.(tentative);
+      await this.reportRouteGone(tentative);
       return;
     }
     this.liveRoutes.set(tentative.channel, tentative);
