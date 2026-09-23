@@ -277,6 +277,8 @@ Row contents.
 
 ## Open questions
 
+**Correction, 2026-09-23: the four `ckcred-*` gates have no owner.** Chair ruling R2 named CKCRED as their owner. CKCRED has no record of agreeing to build them and never did, and SUBC recorded the owner without confirming. Read from claustrum master `bbd370f`: none of the four exists, none is in flight, and each crosses a boundary the vault holds on purpose. Mint and delete would give a module principal write and delete on records that today only a master-key-gated admin path can create or remove; a caller-supplied name reopens the prefix-grant problem. Audit read would publish an untrimmable HMAC-linked chain over the bus, a disclosure decision. A `Clamped` limiter inverts a ruling that the read-path limiter alarms and never refuses, because a refusing heuristic limiter is a denial-of-service lever. So these are design questions for the operator, CKCRED and ALF, not a queued delivery, and every row gated on them is blocked on a design, not a date. Open alternative, to answer before anyone builds a mint path: ck-bus obtains its own credential by a one-time operator ceremony (`ck auth mint-signing-key` plus a grant) instead of minting at runtime, which may remove the need for runtime mint and delete altogether. The text below is kept as written and is superseded by this paragraph where they disagree.
+
 None live. CKCRED's four vault ops are carried as a named gate in the constraints, not as a question: as of claustrum 7118e35 none has landed, every slice that needs one runs against F-PROV under its named skip, and the gate flips to gating when CKCRED pings the op names. The order in which they land changes a gate's state, never the slice plan.
 
 ## Chair rulings (normative)
