@@ -486,14 +486,21 @@ async fn pump_lines_into<R, S>(
     }
 }
 
-/// Bytes examined by newline searches, summed across a pump. Tests use this to
-/// assert the reader does not rescan bytes it already knows contain no newline.
+// Bytes examined by newline searches, summed across a pump. Tests use this to
+// assert the reader does not rescan bytes it already knows contain no newline.
+// Per thread, not process-wide: other tests pump concurrently on their own
+// threads, and a shared counter picked up their searches too, failing the
+// bound by a few bytes under a parallel run. `#[tokio::test]` runs its body
+// and every future it awaits on one thread, so a pump's searches land on the
+// test's own counter.
 #[cfg(test)]
-static SCANNED_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static SCANNED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[cfg(test)]
 fn take_scanned_bytes() -> usize {
-    SCANNED_BYTES.swap(0, Ordering::Relaxed)
+    SCANNED_BYTES.with(|scanned| scanned.replace(0))
 }
 
 /// Locate the next newline in `haystack`, counting the bytes examined so a
@@ -501,10 +508,9 @@ fn take_scanned_bytes() -> usize {
 fn find_newline(haystack: &[u8]) -> Option<usize> {
     let found = memchr::memchr(b'\n', haystack);
     #[cfg(test)]
-    SCANNED_BYTES.fetch_add(
-        found.map(|index| index + 1).unwrap_or(haystack.len()),
-        Ordering::Relaxed,
-    );
+    SCANNED_BYTES.with(|scanned| {
+        scanned.set(scanned.get() + found.map(|index| index + 1).unwrap_or(haystack.len()));
+    });
     found
 }
 

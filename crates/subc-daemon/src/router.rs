@@ -489,7 +489,15 @@ impl Router {
                     return Ok(());
                 }
 
+                // A terminal frame ends the request at the module whether or not
+                // the client can still take it, so its credit is released before
+                // delivery is attempted. Releasing only after a successful
+                // enqueue would leave a drain counting a finished request until
+                // the client connection's cleanup removes the route.
                 let releases_credit = is_terminal_frame(frame.header.ty);
+                if releases_credit {
+                    route.flow.release_corr(corr);
+                }
                 let mut frame = frame;
                 frame.header.channel = route.client_channel;
                 frame.header.epoch = route.client_epoch;
@@ -514,9 +522,6 @@ impl Router {
                             .increment_client_egress_close_delivery_failed();
                     }
                     return Ok(());
-                }
-                if releases_credit {
-                    route.flow.release_corr(corr);
                 }
                 return Ok(());
             }
@@ -1249,6 +1254,92 @@ mod tests {
         assert_eq!(
             router.counters.snapshot()["client_egress_close_delivery_failed"],
             1
+        );
+    }
+
+    /// A terminal frame ends the request at the module even when the client
+    /// cannot take it, so the drain must stop counting it at once rather than
+    /// when the client connection's cleanup later removes the route.
+    #[tokio::test]
+    async fn terminal_frame_releases_its_credit_even_when_client_delivery_fails() {
+        let forwarding = Arc::new(ForwardingTable::default());
+        let control = Arc::new(ControlHandler::with_forwarding(
+            Arc::new(crate::Registry::default()),
+            Arc::clone(&forwarding),
+        ));
+        let router = Router::with_control_handler(control);
+        let module_connection = ConnectionId::new(11);
+        let client_connection = ConnectionId::new(21);
+        let _close_receiver = forwarding.register_connection_close(client_connection);
+        let (module_tx, _module_rx) = mpsc::channel(1);
+        forwarding
+            .register_module_connection(
+                module_connection,
+                "credit-provider".to_string(),
+                1,
+                Concurrency::ModuleManaged,
+                FrameSink::new(module_tx),
+            )
+            .unwrap();
+        // Capacity one, filled by the route.open response, so the terminal
+        // frame below cannot be enqueued for the client.
+        let (client_tx, _client_rx) = mpsc::channel(1);
+        let pending = forwarding
+            .begin_route_bind_relay_for_test(
+                client_connection,
+                FrameSink::new(client_tx),
+                800,
+                "credit-provider",
+            )
+            .unwrap();
+        forwarding
+            .complete_pending_relay(
+                module_connection,
+                pending.corr,
+                RouteBindRelayOutcome::Accepted,
+            )
+            .unwrap();
+        let DataRoute::Client(DataRouteState::Bound(route)) = forwarding
+            .lookup_data_route(
+                client_connection,
+                pending.client_channel,
+                pending.client_epoch,
+            )
+            .unwrap()
+        else {
+            panic!("expected a bound client route");
+        };
+        route.flow.acquire_tagged(801, false).await.unwrap();
+        assert_eq!(route.flow.drain_in_flight(), 1);
+
+        let (module_egress_tx, _module_egress_rx) = mpsc::channel(1);
+        let module_ctx = RouteCtx {
+            connection_id: module_connection,
+            egress: FrameSink::new(module_egress_tx),
+        };
+        let terminal = Frame::build(
+            FrameType::Response,
+            Flags::new(false, Priority::Interactive, true),
+            pending.module_channel,
+            pending.module_epoch,
+            801,
+            b"terminal".to_vec(),
+        )
+        .unwrap();
+        router
+            .route_for_connection(&module_ctx, terminal)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            router.counters.snapshot()["client_egress_close_delivery_failed"],
+            1,
+            "the client delivery must have failed for this test to mean anything"
+        );
+        assert_eq!(
+            route.flow.drain_in_flight(),
+            0,
+            "the module's terminal frame must release its credit even though the client could not take it"
         );
     }
 
