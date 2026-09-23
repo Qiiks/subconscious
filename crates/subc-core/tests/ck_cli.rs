@@ -1770,7 +1770,10 @@ async fn module_logs_merges_sources_by_timestamp_and_reports_real_filter_counts(
     .unwrap();
     fs::write(
         run_logs.join(format!("{module_id}.stderr.log")),
-        format!("2026-09-05T10:00:04.000Z ERROR {module_id} captured line\n"),
+        // Genuinely raw child output: a Rust panic line carries no timestamp
+        // or level. (An r1-shaped line here would now parse, correctly, since
+        // pre-adoption modules wrote r1 to stderr.)
+        "thread 'main' panicked at src/main.rs:12:5: captured line\n",
     )
     .unwrap();
     fs::write(
@@ -1808,7 +1811,7 @@ async fn module_logs_merges_sources_by_timestamp_and_reports_real_filter_counts(
             "mod          2026-09-05T10:00:01.000Z INFO  merged-logs: [harness=opencode] plugin line\n",
             "daemon       2026-09-05T10:00:02.000Z WARN  subc: daemon line module_id=merged-logs\n",
             "mod          2026-09-05T10:00:03.000Z INFO  merged-logs.perf: module line ms=7\n",
-            "stderr       2026-09-05T10:00:04.000Z ERROR merged-logs captured line\n"
+            "stderr       thread 'main' panicked at src/main.rs:12:5: captured line\n"
         )
     );
     assert_eq!(
