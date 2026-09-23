@@ -187,10 +187,17 @@ where
 }
 
 fn accept_resource_exhausted(error: &io::Error) -> bool {
-    // Unix ENFILE/EMFILE and macOS/Linux ENOBUFS; Winsock WSAEMFILE/WSAENOBUFS.
+    // ENFILE/EMFILE/ENOBUFS by name rather than number: the numbers differ by
+    // platform (ENOBUFS is 55 on macOS and 105 on Linux, and each number means
+    // something unrelated on the other), so a literal list misclassifies.
+    // Winsock: WSAEMFILE and WSAENOBUFS.
     #[cfg(unix)]
     {
-        matches!(error.raw_os_error(), Some(23 | 24 | 55 | 105))
+        use rustix::io::Errno;
+        let exhausted = [Errno::NFILE, Errno::MFILE, Errno::NOBUFS];
+        error
+            .raw_os_error()
+            .is_some_and(|code| exhausted.iter().any(|e| e.raw_os_error() == code))
     }
     #[cfg(windows)]
     {
@@ -481,7 +488,8 @@ where
 
         // Keep the same read future when a route.open completes: read_frame owns
         // partial header/body buffers that would be lost if that future were dropped.
-        let mut read = Box::pin(read_frame(&mut *read_half));
+        let read = read_frame(&mut *read_half);
+        tokio::pin!(read);
         let frame = loop {
             tokio::select! {
                 close = &mut close_receiver => {
@@ -1471,7 +1479,13 @@ mod tests {
             auth,
             move || {
                 attempts += 1;
-                let error = (attempts == 1).then(|| io::Error::from_raw_os_error(24));
+                // The platform's "too many open files" code: EMFILE on Unix,
+                // WSAEMFILE on Windows. A bare 24 is ERROR_BAD_LENGTH on Windows.
+                #[cfg(unix)]
+                let emfile = rustix::io::Errno::MFILE.raw_os_error();
+                #[cfg(windows)]
+                let emfile = 10024;
+                let error = (attempts == 1).then(|| io::Error::from_raw_os_error(emfile));
                 let listener = Arc::clone(&listener);
                 async move {
                     match error {
