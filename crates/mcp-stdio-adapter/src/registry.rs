@@ -241,7 +241,13 @@ fn parse_server(
             env,
             idle_ttl_ms,
             disabled: raw.disabled,
-            deadline_ms: raw.deadline_ms.unwrap_or(DEFAULT_DEADLINE_MS),
+            // A zero deadline now bounds the child read, so it can no longer
+            // pass through silently: treat it as unset rather than failing
+            // every call instantly.
+            deadline_ms: raw
+                .deadline_ms
+                .filter(|value| *value != 0)
+                .unwrap_or(DEFAULT_DEADLINE_MS),
             frame_ceiling_bytes: raw
                 .frame_ceiling_bytes
                 .unwrap_or(DEFAULT_FRAME_CEILING_BYTES),
@@ -390,6 +396,7 @@ mod tests {
                 "cache_tools_list": false,
               },
               "defaults": { "command": "defaults" },
+              "zero-deadline": { "command": "zero", "deadline_ms": 0 },
             }
             "#,
         )
@@ -412,6 +419,8 @@ mod tests {
         assert_eq!(github.deadline_ms, 45_000);
         assert_eq!(github.frame_ceiling_bytes, 8192);
         assert!(!github.cache_tools_list);
+        let zero_deadline = &registry.servers()["zero-deadline"];
+        assert_eq!(zero_deadline.deadline_ms, DEFAULT_DEADLINE_MS);
         let defaults = &registry.servers()["defaults"];
         assert_eq!(defaults.deadline_ms, DEFAULT_DEADLINE_MS);
         assert_eq!(defaults.frame_ceiling_bytes, DEFAULT_FRAME_CEILING_BYTES);

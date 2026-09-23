@@ -1,6 +1,6 @@
 [package]
 name = "mcp-stdio-adapter"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -19,3 +19,4 @@ subc-client-rs = { path = "../subc-client-rs" }
 subc-jsonc = { path = "../subc-jsonc" }
 subc-protocol = { path = "../subc-protocol" }
 tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+tokio-util = "0.7"

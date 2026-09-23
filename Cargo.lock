@@ -1074,7 +1074,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-stdio-adapter"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "cortexkit-log",
  "serde",
@@ -1083,6 +1083,7 @@ dependencies = [
  "subc-jsonc",
  "subc-protocol",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 

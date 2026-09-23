@@ -27,6 +27,12 @@ fn main() {
             );
             continue;
         }
+        if mode == "hang" {
+            // Simulate a wedged child: the request is consumed from stdin but
+            // no response frame is ever written, while the process stays alive
+            // and keeps its pipes open.
+            continue;
+        }
         if mode == "oversized" {
             write_frame(
                 &mut stdout,

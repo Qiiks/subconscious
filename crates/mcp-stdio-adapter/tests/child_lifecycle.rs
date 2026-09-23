@@ -12,6 +12,7 @@ use mcp_stdio_adapter::{
 };
 use serde_json::{json, Value};
 use subc_client_rs::{async_trait, HandlerOutcome};
+use tokio_util::sync::CancellationToken;
 
 struct RotatingResolver {
     value: Mutex<String>,
@@ -141,10 +142,20 @@ fn declare(expected: &mut BTreeMap<String, String>, key: &str, value: &str) {
     expected.insert(key.to_string(), value.to_string());
 }
 
-async fn evict_after_test_ttl() {
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
+/// Waits until the slot's eviction timer has actually fired. The re-armed
+/// timer needs a few scheduler rounds to observe the zero test TTL, so a fixed
+/// yield count is not enough under load.
+async fn evict_after_test_ttl(handler: &AdapterHandler, expected_evictions: u64) {
+    for _ in 0..400 {
+        let evictions = handler.metrics().snapshot()["idle_evictions_total"]
+            .as_u64()
+            .unwrap();
+        if evictions >= expected_evictions {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
+    panic!("idle eviction count did not reach {expected_evictions}");
 }
 
 #[tokio::test]
@@ -183,7 +194,7 @@ async fn real_stdio_child_is_lazily_spawned_isolated_and_resolved_again_after_id
     assert!(!child_environment.contains_key("SUBC_MODULE_ID"));
     assert!(!child_environment.contains_key("SUBC_LAUNCH_NONCE"));
 
-    evict_after_test_ttl().await;
+    evict_after_test_ttl(&handler, 1).await;
 
     resolver.rotate("second-secret");
     let second = call(
@@ -200,7 +211,7 @@ async fn real_stdio_child_is_lazily_spawned_isolated_and_resolved_again_after_id
     assert_eq!(handler.metrics().snapshot()["idle_evictions_total"], 1);
     assert_eq!(resolver.calls(), 2);
 
-    evict_after_test_ttl().await;
+    evict_after_test_ttl(&handler, 2).await;
 }
 
 #[tokio::test]
@@ -240,6 +251,109 @@ async fn vault_miss_spawn_failed_refusal_fence_names_variable_not_handle_or_secr
 }
 
 #[tokio::test]
+async fn wedged_child_call_ends_at_deadline_and_later_calls_are_not_queued_behind_it() {
+    let handler = AdapterHandler::with_resolver(
+        registry(json!({"wedged": {
+            "command": fixture_path(),
+            "deadline_ms": 400,
+            "env": {"FIXTURE_MODE": {"value": "hang"}}
+        }})),
+        Arc::new(MissingResolver),
+        test_settings(),
+    );
+
+    // The first call wedges inside the child; the second starts while the
+    // first is still waiting, so it can only complete if the wedged wait ends
+    // and releases the per-server lane.
+    let (first, second) = tokio::join!(
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            refusal(&handler, "wedged", "tools/call")
+        ),
+        async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::timeout(
+                Duration::from_secs(20),
+                refusal(&handler, "wedged", "tools/call"),
+            )
+            .await
+        }
+    );
+
+    let (code, _detail) = first.expect("first call must end at the configured deadline, not hang");
+    assert_eq!(code, "call_outcome_unknown");
+    let (code, _detail) = second.expect("second call must not queue behind the wedged session");
+    assert_eq!(code, "call_outcome_unknown");
+    assert_eq!(handler.metrics().snapshot()["children_live"], 0);
+}
+
+#[tokio::test]
+async fn cancelled_call_stops_waiting_on_a_wedged_child() {
+    let handler = AdapterHandler::with_resolver(
+        registry(json!({"wedged": {
+            "command": fixture_path(),
+            "deadline_ms": 60000,
+            "env": {"FIXTURE_MODE": {"value": "hang"}}
+        }})),
+        Arc::new(MissingResolver),
+        test_settings(),
+    );
+    let metrics = Arc::clone(handler.metrics());
+    let token = CancellationToken::new();
+    let cancel = token.clone();
+    let call = tokio::spawn(async move {
+        handler
+            .route_outcome_with_cancellation(
+                &serde_json::to_vec(&json!({
+                    "server": "wedged",
+                    "op": "tools/call",
+                    "payload": { "method": "tools/call" },
+                }))
+                .unwrap(),
+                cancel,
+            )
+            .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    token.cancel();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), call)
+        .await
+        .expect("a cancelled call must stop waiting on the child")
+        .expect("call task must not panic");
+    let HandlerOutcome::ErrorWithDetail { code, .. } = outcome else {
+        panic!("cancelled call must end as a refusal: {outcome:?}");
+    };
+    assert_eq!(code, "call_outcome_unknown");
+    assert_eq!(metrics.snapshot()["children_live"], 0);
+}
+
+#[tokio::test]
+async fn idle_eviction_keeps_one_timer_task_per_server_across_calls() {
+    let handler = AdapterHandler::with_resolver(
+        registry(json!({
+            "one": server(json!({"FIXTURE_MODE": {"value": "normal"}})),
+            "two": server(json!({"FIXTURE_MODE": {"value": "normal"}})),
+        })),
+        Arc::new(MissingResolver),
+        LifecycleSettings {
+            // Long production TTL: the timers stay asleep for the whole test,
+            // so every live timer is observable in the metric.
+            idle_ttl_override: None,
+            ..test_settings()
+        },
+    );
+
+    for _ in 0..3 {
+        call(&handler, "one", "tools/call", json!({})).await;
+    }
+    assert_eq!(handler.metrics().snapshot()["eviction_timers_live"], 1);
+
+    call(&handler, "two", "tools/call", json!({})).await;
+    assert_eq!(handler.metrics().snapshot()["eviction_timers_live"], 2);
+}
+
+#[tokio::test]
 async fn framing_kill_refusal_fence_names_the_ceiling_and_other_server_remains_live() {
     let handler = AdapterHandler::with_resolver(
         registry(json!({
@@ -263,5 +377,5 @@ async fn framing_kill_refusal_fence_names_the_ceiling_and_other_server_remains_l
     let normal = call(&handler, "normal", "tools/list", json!({})).await;
     assert_eq!(normal["payload"]["tools"][0]["name"], "fixture");
 
-    evict_after_test_ttl().await;
+    evict_after_test_ttl(&handler, 1).await;
 }

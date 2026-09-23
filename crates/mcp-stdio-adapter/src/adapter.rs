@@ -22,9 +22,10 @@ use subc_protocol::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
-    sync::Mutex as AsyncMutex,
-    time::{sleep, timeout},
+    sync::{Mutex as AsyncMutex, Notify},
+    time::{sleep_until, timeout, Instant as TokioInstant},
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     constants::{
@@ -54,6 +55,7 @@ pub struct HealthMetrics {
     spawns_total: AtomicU64,
     spawn_failures_total: AtomicU64,
     idle_evictions_total: AtomicU64,
+    eviction_timers_live: AtomicU64,
     calls_in_flight: AtomicU64,
     oldest_in_flight_ms: AtomicU64,
     cache_served_total: AtomicU64,
@@ -67,6 +69,7 @@ impl Default for HealthMetrics {
             spawns_total: AtomicU64::new(0),
             spawn_failures_total: AtomicU64::new(0),
             idle_evictions_total: AtomicU64::new(0),
+            eviction_timers_live: AtomicU64::new(0),
             calls_in_flight: AtomicU64::new(0),
             oldest_in_flight_ms: AtomicU64::new(0),
             cache_served_total: AtomicU64::new(0),
@@ -82,6 +85,7 @@ impl HealthMetrics {
             "spawns_total": self.spawns_total.load(Ordering::Relaxed),
             "spawn_failures_total": self.spawn_failures_total.load(Ordering::Relaxed),
             "idle_evictions_total": self.idle_evictions_total.load(Ordering::Relaxed),
+            "eviction_timers_live": self.eviction_timers_live.load(Ordering::Relaxed),
             "calls_in_flight": self.calls_in_flight.load(Ordering::Relaxed),
             "oldest_in_flight_ms": oldest_in_flight_age_ms(
                 self.calls_in_flight.load(Ordering::Relaxed),
@@ -230,6 +234,17 @@ impl AdapterHandler {
     /// Processes one route envelope without requiring a daemon RequestCtx. This keeps
     /// real-child lifecycle tests focused on the adapter boundary rather than the daemon.
     pub async fn route_outcome(&self, body: &[u8]) -> HandlerOutcome {
+        self.route_outcome_with_cancellation(body, CancellationToken::new())
+            .await
+    }
+
+    /// Processes one route envelope like [`Self::route_outcome`], ending any in-progress
+    /// child wait early when the cancellation token fires (daemon CANCEL or route teardown).
+    pub async fn route_outcome_with_cancellation(
+        &self,
+        body: &[u8],
+        cancel: CancellationToken,
+    ) -> HandlerOutcome {
         let request = match parse_envelope(body) {
             Ok(request) => request,
             Err(error) => return error.into_handler_outcome(),
@@ -263,7 +278,13 @@ impl AdapterHandler {
         let _flight = FlightGuard::new(Arc::clone(&self.metrics));
         match self
             .lifecycle
-            .forward(&request.server, config, request.op, request.payload)
+            .forward(
+                &request.server,
+                config,
+                request.op,
+                request.payload,
+                &cancel,
+            )
             .await
         {
             Ok(forwarded) => {
@@ -290,8 +311,9 @@ impl AdapterHandler {
 
 #[async_trait]
 impl ModuleHandler for AdapterHandler {
-    async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
-        self.route_outcome(&body).await
+    async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+        self.route_outcome_with_cancellation(&body, ctx.cancellation_token())
+            .await
     }
 
     async fn health(&self) -> HealthReport {
@@ -361,6 +383,7 @@ impl ChildLifecycle {
         config: ServerConfig,
         operation: Operation,
         payload: Value,
+        cancel: &CancellationToken,
     ) -> Result<ForwardedResponse, LifecycleError> {
         let attempts = if operation == Operation::ToolsList {
             2
@@ -369,10 +392,16 @@ impl ChildLifecycle {
         };
         for attempt in 0..attempts {
             match self
-                .forward_once(server, &config, operation, payload.clone())
+                .forward_once(server, &config, operation, payload.clone(), cancel)
                 .await
             {
-                Err(LifecycleError::CallOutcomeUnknown) if attempt + 1 < attempts => continue,
+                // A cancelled caller is gone for good: respawning a child for a
+                // retry nobody waits on would only churn processes.
+                Err(LifecycleError::CallOutcomeUnknown)
+                    if attempt + 1 < attempts && !cancel.is_cancelled() =>
+                {
+                    continue
+                }
                 result => return result,
             }
         }
@@ -385,6 +414,7 @@ impl ChildLifecycle {
         config: &ServerConfig,
         _operation: Operation,
         payload: Value,
+        cancel: &CancellationToken,
     ) -> Result<ForwardedResponse, LifecycleError> {
         let slot = self.slot(server);
         let mut state = slot.state.lock().await;
@@ -404,7 +434,24 @@ impl ChildLifecycle {
             return Err(LifecycleError::CallOutcomeUnknown);
         }
 
-        let response = match read_response(session, child_id, config.frame_ceiling_bytes).await {
+        // The per-server lane is held for the whole wait, so the read must be
+        // bounded: a child that accepts the request and never replies would
+        // otherwise block every later call to this server (and the eviction
+        // timer) until the adapter restarts. Deadline expiry and caller
+        // cancellation both land on TimedOut, which tears the session down:
+        // the request may already be running inside the child, so its outcome
+        // is unknown and the session cannot be reused. The child is then
+        // terminated, so a late reply dies with the process instead of
+        // landing on a session nobody reads.
+        let deadline = Duration::from_millis(config.deadline_ms);
+        let read = timeout(
+            deadline,
+            read_response(session, child_id, config.frame_ceiling_bytes),
+        );
+        let response = match tokio::select! {
+            result = read => result.unwrap_or(Err(FrameReadError::TimedOut)),
+            () = cancel.cancelled() => Err(FrameReadError::TimedOut),
+        } {
             Ok(response) => response,
             Err(FrameReadError::Framing { observed_bytes }) => {
                 self.remove_session(&mut state).await;
@@ -426,13 +473,12 @@ impl ChildLifecycle {
                 ceiling_bytes: config.frame_ceiling_bytes,
             });
         };
-        let generation = session.generation;
         session.last_idle = Instant::now();
         let ttl = self
             .settings
             .idle_ttl_override
             .unwrap_or_else(|| Duration::from_millis(config.idle_ttl_ms));
-        self.schedule_idle_eviction(Arc::clone(&slot), generation, ttl);
+        self.schedule_idle_eviction(Arc::clone(&slot), &mut state, ttl);
 
         Ok(ForwardedResponse {
             payload,
@@ -508,13 +554,10 @@ impl ChildLifecycle {
         self.metrics.children_live.fetch_add(1, Ordering::Relaxed);
         let stdin = child.stdin.take().expect("piped stdin is present");
         let stdout = child.stdout.take().expect("piped stdout is present");
-        let generation = state.next_generation;
-        state.next_generation = state.next_generation.saturating_add(1);
         let mut session = ChildSession {
             child,
             stdin: Some(stdin),
             stdout: BufReader::new(stdout),
-            generation,
             next_id: 1,
             last_idle: Instant::now(),
         };
@@ -612,54 +655,109 @@ impl ChildLifecycle {
         self.metrics.children_live.fetch_sub(1, Ordering::Relaxed);
     }
 
+    /// Re-arms the slot's single eviction timer after a successful call. The
+    /// timer task is spawned on first use and then kept: one sleeping task per
+    /// server no matter how many calls complete, instead of one extra sleeper
+    /// per call for the full TTL.
     fn schedule_idle_eviction(
         self: &Arc<Self>,
         slot: Arc<ServerSlot>,
-        generation: u64,
+        state: &mut SlotState,
         ttl: Duration,
     ) {
-        let lifecycle = Arc::clone(self);
-        tokio::spawn(async move {
-            // A zero duration exists only in the injected test clock. Production TTLs
-            // are normalized by the registry, so skipping the timer yield here cannot
-            // make an operator-configured child immediately idle-eligible.
-            if !ttl.is_zero() {
-                sleep(ttl).await;
+        state.eviction_ttl = ttl;
+        if state.eviction_timer.is_none() {
+            let task = tokio::spawn(run_idle_eviction_timer(Arc::clone(self), Arc::clone(&slot)));
+            state.eviction_timer = Some(task.abort_handle());
+            self.metrics
+                .eviction_timers_live
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        slot.eviction_wakeup.notify_one();
+    }
+}
+
+/// The slot's long-lived eviction timer. Each iteration parks until either the
+/// current session's idle deadline passes or a completed call re-arms the
+/// deadline, so the task count stays at one per slot instead of growing with
+/// call rate.
+async fn run_idle_eviction_timer(lifecycle: Arc<ChildLifecycle>, slot: Arc<ServerSlot>) {
+    let _live = EvictionTimerGuard::new(Arc::clone(&lifecycle.metrics));
+    loop {
+        let wake_at = {
+            let state = slot.state.lock().await;
+            state
+                .session
+                .as_ref()
+                .map(|session| session.last_idle + state.eviction_ttl)
+        };
+        let Some(wake_at) = wake_at else {
+            // No live session: park until the next completed call re-arms.
+            slot.eviction_wakeup.notified().await;
+            continue;
+        };
+        tokio::select! {
+            () = sleep_until(TokioInstant::from_std(wake_at)) => {
+                let mut state = slot.state.lock().await;
+                // Re-checking last_idle under the lock covers a call that
+                // finished between the deadline passing and this wakeup.
+                let eligible = state.session.as_ref().is_some_and(|session| {
+                    session.last_idle.elapsed() >= state.eviction_ttl
+                });
+                if eligible {
+                    lifecycle.remove_session(&mut state).await;
+                    lifecycle
+                        .metrics
+                        .idle_evictions_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
-            let mut state = slot.state.lock().await;
-            let eligible = state.session.as_ref().is_some_and(|session| {
-                session.generation == generation && session.last_idle.elapsed() >= ttl
-            });
-            if eligible {
-                lifecycle.remove_session(&mut state).await;
-                lifecycle
-                    .metrics
-                    .idle_evictions_total
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-        });
+            // A call completed: recompute the deadline from the fresh last_idle.
+            () = slot.eviction_wakeup.notified() => {}
+        }
+    }
+}
+
+/// Keeps the live-timer metric honest if the timer task is ever aborted (for
+/// example by runtime shutdown).
+struct EvictionTimerGuard {
+    metrics: Arc<HealthMetrics>,
+}
+
+impl EvictionTimerGuard {
+    fn new(metrics: Arc<HealthMetrics>) -> Self {
+        Self { metrics }
+    }
+}
+
+impl Drop for EvictionTimerGuard {
+    fn drop(&mut self) {
+        self.metrics
+            .eviction_timers_live
+            .fetch_sub(1, Ordering::Relaxed);
     }
 }
 
 #[derive(Default)]
 struct ServerSlot {
     state: AsyncMutex<SlotState>,
+    eviction_wakeup: Notify,
 }
 
 #[derive(Default)]
 struct SlotState {
     session: Option<ChildSession>,
-    next_generation: u64,
     consecutive_failures: u64,
     cooldown_until: Option<Instant>,
     last_failure_cause: Option<SpawnFailureCause>,
+    eviction_ttl: Duration,
+    eviction_timer: Option<tokio::task::AbortHandle>,
 }
 
 struct ChildSession {
     child: Child,
     stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
-    generation: u64,
     next_id: u64,
     last_idle: Instant,
 }
@@ -1222,6 +1320,7 @@ mod tests {
             "spawns_total",
             "spawn_failures_total",
             "idle_evictions_total",
+            "eviction_timers_live",
             "calls_in_flight",
             "oldest_in_flight_ms",
             "cache_served_total",
