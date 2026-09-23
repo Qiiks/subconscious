@@ -108,7 +108,7 @@
       "event": { "at_ms": 1788604875000, "level": "warn", "logger": "aft.lsp", "bound": [],
                  "message": "server said", "fields": [["text", "x\u001b]title"], ["code", "2"]] },
       "line": "2026-09-05T10:41:15.000Z WARN  aft.lsp: server said text=\"x\\u001b]title\" code=2",
-      "note": "the r2.0 defect: a whole-line strip read ESC ] as an OSC and consumed the closing quote and code=2. Per-field handling keeps every later field"
+      "note": "the defect before cortexkit-log 0.3.3 / @cortexkit/log 0.2.1: a whole-line strip read ESC ] as an OSC and consumed the closing quote and code=2. Per-field handling keeps every later field"
     },
     {
       "name": "complete-csi-in-message-is-stripped",
@@ -151,7 +151,7 @@
       { "name": "github-classic", "input": "ghp_AbC123 gho_Def456", "output": "[REDACTED] [REDACTED]" },
       { "name": "url-userinfo-password", "input": "clone https://user:hunter2@example.com/org/repo", "output": "clone https://[REDACTED]@example.com/org/repo" },
       { "name": "url-userinfo-token-only", "input": "clone https://x-access-token@github.com/o/r", "output": "clone https://[REDACTED]@github.com/o/r" },
-      { "name": "url-query-access-token", "input": "GET https://api.example.com/v1?access_token=abc123&page=2", "output": "GET https://api.example.com/v1?access_token=[REDACTED]&page=2", "note": "AFT: a generic key=value rule misses this because https: matches as the key" },
+      { "name": "url-query-access-token", "input": "GET https://api.example.com/v1?access_token=abc123&page=2", "output": "GET https://api.example.com/v1?access_token=[REDACTED]&page=2", "note": "a generic key=value rule misses this because https: matches as the key" },
       { "name": "quoted-url-query-api-key", "input": "url=\"https://h.example/p?x=1&api_key=Z9y8\"", "output": "url=\"https://h.example/p?x=1&api_key=[REDACTED]\"" },
       { "name": "query-value-with-escaped-quote-stays-balanced", "input": "url=\"https://h.example/p?token=ab\\\"cd&x=1\"", "output": "url=\"https://h.example/p?token=[REDACTED]&x=1\"", "note": "inside a quoted field a quote in the value is written \\\"; the value consumes backslash pairs, so the field's closing quote is never left unbalanced" },
       { "name": "authorization-bearer", "input": "Authorization: Bearer abc.def", "output": "Authorization: [REDACTED]" },

@@ -128,8 +128,9 @@ line:
 3. A value that contains any escape is quoted, like one containing a space.
 
 The guard after a module's redactor escapes any raw control character the
-redactor introduces the same way; it never strips. Stripping on the whole line
-was the r2.0 behaviour and it lost data: a stray `ESC ]` in one value began an
+redactor introduces the same way; it never strips. Stripping on the whole line,
+as both twins did before `cortexkit-log` 0.3.3 and `@cortexkit/log` 0.2.1, lost
+data: a stray `ESC ]` in one value began an
 OSC that consumed the rest of that value, its closing quote and every field
 after it, up to a terminator that never came. A rendered line therefore never
 contains a raw control character, which is what the `ansi-in-line` parse
@@ -324,9 +325,9 @@ write. The fleet default redacts, and both twins pin it with the fixture's
 - URL userinfo, `scheme://user:pass@host` or `scheme://token@host`, to
   `scheme://[REDACTED]@host`;
 - credential query parameters (`access_token`, `token`, `api_key`, `apikey`,
-  `password`, `secret`, `client_secret`) after `?` or `&`, value only. AFT found
-  that a generic `key=value` rule misses `?access_token=` inside a URL because
-  `https:` matches as the key, which is why the query rule is its own pattern.
+  `password`, `secret`, `client_secret`) after `?` or `&`, value only. A generic
+  `key=value` rule misses `?access_token=` inside a URL because `https:` matches
+  as the key, which is why the query rule is its own pattern.
 
 A module composes its own on top (MC's sanitizer; claustrum's hand-written redacting
 `Debug` impls remain the first line of defence). A module MUST NOT log prompt
