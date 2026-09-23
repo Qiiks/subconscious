@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.18.2 — 2026-09-23
+
+- `PolicyResolver` releases a subject's state once its verdicts expire: expired
+  cache entries are removed, and the subject's resolver route is closed and its
+  `policy.subscribe` task aborted. Before, both grew with every subject seen.
+- Add `PolicyResolver::footprint` and `PolicyResolverFootprint` (entries, held
+  routes, running subscription tasks).
+
 ## 0.7.2 — 2026-08-24
 
 - Add capability-addressed provider resolution from the catalog capabilities mirror.
