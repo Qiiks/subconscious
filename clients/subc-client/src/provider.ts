@@ -697,6 +697,23 @@ export class SubcProvider {
    * every route on the connection; report and absorb it here instead, the same
    * way a failing request handler is reported.
    */
+  /**
+   * Invoke the consumer's bound callback without letting it break the read
+   * loop. By the time it runs the bind is acknowledged and the route installed,
+   * so a throw here is a failure of the consumer's setup for THIS route, and
+   * letting it escape would be read as an unexpected connection drop and tear
+   * down every other route on the connection. The route stays bound: the
+   * daemon already considers it live, and the consumer can close it.
+   */
+  private async reportRouteBound(handle: RouteHandle): Promise<void> {
+    if (!this.opts.onBound) return;
+    try {
+      await this.opts.onBound(handle);
+    } catch (error) {
+      console.warn("SubcProvider bound callback failed", error);
+    }
+  }
+
   private async reportRouteGone(handle: RouteHandle): Promise<void> {
     if (!this.opts.onRouteGone) return;
     try {
@@ -841,7 +858,7 @@ export class SubcProvider {
       return;
     }
     this.liveRoutes.set(tentative.channel, tentative);
-    await this.opts.onBound?.(tentative);
+    await this.reportRouteBound(tentative);
   }
 
   private async handleDataRequest(

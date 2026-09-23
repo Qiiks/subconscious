@@ -436,6 +436,30 @@ describe("provider bind publication and unknown-slot precedence", () => {
     expect((socket.writes[1]!.header.flags >> 4) & 0b11).toBe(AdmissionClass.Expedite);
   });
 
+  test("a throwing onBound is reported and the bound route stays installed", async () => {
+    // onBound is consumer code awaited inside the read loop. If its throw
+    // escaped, the read loop would read it as an unexpected drop and tear down
+    // every route on the connection, not just this one.
+    const { internals, socket } = providerHarness();
+    internals.opts.onBind = () => true;
+    internals.opts.onBound = () => {
+      throw new Error("consumer setup broke");
+    };
+    const warnings: unknown[][] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args);
+    };
+    try {
+      await expect(internals.handleControlRequest(bindFrame(20, 9), socket, 1)).resolves.toBeUndefined();
+      expect(internals.liveRoutes.get(20)).toMatchObject({ channel: 20, epoch: 9 });
+      expect(socket.writes[0]!.header.ty).toBe(FrameType.Response);
+      expect(warnings).toHaveLength(1);
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
   test("rejected bind cleans tentative state without install or onBound", async () => {
     const { internals, socket } = providerHarness();
     const cleaned: RouteHandle[] = [];
