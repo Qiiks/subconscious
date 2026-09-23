@@ -1,6 +1,6 @@
 use std::{collections::VecDeque, sync::Arc};
 
-use crate::terminal_journal::{ring_history, TerminalJournal};
+use crate::terminal_journal::{ring_history, JournalRead, TerminalJournal};
 
 use subc_control::{TerminalDisposition, TerminalExitKind};
 
@@ -52,6 +52,22 @@ pub struct TerminalHistorySnapshot {
     pub dropped: u64,
 }
 
+/// A durable history read captured under the ring lock and finished after it.
+pub(crate) enum DurableHistoryRead {
+    RingOnly(TerminalHistorySnapshot),
+    Journal(JournalRead),
+}
+
+impl DurableHistoryRead {
+    /// Blocking when a journal is configured: it reads journal files.
+    pub(crate) fn read(self, module_id: &str) -> subc_control::TerminalHistory {
+        match self {
+            Self::RingOnly(snapshot) => ring_history(snapshot, None),
+            Self::Journal(read) => read.read(module_id),
+        }
+    }
+}
+
 /// Bounded terminal-exit history for one supervised module.
 ///
 /// This belongs to the module rather than an individual child so a replacement
@@ -95,9 +111,16 @@ impl TerminalRing {
     }
 
     pub(crate) fn durable_history(&self, module_id: &str) -> subc_control::TerminalHistory {
+        self.capture_durable_history().read(module_id)
+    }
+
+    /// Pin this ring's snapshot and the journal files a history read will
+    /// see. Cheap; the caller may then release the ring lock before the
+    /// file reading in [`DurableHistoryRead::read`].
+    pub(crate) fn capture_durable_history(&self) -> DurableHistoryRead {
         match &self.journal {
-            Some(journal) => journal.merge(module_id, self.snapshot()),
-            None => ring_history(self.snapshot(), None),
+            Some(journal) => DurableHistoryRead::Journal(journal.capture_read(self.snapshot())),
+            None => DurableHistoryRead::RingOnly(self.snapshot()),
         }
     }
 

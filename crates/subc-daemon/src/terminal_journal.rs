@@ -42,7 +42,9 @@ struct Writer {
     failures: u64,
 }
 
-/// One shared sink serializes append, rotation, and reads across all modules.
+/// One shared sink serializes append and rotation across all modules. A history
+/// read holds the same lock only to pin the files it will read, never while
+/// reading them; see [`TerminalJournal::capture_read`].
 pub(crate) struct TerminalJournal {
     path: PathBuf,
     incarnation: String,
@@ -134,12 +136,32 @@ impl TerminalJournal {
         module_id: &str,
         snapshot: TerminalHistorySnapshot,
     ) -> TerminalHistory {
-        // Keep rotation and append out of the read window; callers hold the ring
-        // lock too, so a current exit cannot land in only one half of this merge.
+        self.capture_read(snapshot).read(module_id)
+    }
+
+    /// Pin what a history read will see, holding the writer lock only for that.
+    ///
+    /// Under the lock no append or rotation is in flight, so every generation
+    /// file ends on a line boundary. Each existing generation is OPENED here and
+    /// its current length recorded; the slow part (reading and parsing up to
+    /// every retained generation) happens later in [`JournalRead::read`], with
+    /// the lock released, so exit recording for every module proceeds while a
+    /// history is read.
+    ///
+    /// How a write racing that read is handled: an append lands past the
+    /// recorded length and is not read, and a rotation renames or prunes paths
+    /// but not the files already open here (Unix keeps an open file's inode;
+    /// Rust's Windows `rename`/`remove_file` use POSIX semantics against the
+    /// delete-sharing handles `File::open` makes). So the read describes the
+    /// journal exactly as of this call. Callers take the ring snapshot at the
+    /// same moment, under the ring lock that recording also holds across its
+    /// append and push, so an exit recorded after this call is in neither half
+    /// of the merge and the next read has it once.
+    pub(crate) fn capture_read(&self, snapshot: TerminalHistorySnapshot) -> JournalRead {
         let writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
         let mut history = ring_history(snapshot, Some(&self.incarnation));
         history.journal_write_failures = writer.failures;
-        let mut entries = Vec::new();
+        let mut generations = Vec::new();
         // LineSink names generations by appending .1, .2, ...; only the sink
         // rotates or prunes them. Read oldest first for stable timestamp ties.
         for generation in (0..=RETENTION.keep).rev() {
@@ -150,16 +172,50 @@ impl TerminalJournal {
                 name.push(format!(".{generation}"));
                 PathBuf::from(name)
             };
-            let file = match File::open(&path) {
-                Ok(file) => file,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            let opened = File::open(&path).and_then(|file| {
+                let len = file.metadata()?.len();
+                Ok((file, len))
+            });
+            match opened {
+                Ok((file, len)) => generations.push((path, file, len)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => {
                     history.journal_read_errors += 1;
                     tracing::warn!(path = %path.display(), %error, "terminal journal read failed");
-                    continue;
                 }
-            };
-            let mut reader = BufReader::new(file);
+            }
+        }
+        drop(writer);
+        JournalRead {
+            #[cfg(test)]
+            journal_path: self.path.clone(),
+            history,
+            generations,
+        }
+    }
+}
+
+/// A history read pinned by [`TerminalJournal::capture_read`], to be finished
+/// without any journal or ring lock held.
+pub(crate) struct JournalRead {
+    #[cfg(test)]
+    journal_path: PathBuf,
+    /// The ring half, already in wire form, plus the counters known at capture.
+    history: TerminalHistory,
+    /// Open generation files, oldest first, each with its length at capture.
+    generations: Vec<(PathBuf, File, u64)>,
+}
+
+impl JournalRead {
+    /// Read the pinned generations and merge them with the ring snapshot.
+    /// This is blocking file I/O: async callers run it on a blocking thread.
+    pub(crate) fn read(self, module_id: &str) -> TerminalHistory {
+        #[cfg(test)]
+        read_pause::wait(&self.journal_path);
+        let mut history = self.history;
+        let mut entries = Vec::new();
+        for (path, file, len) in self.generations {
+            let mut reader = BufReader::new(file.take(len));
             let mut line = Vec::new();
             loop {
                 line.clear();
@@ -210,6 +266,57 @@ impl TerminalJournal {
         entries.sort_by_key(|entry| entry.at_ms);
         history.entries = entries;
         history
+    }
+}
+
+/// Test-only pause at the start of a journal history read, keyed by journal
+/// path so parallel tests never see each other's pauses. It makes a read
+/// "slow" deterministically: the read parks until the test releases it.
+#[cfg(test)]
+pub(crate) mod read_pause {
+    use std::{
+        collections::HashMap,
+        path::{Path, PathBuf},
+        sync::{mpsc, Arc, Mutex, OnceLock},
+        time::Duration,
+    };
+
+    struct Pause {
+        started: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    fn pauses() -> &'static Mutex<HashMap<PathBuf, Arc<Pause>>> {
+        static PAUSES: OnceLock<Mutex<HashMap<PathBuf, Arc<Pause>>>> = OnceLock::new();
+        PAUSES.get_or_init(Default::default)
+    }
+
+    /// Returns (a receiver told when a read reaches the pause, a sender that
+    /// releases it). An unreleased read gives up after five seconds so a failing
+    /// test cannot wedge the process.
+    pub(crate) fn install(path: &Path) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (started, started_rx) = mpsc::channel();
+        let (release_tx, release) = mpsc::channel();
+        pauses().lock().unwrap().insert(
+            path.to_path_buf(),
+            Arc::new(Pause {
+                started,
+                release: Mutex::new(release),
+            }),
+        );
+        (started_rx, release_tx)
+    }
+
+    pub(crate) fn wait(path: &Path) {
+        let pause = pauses().lock().unwrap().get(path).cloned();
+        if let Some(pause) = pause {
+            let _ = pause.started.send(());
+            let _ = pause
+                .release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5));
+        }
     }
 }
 

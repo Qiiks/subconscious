@@ -2039,7 +2039,7 @@ impl ControlHandler {
                 max_bytes,
             } => self.handle_supervisor_stderr_tail(frame, module_id, max_lines, max_bytes),
             ClientControlRequest::SupervisorTerminals { module_id } => {
-                self.handle_supervisor_terminals(frame, module_id)
+                self.handle_supervisor_terminals(frame, module_id).await
             }
         }
     }
@@ -3272,7 +3272,7 @@ impl ControlHandler {
         )?])
     }
 
-    fn handle_supervisor_terminals(
+    async fn handle_supervisor_terminals(
         &self,
         frame: Frame,
         module_id: String,
@@ -3285,9 +3285,21 @@ impl ControlHandler {
             )?]);
         };
 
+        // The journal read runs on a blocking thread: it can be megabytes of
+        // file I/O and must not occupy a runtime worker.
+        let terminals = module
+            .read_durable_terminal_history()
+            .await
+            .map_err(|error| {
+                RouterError::backend(
+                    0,
+                    frame.header.corr,
+                    format!("failed to read terminal history: {error}"),
+                )
+            })?;
         let response = ClientControlResponse::SupervisorTerminals {
             module_id,
-            terminals: module.durable_terminal_history(),
+            terminals,
         };
         Ok(vec![control_response_body_frame(
             &frame,
@@ -6043,6 +6055,84 @@ mod tests {
         };
         assert_eq!(text, &source_line[..DEFAULT_MAX_LINE_BYTES]);
         assert!(*truncated);
+    }
+
+    /// `supervisor.terminals` reads journal files. On a single-worker runtime a
+    /// read done on the worker thread would stall every other task until it
+    /// finished; the read must run off the worker so this test's own task keeps
+    /// running while the read is paused.
+    #[tokio::test(flavor = "current_thread")]
+    async fn supervisor_terminals_reads_the_journal_off_the_runtime_worker() {
+        let dir = TestTempDir::new("terminals-off-worker");
+        let journal_path = dir.join("terminals.jsonl");
+        let registry = Arc::new(Registry::default());
+        let supervisor_handle = SupervisorHandle::new();
+        let supervisor =
+            Supervisor::new(Arc::clone(&registry), RestartPolicy::new(1, Duration::ZERO))
+                .with_handle(supervisor_handle.clone())
+                .with_terminal_journal(journal_path.clone(), "off-worker-daemon".to_string());
+        let module = supervisor
+            .spawn(ModuleSpec {
+                module_id: "terminal-off-worker".to_string(),
+                program: fake_aft_stub_path(),
+                args: Vec::new(),
+                env: vec![("FAKE_AFT_EXIT_CODE".to_string(), "23".to_string())],
+                reserved: false,
+                reserved_prefixes: Vec::new(),
+                protocol: ModuleProtocol::Subc,
+                overlap: Default::default(),
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while module.terminal_history().entries.len() != 2 {
+            assert!(Instant::now() < deadline, "module did not record two exits");
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        let (started, release) = crate::terminal_journal::read_pause::install(&journal_path);
+        let handler =
+            Arc::new(ControlHandler::new(Arc::clone(&registry)).with_supervisor(supervisor_handle));
+        let frame = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            1,
+            serde_json::to_vec(&ClientControlRequest::SupervisorTerminals {
+                module_id: "terminal-off-worker".to_string(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let (ctx, _egress) = route_ctx(ConnectionId::new(1));
+        let spawned_at = std::time::Instant::now();
+        let read = tokio::spawn({
+            let handler = Arc::clone(&handler);
+            async move { handler.handle_control_frame(&ctx, frame).await }
+        });
+        // Waiting for the pause from a blocking thread keeps this task pending,
+        // so the runtime's single worker is free to run the read task.
+        tokio::task::spawn_blocking(move || started.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .expect("the history read reached its pause");
+        let elapsed = spawned_at.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2) && !read.is_finished(),
+            "this task could not run while the history read was paused \
+             (resumed after {elapsed:?}, read finished: {})",
+            read.is_finished()
+        );
+
+        drop(release);
+        let responses = read.await.unwrap().unwrap();
+        let response: ClientControlResponse = serde_json::from_slice(&responses[0].body).unwrap();
+        let ClientControlResponse::SupervisorTerminals { terminals, .. } = response else {
+            panic!("expected supervisor.terminals response");
+        };
+        assert_eq!(terminals.entries.len(), 2);
+        assert_eq!(terminals.journal_skipped_lines, 0);
+        assert_eq!(terminals.journal_read_errors, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

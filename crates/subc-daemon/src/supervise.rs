@@ -2431,12 +2431,24 @@ impl SupervisedModule {
     }
 
     /// Retained observations from the current ring and all journal generations.
+    ///
+    /// Blocking: this reads the journal files. Async callers use
+    /// [`Self::read_durable_terminal_history`].
     pub fn durable_terminal_history(&self) -> subc_control::TerminalHistory {
-        self.inner
-            .terminal_ring
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .durable_history(&self.inner.module_id)
+        durable_terminal_history_of(&self.inner.terminal_ring, &self.inner.module_id)
+    }
+
+    /// [`Self::durable_terminal_history`] on a blocking thread, so the journal
+    /// read (up to every retained generation) never occupies a runtime worker.
+    /// Fails only if the blocking task could not finish (runtime shutdown or a
+    /// panic in the read).
+    pub(crate) async fn read_durable_terminal_history(
+        &self,
+    ) -> Result<subc_control::TerminalHistory, tokio::task::JoinError> {
+        let terminal_ring = Arc::clone(&self.inner.terminal_ring);
+        let module_id = self.inner.module_id.clone();
+        tokio::task::spawn_blocking(move || durable_terminal_history_of(&terminal_ring, &module_id))
+            .await
     }
 
     pub fn status(&self) -> Result<ModuleStatus, SuperviseError> {
@@ -5173,6 +5185,20 @@ fn record_terminal(
         disposition,
         None,
     );
+}
+
+/// The ring lock is held only to capture the read (see
+/// `TerminalJournal::capture_read`), so this module's exits keep recording
+/// while the journal files are read. Blocking: it reads files.
+fn durable_terminal_history_of(
+    terminal_ring: &Mutex<TerminalRing>,
+    module_id: &str,
+) -> subc_control::TerminalHistory {
+    let read = terminal_ring
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .capture_durable_history();
+    read.read(module_id)
 }
 
 fn record_terminal_with_detail(
@@ -8897,5 +8923,112 @@ mod spawn_subscriber_lag_tests {
             detail["first_undelivered_cursor"]["daemon_incarnation"],
             "lag-incarnation"
         );
+    }
+}
+
+#[cfg(test)]
+mod terminal_history_read_concurrency_tests {
+    use super::*;
+    use crate::{terminal_journal::read_pause, test_support::TestTempDir};
+    use std::sync::mpsc as std_mpsc;
+
+    fn journaled_ring(
+        journal: &Arc<crate::terminal_journal::TerminalJournal>,
+    ) -> Arc<Mutex<TerminalRing>> {
+        Arc::new(Mutex::new(
+            TerminalRing::new(TerminalRingConfig::default(), 1)
+                .with_journal(Some(Arc::clone(journal))),
+        ))
+    }
+
+    fn crash(at_ms: u64) -> ExitReport {
+        ExitReport {
+            kind: ExitKind::Crash,
+            code: Some(1),
+            signal: None,
+            at_ms,
+        }
+    }
+
+    /// Record an exit on another thread and report whether it finished within
+    /// `bound`. The recorder thread is left running if it did not.
+    fn record_within(
+        module_id: &'static str,
+        ring: &Arc<Mutex<TerminalRing>>,
+        at_ms: u64,
+        bound: Duration,
+    ) -> bool {
+        let ring = Arc::clone(ring);
+        let (done, done_rx) = std_mpsc::channel();
+        std::thread::spawn(move || {
+            record_terminal(
+                module_id,
+                &ring,
+                &SpawnEventFeed::default(),
+                &crash(at_ms),
+                TerminalDisposition::Restarting,
+            );
+            let _ = done.send(());
+        });
+        done_rx.recv_timeout(bound).is_ok()
+    }
+
+    /// A history read in progress must not hold the journal writer (which every
+    /// module's exit recording needs) or the module's own ring. Exits recorded
+    /// while the read is paused complete promptly; the paused read answers as of
+    /// the moment it started, and the next read has each exit exactly once.
+    #[test]
+    fn exits_recorded_during_a_paused_history_read_are_not_blocked_or_half_merged() {
+        let dir = TestTempDir::new("terminal-history-concurrent-read");
+        let path = dir.join("terminals.jsonl");
+        let journal = Arc::new(crate::terminal_journal::TerminalJournal::open(
+            path.clone(),
+            "daemon".into(),
+        ));
+        let reader_ring = journaled_ring(&journal);
+        let other_ring = journaled_ring(&journal);
+        assert!(record_within(
+            "reader-module",
+            &reader_ring,
+            10,
+            Duration::from_secs(5)
+        ));
+
+        let (started, release) = read_pause::install(&path);
+        let reading = {
+            let ring = Arc::clone(&reader_ring);
+            std::thread::spawn(move || durable_terminal_history_of(&ring, "reader-module"))
+        };
+        started
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the history read reached its pause");
+
+        let bound = Duration::from_secs(1);
+        assert!(
+            record_within("other-module", &other_ring, 20, bound),
+            "another module's exit waited on a history read (journal writer held)"
+        );
+        assert!(
+            record_within("reader-module", &reader_ring, 30, bound),
+            "the read module's own exit waited on its history read (ring held)"
+        );
+
+        drop(release);
+        let paused = reading.join().unwrap();
+        assert_eq!(
+            paused.entries.iter().map(|e| e.at_ms).collect::<Vec<_>>(),
+            vec![10],
+            "an exit recorded after the read began lands in neither half of it"
+        );
+        assert_eq!(paused.journal_skipped_lines, 0);
+        assert_eq!(paused.journal_read_errors, 0);
+
+        let after = durable_terminal_history_of(&reader_ring, "reader-module");
+        assert_eq!(
+            after.entries.iter().map(|e| e.at_ms).collect::<Vec<_>>(),
+            vec![10, 30],
+            "the next read merges ring and journal with no duplicate"
+        );
+        assert_eq!(after.journal_skipped_lines, 0);
     }
 }
