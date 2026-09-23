@@ -180,6 +180,15 @@ const FAKE_AFT_PID_PATH_ENV: &str = "FAKE_AFT_PID_PATH";
 /// difference between a daemon that lets modules tear down and a process-group
 /// kill that arrives with the EOF. Requires `FAKE_AFT_RECORD_EOF`.
 const FAKE_AFT_EOF_TEARDOWN_MS_ENV: &str = "FAKE_AFT_EOF_TEARDOWN_MS";
+/// Presence makes a subc-mode stub stay alive after EOF on its control
+/// connection instead of exiting: a module whose teardown ignores the daemon's
+/// stop request, which only a signal can end.
+const FAKE_AFT_IGNORE_EOF_ENV: &str = "FAKE_AFT_IGNORE_EOF";
+/// Presence installs a SIGTERM handler in a subc-mode stub that records a
+/// `sigterm` event (with `at_ms`) and does NOT exit, so a test can see whether
+/// and when the daemon signalled it, and a later SIGKILL is still what ends it.
+#[cfg(unix)]
+const FAKE_AFT_RECORD_SIGTERM_ENV: &str = "FAKE_AFT_RECORD_SIGTERM";
 /// Id used when `FAKE_AFT_MODULE_ID` is absent.
 ///
 /// TESTS THAT ASSERT A MODULE APPEARS IN THE CATALOG MUST CONFIGURE AN ID THAT
@@ -384,6 +393,22 @@ fn exit_code_from_env() -> Result<Option<i32>, StubError> {
 async fn run(config: StubConfig) -> Result<(), StubError> {
     if config.fail_registration {
         std::process::exit(2);
+    }
+
+    #[cfg(unix)]
+    if env_flag(FAKE_AFT_RECORD_SIGTERM_ENV) {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut terminate = signal(SignalKind::terminate()).map_err(StubError::Io)?;
+        let sigterm_config = config.clone();
+        tokio::spawn(async move {
+            while terminate.recv().await.is_some() {
+                let at_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_millis() as u64)
+                    .unwrap_or(0);
+                let _ = record_event(&sigterm_config, json!({"kind": "sigterm", "at_ms": at_ms}));
+            }
+        });
     }
 
     let stream = connect_to_subc(&config.connection_file_path).await?;
@@ -665,6 +690,9 @@ async fn handle_frame(
                 sleep(Duration::from_millis(teardown)).await;
                 record_event(config, json!({"kind": "teardown_complete"}))?;
             }
+        }
+        if env_flag(FAKE_AFT_IGNORE_EOF_ENV) {
+            std::future::pending::<()>().await;
         }
         return Ok(false);
     };

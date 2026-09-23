@@ -18,6 +18,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, MutexGuard,
     },
+    time::Duration,
 };
 
 use subc_control::ModuleProtocol;
@@ -35,6 +36,9 @@ pub(crate) struct RosterEntry {
     /// Kernel start time where the platform exposes one, used to refuse a
     /// signal to a different process that has reused a reaped child's pid.
     pub(crate) start_time: Option<u64>,
+    /// The module's resolved drain budget, shared with its supervisor so a
+    /// configuration rescan that changes it is seen at shutdown.
+    drain_budget: Arc<Mutex<Duration>>,
 }
 
 #[derive(Debug, Default)]
@@ -45,9 +49,21 @@ struct RosterInner {
 }
 
 /// Shared by every clone of one `Supervisor` and every module task it starts.
-#[derive(Debug, Clone, Default)]
+/// A module task's copy also carries that module's drain budget, which every
+/// process it spawns is admitted with.
+#[derive(Debug, Clone)]
 pub(crate) struct ChildRoster {
     inner: Arc<RosterInner>,
+    drain_budget: Arc<Mutex<Duration>>,
+}
+
+impl Default for ChildRoster {
+    fn default() -> Self {
+        Self {
+            inner: Arc::default(),
+            drain_budget: Arc::new(Mutex::new(crate::supervise::DEFAULT_DRAIN_TIMEOUT)),
+        }
+    }
 }
 
 /// Holds a child's roster entry. Dropped when the child is reaped, or when its
@@ -65,6 +81,14 @@ impl Drop for RosterGuard {
 }
 
 impl ChildRoster {
+    /// The same roster, admitting children under one module's drain budget.
+    pub(crate) fn for_module(&self, drain_budget: Arc<Mutex<Duration>>) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            drain_budget,
+        }
+    }
+
     /// True once daemon shutdown has begun. A spawn after this point would
     /// create a child the shutdown stop may already have finished looking for,
     /// so spawning refuses instead (the supervisor would otherwise restart each
@@ -73,9 +97,24 @@ impl ChildRoster {
         self.inner.closed.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn admit(&self, entry: RosterEntry) -> RosterGuard {
+    pub(crate) fn admit(
+        &self,
+        module_id: String,
+        pid: u32,
+        protocol: ModuleProtocol,
+        start_time: Option<u64>,
+    ) -> RosterGuard {
         let key = self.inner.next_key.fetch_add(1, Ordering::Relaxed);
-        lock(&self.inner.live).insert(key, entry);
+        lock(&self.inner.live).insert(
+            key,
+            RosterEntry {
+                module_id,
+                pid,
+                protocol,
+                start_time,
+                drain_budget: Arc::clone(&self.drain_budget),
+            },
+        );
         RosterGuard {
             inner: Arc::clone(&self.inner),
             key,
@@ -83,8 +122,11 @@ impl ChildRoster {
     }
 
     #[cfg(unix)]
-    pub(crate) fn live(&self) -> Vec<RosterEntry> {
-        lock(&self.inner.live).values().cloned().collect()
+    fn live(&self) -> Vec<(u64, RosterEntry)> {
+        lock(&self.inner.live)
+            .iter()
+            .map(|(key, entry)| (*key, entry.clone()))
+            .collect()
     }
 
     #[cfg(unix)]
@@ -104,48 +146,61 @@ pub(crate) use unix_shutdown::end_children_for_daemon_shutdown;
 
 #[cfg(unix)]
 mod unix_shutdown {
-    use std::{future::Future, time::Duration};
+    use std::{collections::HashSet, future::Future, time::Duration};
 
     use rustix::process::{kill_process, Pid, Signal};
     use tokio::time::{sleep, Instant};
     use tracing::{debug, info, warn};
 
-    use super::{ChildRoster, RosterEntry};
+    use super::{lock, ChildRoster, RosterEntry};
     use subc_control::ModuleProtocol;
 
-    /// How long children get to exit on their own once their control
-    /// connections are closed (EOF) and every `protocol: "none"` child has had
-    /// SIGTERM. A module whose teardown hangs off EOF typically finishes in
-    /// ~100 ms; one that needs longer must already survive being cut short
-    /// (see docs/designs/daemon-shutdown-handler.md), and this wait sits after
-    /// a 500 ms notice budget and a 2 s drain budget, so it is kept to one
-    /// second rather than sized for the slowest module.
-    const CHILD_EXIT_GRACE: Duration = Duration::from_millis(1000);
-    /// After SIGTERM to every child still running, the time before SIGKILL.
-    /// Long enough for a signal handler to write a last line and exit, short
-    /// enough that the whole stop adds under two seconds.
-    const CHILD_TERM_GRACE: Duration = Duration::from_millis(500);
-    /// After SIGKILL, how long to wait for the supervisor tasks to reap. SIGKILL
-    /// cannot be ignored, so this only covers scheduling; it bounds the wait
-    /// even if a reap never lands.
+    /// The longest any one child is waited on before escalation, whatever its
+    /// drain budget says.
+    ///
+    /// Modules are outside the daemon's process group, so if the service
+    /// manager SIGKILLs the daemon before this stop finishes, whatever the
+    /// daemon has not ended survives it. A subc module has already had its EOF
+    /// and finishes its own teardown regardless, but a `protocol: "none"` child
+    /// would be orphaned. So the whole shutdown must fit inside the service
+    /// manager's stop timeout: the 0.5 s notice and 2 s drain before this, this
+    /// cap, [`TERM_TO_KILL`] and [`CHILD_REAP_BOUND`] after it come to 28.25 s,
+    /// under the 35 s `ExitTimeOut` / `TimeoutStopSec` that `ck setup` writes
+    /// (see `desired_definition`). 25 s covers BROCA's teardown (10 s run grace,
+    /// then a seal, inside a 20 s budget; 12 s measured) with room to spare.
+    const CHILD_SHUTDOWN_CAP: Duration = Duration::from_secs(25);
+    /// For a subc module still running at its deadline: the time between the
+    /// SIGTERM sent then and the SIGKILL. Long enough for a handler to write a
+    /// last line and exit.
+    const TERM_TO_KILL: Duration = Duration::from_millis(500);
+    /// After a SIGKILL, how long to wait for the supervisor tasks to reap.
+    /// SIGKILL cannot be ignored, so this only covers scheduling; it bounds the
+    /// wait even if a reap never lands.
     const CHILD_REAP_BOUND: Duration = Duration::from_millis(250);
     const POLL: Duration = Duration::from_millis(10);
 
     /// End every supervised child before the daemon exits.
     ///
-    /// The caller has already closed every connection, so a subc module has its
-    /// EOF and is running its own teardown. Order:
+    /// The caller has already closed every connection, so each subc module has
+    /// had its EOF: that is its one stop request, and it is left alone to run
+    /// its own teardown. A `protocol: "none"` child has no connection, so its
+    /// one stop request is SIGTERM, sent here immediately (the same stop the
+    /// supervisor sends it on restart).
     ///
-    /// 1. refuse further spawns, so a module exiting on EOF is not restarted;
-    /// 2. SIGTERM every `protocol: "none"` child, which has no connection and so
-    ///    no EOF, the same stop the supervisor sends it on restart;
-    /// 3. wait up to [`CHILD_EXIT_GRACE`] for the roster to empty;
-    /// 4. SIGTERM whatever is left, EOF modules included, and wait up to
-    ///    [`CHILD_TERM_GRACE`];
-    /// 5. SIGKILL whatever is left and wait up to [`CHILD_REAP_BOUND`].
+    /// Escalation happens per child, at that child's own deadline: its
+    /// resolved drain budget (per-module `drain_timeout_ms`, else the daemon
+    /// default), capped at [`CHILD_SHUTDOWN_CAP`]. At the deadline a subc
+    /// module still running gets SIGTERM and, [`TERM_TO_KILL`] later, SIGKILL;
+    /// a `protocol: "none"` child, already asked, gets SIGKILL. All children are
+    /// waited on concurrently, so the whole stop takes as long as the longest
+    /// single deadline, and returns as soon as every child has been reaped.
+    /// A fixed short bound for everyone would SIGKILL a module whose teardown
+    /// legitimately takes seconds (BROCA seals in-flight runs) on exactly the
+    /// stops where it has work in flight.
     ///
+    /// Spawns are refused first, so a module exiting on EOF is not restarted.
     /// `already_escalated` or `escalate` resolving (a second SIGTERM to the
-    /// daemon) skips the remaining graces and goes straight to step 5: the
+    /// daemon) skips every remaining wait and kills what is left: the
     /// operator has said stop waiting, and leaving children behind would be
     /// the orphan this exists to prevent.
     pub(crate) async fn end_children_for_daemon_shutdown(
@@ -155,65 +210,78 @@ mod unix_shutdown {
     ) {
         roster.close();
         tokio::pin!(escalate);
+        let started = Instant::now();
+        let mut termed = HashSet::new();
+        let mut killed = HashSet::new();
+        let mut last_kill: Option<Instant> = None;
         let mut escalated = already_escalated;
 
         if !escalated {
-            for entry in roster.live() {
+            for (key, entry) in roster.live() {
                 if entry.protocol == ModuleProtocol::None {
                     signal(&entry, Signal::TERM);
+                    termed.insert(key);
                 }
             }
-            escalated = !wait_for_empty(roster, CHILD_EXIT_GRACE, &mut escalate).await;
-            if !escalated && !roster.live().is_empty() {
-                for entry in roster.live() {
+        }
+
+        loop {
+            let live = roster.live();
+            if live.is_empty() {
+                return;
+            }
+            let now = Instant::now();
+            for (key, entry) in &live {
+                if killed.contains(key) {
+                    continue;
+                }
+                let deadline = started + budget(entry);
+                let kill_at = match entry.protocol {
+                    ModuleProtocol::None => deadline,
+                    ModuleProtocol::Subc => deadline + TERM_TO_KILL,
+                };
+                if escalated || now >= kill_at {
                     warn!(
                         module_id = %entry.module_id,
                         pid = entry.pid,
-                        "supervised child still running after daemon shutdown grace; sending SIGTERM"
+                        escalated,
+                        "supervised child did not exit during daemon shutdown; sending SIGKILL"
                     );
-                    signal(&entry, Signal::TERM);
+                    signal(entry, Signal::KILL);
+                    killed.insert(*key);
+                    last_kill = Some(now);
+                } else if now >= deadline && termed.insert(*key) {
+                    warn!(
+                        module_id = %entry.module_id,
+                        pid = entry.pid,
+                        "supervised module still running at its shutdown deadline after EOF; sending SIGTERM"
+                    );
+                    signal(entry, Signal::TERM);
                 }
-                escalated = !wait_for_empty(roster, CHILD_TERM_GRACE, &mut escalate).await;
             }
-        }
-        if escalated {
-            info!("second SIGTERM: killing remaining supervised children without further grace");
-        }
-
-        let remaining = roster.live();
-        if remaining.is_empty() {
-            return;
-        }
-        for entry in &remaining {
-            warn!(
-                module_id = %entry.module_id,
-                pid = entry.pid,
-                "supervised child did not exit during daemon shutdown; sending SIGKILL"
-            );
-            signal(entry, Signal::KILL);
-        }
-        let deadline = Instant::now() + CHILD_REAP_BOUND;
-        while !roster.live().is_empty() && Instant::now() < deadline {
-            sleep(POLL).await;
-        }
-    }
-
-    /// Waits until the roster is empty or `budget` elapses. Returns false only
-    /// when `escalate` resolved first.
-    async fn wait_for_empty<F: Future<Output = ()>>(
-        roster: &ChildRoster,
-        budget: Duration,
-        escalate: &mut std::pin::Pin<&mut F>,
-    ) -> bool {
-        let deadline = Instant::now() + budget;
-        while !roster.live().is_empty() && Instant::now() < deadline {
+            // Everything left has been SIGKILLed: wait only for the reaps.
+            if live.iter().all(|(key, _)| killed.contains(key))
+                && last_kill.is_some_and(|at| now >= at + CHILD_REAP_BOUND)
+            {
+                return;
+            }
+            if escalated {
+                sleep(POLL).await;
+                continue;
+            }
             tokio::select! {
                 biased;
-                _ = escalate.as_mut() => return false,
+                _ = escalate.as_mut() => {
+                    info!("second SIGTERM: killing remaining supervised children without further grace");
+                    escalated = true;
+                }
                 _ = sleep(POLL) => {}
             }
         }
-        true
+    }
+
+    fn budget(entry: &RosterEntry) -> Duration {
+        (*lock(&entry.drain_budget)).min(CHILD_SHUTDOWN_CAP)
     }
 
     fn signal(entry: &RosterEntry, signal: Signal) {

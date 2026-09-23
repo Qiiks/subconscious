@@ -79,8 +79,8 @@ async fn main() {
         process::exit(1);
     }
     // The bounded SIGTERM path has already announced the shutdown, closed every
-    // connection so modules saw EOF, and ended any child still running after a
-    // short grace. Exit without dropping the Tokio runtime: tearing down every
+    // connection so modules saw EOF, and ended any child still running at its
+    // own bounded deadline. Exit without dropping the Tokio runtime: tearing down every
     // task adds nothing at this point, and supervised Child handles use
     // kill_on_drop, so a destructor would be a second, unbounded-order kill
     // path next to the deliberate one. Process exit closes the descriptors.

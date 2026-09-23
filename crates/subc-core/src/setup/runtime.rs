@@ -113,6 +113,20 @@ pub fn runtime_paths(platform: RuntimePlatform, home: &Path, data_home: &Path) -
     RuntimePaths { definition, daemon }
 }
 
+/// How long the service manager lets the daemon run after asking it to stop,
+/// before it SIGKILLs it: launchd `ExitTimeOut` (default 20 s) and systemd
+/// `TimeoutStopSec` (default 90 s), set to the same value on both.
+///
+/// The daemon's announced shutdown takes up to 28.25 s: a 0.5 s notice, a 2 s
+/// drain, then each child's own drain budget capped at 25 s
+/// (`CHILD_SHUTDOWN_CAP` in subc-daemon's child_roster.rs) plus 0.75 s to
+/// SIGKILL and reap a straggler. It must finish before this timeout. Modules
+/// lead their own process groups, so a daemon killed mid-stop leaves behind
+/// whatever it had not ended yet, and a `protocol: "none"` child (which never
+/// sees EOF) would be orphaned. launchd's 20 s default is below 28.25 s; 35 s
+/// leaves a margin of several seconds.
+pub const DAEMON_STOP_TIMEOUT_SECS: u64 = 35;
+
 pub fn desired_definition(platform: RuntimePlatform, paths: &RuntimePaths) -> String {
     let daemon = paths.daemon.to_string_lossy();
     match platform {
@@ -123,8 +137,10 @@ pub fn desired_definition(platform: RuntimePlatform, paths: &RuntimePaths) -> St
         // itself before exiting). What it still reaches is any process the
         // daemon started that is not a supervised module, which is a cleanup
         // worth keeping.
+        //
+        // ExitTimeOut is the stop timeout, see DAEMON_STOP_TIMEOUT_SECS.
         RuntimePlatform::Macos => format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>cortexkit.subc</string><key>ProgramArguments</key><array><string>{daemon}</string></array><key>RunAtLoad</key><true/></dict></plist>\n"
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>cortexkit.subc</string><key>ProgramArguments</key><array><string>{daemon}</string></array><key>RunAtLoad</key><true/><key>ExitTimeOut</key><integer>{DAEMON_STOP_TIMEOUT_SECS}</integer></dict></plist>\n"
         ),
         // KillMode=mixed: stopping the unit sends SIGTERM to the daemon only,
         // and SIGKILLs the rest of the cgroup after the daemon has exited.
@@ -134,9 +150,10 @@ pub fn desired_definition(platform: RuntimePlatform, paths: &RuntimePaths) -> St
         // announce the shutdown, before the notice, the drain, or the EOF
         // teardown that follows. With mixed, the daemon runs that sequence and
         // ends its own children first; the final SIGKILL only catches what it
-        // could not.
+        // could not. TimeoutStopSec is the stop timeout, see
+        // DAEMON_STOP_TIMEOUT_SECS.
         RuntimePlatform::Linux => format!(
-            "[Unit]\nDescription=CortexKit subconscious daemon\n\n[Service]\nExecStart={daemon}\nRestart=on-failure\nDelegate=yes\nDelegateSubgroup=daemon\nKillMode=mixed\n\n[Install]\nWantedBy=default.target\n"
+            "[Unit]\nDescription=CortexKit subconscious daemon\n\n[Service]\nExecStart={daemon}\nRestart=on-failure\nDelegate=yes\nDelegateSubgroup=daemon\nKillMode=mixed\nTimeoutStopSec={DAEMON_STOP_TIMEOUT_SECS}\n\n[Install]\nWantedBy=default.target\n"
         ),
         // The Task Scheduler schema namespace is not decoration: `schtasks
         // /Create /XML` refuses a Task element without it ("contains an
@@ -990,6 +1007,39 @@ mod tests {
         assert!(
             definition.contains("\nKillMode=mixed\n"),
             "the systemd unit must signal only the daemon first: {definition}"
+        );
+    }
+
+    /// The daemon's shutdown (notice, drain, then per-child deadlines capped
+    /// at 25 s) takes up to 28.25 s and must finish before the service manager
+    /// SIGKILLs it, or a protocol none child is orphaned. Both managers'
+    /// defaults are overridden explicitly.
+    #[test]
+    fn service_stop_timeout_outlasts_the_daemons_bounded_shutdown() {
+        assert_eq!(DAEMON_STOP_TIMEOUT_SECS, 35);
+        let linux = desired_definition(
+            RuntimePlatform::Linux,
+            &runtime_paths(
+                RuntimePlatform::Linux,
+                Path::new("/home/test/bin"),
+                Path::new("/home/test"),
+            ),
+        );
+        assert!(
+            linux.contains("\nTimeoutStopSec=35\n"),
+            "the systemd unit must set its stop timeout: {linux}"
+        );
+        let macos = desired_definition(
+            RuntimePlatform::Macos,
+            &runtime_paths(
+                RuntimePlatform::Macos,
+                Path::new("/Users/test/bin"),
+                Path::new("/Users/test"),
+            ),
+        );
+        assert!(
+            macos.contains("<key>ExitTimeOut</key><integer>35</integer>"),
+            "the launchd plist must set its stop timeout: {macos}"
         );
     }
 

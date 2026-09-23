@@ -31,7 +31,7 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    child_roster::{ChildRoster, RosterEntry},
+    child_roster::ChildRoster,
     daemon_config::{
         CAPTURE_KEEP_ENV, CAPTURE_MAX_AGE_DAYS_ENV, CAPTURE_MAX_FILE_MB_ENV, CK_LOG_ENV,
     },
@@ -1943,7 +1943,8 @@ impl Supervisor {
     /// The last step of an announced daemon shutdown, after the notice and the
     /// drain: close every connection so each subc module sees EOF and starts
     /// its own teardown, then end every supervised child that has not exited
-    /// within a short bound. Modules lead their own process groups, so a
+    /// by its own deadline (its drain budget, capped). Modules lead their own
+    /// process groups, so a
     /// service manager's group kill no longer reaches them; without this a
     /// child that does not stop on EOF (every `protocol: "none"` child, which
     /// has no connection) would outlive the daemon. Every wait is bounded (see
@@ -2198,10 +2199,16 @@ impl Supervisor {
     }
 
     fn runtime_config(&self) -> SupervisorRuntimeConfig {
+        let effective_drain_timeout = Arc::new(Mutex::new(self.drain_timeout));
         SupervisorRuntimeConfig {
             restart_policy: self.restart_policy,
             drain_timeout: self.drain_timeout,
-            effective_drain_timeout: Arc::new(Mutex::new(self.drain_timeout)),
+            // Shared with this module's roster copy: daemon shutdown waits on
+            // each child for the module's own drain budget, as resolved now.
+            child_roster: self
+                .child_roster
+                .for_module(Arc::clone(&effective_drain_timeout)),
+            effective_drain_timeout,
             default_drain_timeout: self.drain_timeout,
             health: self.health,
             connection_file_path: self.connection_file_path.clone(),
@@ -2218,7 +2225,6 @@ impl Supervisor {
                 .with_journal(self.terminal_journal.clone()),
             )),
             spawn_events: self.spawn_events.clone(),
-            child_roster: self.child_roster.clone(),
             #[cfg(target_os = "linux")]
             cgroup_placement: self.cgroup_placement.clone(),
             #[cfg(test)]
@@ -5442,12 +5448,12 @@ fn spawn_child_in_slot(
     })?;
     let process_start_time = crate::provenance::process_start_time(pid);
     let process_identity = process_start_time.map(|start_time| ProcessIdentity { pid, start_time });
-    let roster_guard = roster.admit(RosterEntry {
-        module_id: spec.module_id.clone(),
+    let roster_guard = roster.admit(
+        spec.module_id.clone(),
         pid,
-        protocol: spec.protocol,
-        start_time: process_start_time,
-    });
+        spec.protocol,
+        process_start_time,
+    );
 
     let stdout_pump = match child.stdout.take() {
         Some(stdout) => Some(tokio::spawn(pump_stdout_to(stdout, output_sink.clone()))),

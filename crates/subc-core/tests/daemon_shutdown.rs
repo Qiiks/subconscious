@@ -28,12 +28,14 @@ struct Fixture {
 
 impl Fixture {
     fn boot(busy: bool) -> Self {
-        Self::boot_with(busy, None)
+        Self::boot_with(busy, json!({}), None)
     }
 
-    /// `none_module` adds a `protocol: "none"` module named `wire-less` whose
-    /// stub never connects, with these extra environment entries.
-    fn boot_with(busy: bool, none_module: Option<Value>) -> Self {
+    /// `observer` is merged into the `shutdown-observer` module's config, and
+    /// its `env` into that module's environment. `none_module`, when given,
+    /// adds a `protocol: "none"` module named `wire-less` whose stub never
+    /// connects, merged the same way.
+    fn boot_with(busy: bool, observer: Value, none_module: Option<Value>) -> Self {
         let permit = DAEMON_GATE.lock().unwrap_or_else(|p| p.into_inner());
         let root = TestTempDir::new("daemon-shutdown");
         for dir in ["config/cortexkit", "runtime", "data/cortexkit/run"] {
@@ -53,20 +55,18 @@ impl Fixture {
                 "FAKE_AFT_HEALTH_METRICS": if busy { "{\"work\":1}" } else { "{\"work\":0}" }
             }
         }});
-        if let Some(extra_env) = &none_module {
-            let mut env = json!({
-                "FAKE_AFT_NEVER_CONNECT": "1",
-                "FAKE_AFT_PID_PATH": root.join("wire-less.pid"),
-                "FAKE_AFT_NEVER_CONNECT_READY_PATH": root.join("wire-less.ready"),
-            });
-            for (key, value) in extra_env.as_object().unwrap() {
-                env[key] = value.clone();
-            }
+        merge_module(&mut modules["shutdown-observer"], &observer);
+        if let Some(extra) = &none_module {
             modules["wire-less"] = json!({
                 "program": env!("CARGO_BIN_EXE_fake-aft-stub"),
                 "protocol": "none",
-                "env": env,
+                "env": {
+                    "FAKE_AFT_NEVER_CONNECT": "1",
+                    "FAKE_AFT_PID_PATH": root.join("wire-less.pid"),
+                    "FAKE_AFT_NEVER_CONNECT_READY_PATH": root.join("wire-less.ready"),
+                },
             });
+            merge_module(&mut modules["wire-less"], extra);
         }
         fs::write(
             root.join("config/cortexkit/subc.jsonc"),
@@ -225,6 +225,27 @@ impl Drop for Fixture {
     }
 }
 
+/// Merges `extra` into a module's config: `env` entries into its environment,
+/// every other key onto the module itself.
+fn merge_module(module: &mut Value, extra: &Value) {
+    for (key, value) in extra.as_object().unwrap() {
+        if key == "env" {
+            for (name, entry) in value.as_object().unwrap() {
+                module["env"][name] = entry.clone();
+            }
+        } else {
+            module[key] = value.clone();
+        }
+    }
+}
+
+fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
 /// Simulated EOF teardown in the observer stub. Long enough that a group kill
 /// arriving with the EOF lands mid-teardown; short enough to fit the daemon's
 /// child-exit grace.
@@ -277,13 +298,109 @@ fn module_finishes_its_eof_teardown_before_the_service_manager_group_kill() {
     }
 }
 
+/// BROCA's EOF teardown seals in-flight runs and took 12 s at a measured cut.
+/// A module whose teardown outlasts a short fixed bound must be left to finish
+/// it, not signalled while it works.
+#[test]
+fn slow_eof_teardown_within_its_drain_budget_finishes_unsignalled() {
+    let mut fixture = Fixture::boot_with(
+        false,
+        json!({
+            "drain_timeout_ms": 6000,
+            "env": { "FAKE_AFT_EOF_TEARDOWN_MS": "3000", "FAKE_AFT_RECORD_SIGTERM": "1" }
+        }),
+        None,
+    );
+    let observer = fixture.pid_of("observer.pid");
+    let started = Instant::now();
+    fixture.term();
+    fixture.wait_exit(Duration::from_secs(10));
+    let elapsed = started.elapsed();
+    let kinds: Vec<String> = fixture
+        .events()
+        .into_iter()
+        .filter_map(|e| e["kind"].as_str().map(str::to_owned))
+        .filter(|kind| kind == "eof" || kind == "teardown_complete" || kind == "sigterm")
+        .collect();
+    assert_eq!(
+        kinds,
+        ["eof", "teardown_complete"],
+        "a module inside its drain budget must finish its EOF teardown with no signal"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(3000),
+        "the daemon did not wait for the module's teardown: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(6000),
+        "the daemon waited out the deadline instead of returning when the module exited: {elapsed:?}"
+    );
+    assert!(
+        !process_alive(observer),
+        "the module must have exited on its own"
+    );
+}
+
+#[test]
+fn eof_ignoring_module_is_sigtermed_at_its_deadline_then_killed() {
+    let mut fixture = Fixture::boot_with(
+        false,
+        json!({
+            "drain_timeout_ms": 1000,
+            "env": { "FAKE_AFT_IGNORE_EOF": "1", "FAKE_AFT_RECORD_SIGTERM": "1" }
+        }),
+        None,
+    );
+    let observer = fixture.pid_of("observer.pid");
+    let started = Instant::now();
+    let term_ms = unix_ms_now();
+    fixture.term();
+    fixture.wait_exit(Duration::from_secs(6));
+    let exit_ms = unix_ms_now();
+    let elapsed = started.elapsed();
+    let sigterms: Vec<u64> = fixture
+        .events()
+        .into_iter()
+        .filter(|e| e["kind"] == "sigterm")
+        .map(|e| e["at_ms"].as_u64().unwrap())
+        .collect();
+    assert_eq!(
+        sigterms.len(),
+        1,
+        "exactly one SIGTERM, at the deadline: {sigterms:?}"
+    );
+    // The deadline is counted from the start of the child stop, which follows
+    // the notice and drain, so it lands at least 1 s after the daemon's SIGTERM.
+    assert!(
+        sigterms[0] >= term_ms + 1000,
+        "SIGTERM came before the module's 1 s deadline: {} ms after",
+        sigterms[0] - term_ms
+    );
+    let term_to_exit = exit_ms - sigterms[0];
+    assert!(
+        (400..1500).contains(&term_to_exit),
+        "SIGKILL must follow the deadline SIGTERM by 0.5 s: {term_to_exit} ms"
+    );
+    // 1 s deadline + 0.5 s + 0.25 s reap, after a notice and drain of at most
+    // 2.5 s that a quiescent module does not spend.
+    assert!(
+        elapsed < Duration::from_millis(4500),
+        "shutdown overran the module's bound: {elapsed:?}"
+    );
+    assert!(
+        !process_alive(observer),
+        "the module must not outlive the daemon"
+    );
+}
+
 #[test]
 fn protocol_none_child_is_stopped_by_sigterm_not_left_running() {
     let marker = TestTempDir::new("wire-less-marker");
     let marker_path = marker.join("sigterm");
     let mut fixture = Fixture::boot_with(
         false,
-        Some(json!({ "FAKE_AFT_SIGTERM_MARKER_PATH": marker_path })),
+        json!({}),
+        Some(json!({ "env": { "FAKE_AFT_SIGTERM_MARKER_PATH": marker_path } })),
     );
     let wire_less = fixture.pid_of("wire-less.pid");
     fixture.term();
@@ -301,13 +418,18 @@ fn protocol_none_child_is_stopped_by_sigterm_not_left_running() {
 
 #[test]
 fn child_ignoring_sigterm_is_killed_within_the_shutdown_bound() {
-    let mut fixture = Fixture::boot_with(false, Some(json!({ "FAKE_AFT_IGNORE_SIGTERM": "1" })));
+    let mut fixture = Fixture::boot_with(
+        false,
+        json!({}),
+        Some(json!({ "drain_timeout_ms": 1500, "env": { "FAKE_AFT_IGNORE_SIGTERM": "1" } })),
+    );
     let wire_less = fixture.pid_of("wire-less.pid");
     let started = Instant::now();
     fixture.term();
     // Notice and drain return early for a quiescent module; the child stop
-    // adds at most 1 s + 0.5 s + 0.25 s.
-    fixture.wait_exit(Duration::from_secs(4));
+    // adds the child's 1.5 s drain budget, then SIGKILL and at most 0.25 s to
+    // reap.
+    fixture.wait_exit(Duration::from_secs(5));
     assert!(
         started.elapsed() >= Duration::from_millis(1400),
         "the child was given no grace before the kill"

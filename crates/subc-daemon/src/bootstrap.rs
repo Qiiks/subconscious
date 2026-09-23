@@ -802,7 +802,8 @@ async fn serve_bound_daemon(
         };
         // Supervised modules lead their own process groups, so the service
         // manager's kill of this process's group does not reach them. The
-        // daemon ends them itself: EOF first, then signals on short bounds.
+        // daemon ends them itself: EOF (or SIGTERM for a protocol none child)
+        // first, then signals at each child's own drain deadline.
         supervisor
             .end_children_for_daemon_shutdown(escalated, async {
                 terminate.recv().await;
