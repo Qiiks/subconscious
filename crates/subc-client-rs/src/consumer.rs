@@ -1781,6 +1781,14 @@ impl Shared {
                     "call deadline elapsed waiting for reconnection",
                 ));
             }
+            // Created BEFORE the state is read, and that ordering is the fix.
+            // Reconnect completion wakes waiters with `notify_waiters()`, which
+            // reaches only `Notified` futures that already exist and stores no
+            // permit. A future created after the lock is released misses a
+            // reconnect that finishes in between, and the caller then sleeps
+            // until its deadline on a healthy connection. (`enable()` is kept
+            // for `notify_one` semantics; for `notify_waiters` creation alone
+            // is what registers the waiter.)
             let notified = self.notify.notified();
             tokio::pin!(notified);
             let action = {
