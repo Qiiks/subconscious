@@ -131,6 +131,8 @@ impl TerminalJournal {
         }
     }
 
+    /// Capture and read in one step, for tests that own the journal directly.
+    #[cfg(test)]
     pub(crate) fn merge(
         &self,
         module_id: &str,

@@ -72,7 +72,22 @@ const SHIM_SCHEMA_VERSION: u32 = 1;
 const MAX_SHIM_CONTROL_MESSAGE_LEN: u32 = 64 * 1024;
 const MODULE_CONNECTION_FILE_NAME: &str = "subc-mcp-connection.json";
 const DEFAULT_HARNESS: &str = "mcp:generic";
-const PENDING_FRAME_BUFFER: usize = 8;
+/// Frames one request's consumer may fall behind by before that request is
+/// failed. The reader loop serves every route and call on the connection and
+/// never waits on one request's queue (see `deliver_reply`), so this bounds
+/// how far one slow MCP host can lag, not how long everyone else waits.
+///
+/// A count bound with a typed failure is used rather than an unbounded queue
+/// bounded by bytes: it keeps tokio's bounded channel as the only queue, a
+/// consumer this far behind on progress is not going to recover, and the
+/// frames it could hold are provider messages the reader has already read
+/// into memory anyway. Each queue gets one slot more than this, kept free for
+/// the terminal frame (the answer, or the overflow Error).
+const PENDING_FRAME_BUFFER: usize = 64;
+/// Code of the terminal Error a request receives when its consumer fell more
+/// than `PENDING_FRAME_BUFFER` frames behind. The provider is sent a Cancel
+/// for the same request.
+const REPLY_QUEUE_OVERFLOW_CODE: &str = "subc_reply_queue_overflow";
 const SUBC_EVENT_BUFFER: usize = 64;
 const CATALOG_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const SUPERVISION_HELLO_CORR: u64 = 1;
@@ -1438,7 +1453,7 @@ impl SubcClient {
         route_session: Option<Arc<RelaySession>>,
     ) -> Result<mpsc::Receiver<SubcFrame>> {
         let key = (frame.header.channel, frame.header.epoch, frame.header.corr);
-        let (reply_tx, reply_rx) = mpsc::channel(PENDING_FRAME_BUFFER);
+        let (reply_tx, reply_rx) = mpsc::channel(PENDING_FRAME_BUFFER + 1);
         let pending_request = PendingRequest {
             reply: reply_tx,
             route_session,
@@ -4898,14 +4913,26 @@ async fn subc_reader_loop<R>(
                             }
                         }
                     }
-                    if reply.reply.send(frame).await.is_err() {
-                        if let Some(handle) = opened {
-                            relay.drop_route(handle).await;
-                            relay
-                                .send_reverse_frame(FrameType::Goodbye, handle, 0, Vec::new())
-                                .await;
-                        } else if !terminal {
+                    match deliver_reply(&reply.reply, frame, terminal) {
+                        ReplyDelivery::Delivered => {}
+                        ReplyDelivery::Closed => {
+                            if let Some(handle) = opened {
+                                relay.drop_route(handle).await;
+                                relay
+                                    .send_reverse_frame(FrameType::Goodbye, handle, 0, Vec::new())
+                                    .await;
+                            } else if !terminal {
+                                pending.lock().await.remove(&key);
+                            }
+                        }
+                        ReplyDelivery::Overflowed => {
                             pending.lock().await.remove(&key);
+                            fail_overflowed_request(&reply.reply, key);
+                            if key.0 != 0 {
+                                relay
+                                    .send_reverse_frame(FrameType::Cancel, route, key.2, Vec::new())
+                                    .await;
+                            }
                         }
                     }
                 } else {
@@ -4971,7 +4998,70 @@ async fn fail_pending_on_route(
                 continue;
             }
         };
-        let _ = reply.reply.send(frame).await;
+        // Terminal, so it may take the queue's reserved slot; never waits.
+        let _ = deliver_reply(&reply.reply, frame, true);
+    }
+}
+
+enum ReplyDelivery {
+    Delivered,
+    /// The consumer is gone.
+    Closed,
+    /// The consumer fell `PENDING_FRAME_BUFFER` frames behind; the frame was
+    /// not queued and the request must be failed.
+    Overflowed,
+}
+
+/// Offer one frame to a request's reply queue without ever waiting on it.
+///
+/// Only the reader loop sends into these queues, so the capacity check cannot
+/// race another sender. A non-terminal frame never takes the last free slot,
+/// which is how a terminal frame (the answer, a route failure, or the
+/// overflow Error) always fits.
+fn deliver_reply(reply: &PendingTx, frame: SubcFrame, terminal: bool) -> ReplyDelivery {
+    if reply.is_closed() {
+        return ReplyDelivery::Closed;
+    }
+    if !terminal && reply.capacity() <= 1 {
+        return ReplyDelivery::Overflowed;
+    }
+    match reply.try_send(frame) {
+        Ok(()) => ReplyDelivery::Delivered,
+        Err(mpsc::error::TrySendError::Closed(_)) => ReplyDelivery::Closed,
+        Err(mpsc::error::TrySendError::Full(frame)) => {
+            // Unreachable while the reserved slot holds: only a terminal frame
+            // gets here, and the request leaves `pending` when one is queued.
+            tracing::error!(target: "route",
+                "dropping terminal subc frame type={:?} corr={}: reply queue full",
+                frame.header.ty,
+                frame.header.corr
+            );
+            ReplyDelivery::Closed
+        }
+    }
+}
+
+/// Queue the typed overflow Error in the reserved slot, after the frames the
+/// consumer has not read yet.
+fn fail_overflowed_request(reply: &PendingTx, (channel, epoch, corr): PendingKey) {
+    tracing::warn!(target: "route",
+        "failing subc request handle=({channel}, {epoch}) corr={corr}: its consumer fell {PENDING_FRAME_BUFFER} frames behind"
+    );
+    let body = serde_json::to_vec(&ErrorBody {
+        code: REPLY_QUEUE_OVERFLOW_CODE.to_owned(),
+        message: format!(
+            "the MCP host fell {PENDING_FRAME_BUFFER} frames behind this call's progress; the call was cancelled"
+        ),
+        detail: None,
+    })
+    .unwrap_or_default();
+    match build_frame(FrameType::Error, data_flags(), channel, epoch, corr, body) {
+        Ok(frame) => {
+            let _ = deliver_reply(reply, frame, true);
+        }
+        Err(error) => {
+            tracing::error!(target: "route", "failed to build reply overflow error: {error}");
+        }
     }
 }
 
@@ -7064,6 +7154,116 @@ mod tests {
 
         drop(server);
         reader.await.unwrap();
+    }
+
+    /// One MCP host that never drains a call's progress must cost only that
+    /// call. The reader loop serves every route and call on the module's
+    /// connection, so it must not wait on one call's reply queue.
+    #[tokio::test]
+    async fn a_call_whose_consumer_never_reads_cannot_stall_another_route() {
+        let (client_stream, server_stream) = connected_tcp_stream_pair().await;
+        let (mut server_read, mut server_write) = server_stream.into_split();
+        let subc = SubcClient::start(client_stream);
+        let stalled_route = subc.route_handle(7, 1);
+        let prompt_route = subc.route_handle(8, 1);
+        for route in [stalled_route, prompt_route] {
+            subc.relay()
+                .install_route(route, Arc::new(RelaySession::new("session".to_owned())))
+                .await
+                .unwrap();
+        }
+
+        let stalled_corr = subc.next_corr().unwrap();
+        let stalled_request = subc
+            .build_route_frame(
+                FrameType::Request,
+                data_flags(),
+                stalled_route,
+                stalled_corr,
+                b"{}".to_vec(),
+            )
+            .unwrap();
+        // Held, never read: this call's MCP host is not taking its progress.
+        let mut stalled = subc.request_frames(stalled_request).await.unwrap();
+        let prompt_corr = subc.next_corr().unwrap();
+        let prompt_request = subc
+            .build_route_frame(
+                FrameType::Request,
+                data_flags(),
+                prompt_route,
+                prompt_corr,
+                b"{}".to_vec(),
+            )
+            .unwrap();
+        let mut prompt = subc.request_frames(prompt_request).await.unwrap();
+        for _ in 0..2 {
+            let request = read_frame(&mut server_read).await.unwrap().unwrap();
+            assert_eq!(request.header.ty, FrameType::Request);
+        }
+
+        let flood = PENDING_FRAME_BUFFER * 4;
+        for index in 0..flood {
+            let progress = build_frame(
+                FrameType::Push,
+                data_flags(),
+                stalled_route.channel,
+                stalled_route.epoch,
+                stalled_corr,
+                serde_json::to_vec(&serde_json::json!({ "progress": index })).unwrap(),
+            )
+            .unwrap();
+            write_frame(&mut server_write, &progress).await.unwrap();
+        }
+        let answer = build_frame(
+            FrameType::Response,
+            data_flags(),
+            prompt_route.channel,
+            prompt_route.epoch,
+            prompt_corr,
+            br#"{"content":[]}"#.to_vec(),
+        )
+        .unwrap();
+        write_frame(&mut server_write, &answer).await.unwrap();
+        server_write.flush().await.unwrap();
+
+        let delivered = time::timeout(Duration::from_secs(2), prompt.recv())
+            .await
+            .expect("the other route's reply was stalled behind the unread call")
+            .expect("reply channel open");
+        assert_eq!(delivered.header.ty, FrameType::Response);
+        assert_eq!(delivered.header.corr, prompt_corr);
+
+        // The unread call alone fails: its queued progress, then one typed
+        // terminal Error, and the provider is told to stop the work.
+        let mut progress = 0;
+        let terminal = loop {
+            let frame = time::timeout(Duration::from_secs(2), stalled.recv())
+                .await
+                .unwrap()
+                .expect("the overflowed call gets a terminal frame before its queue closes");
+            if frame.header.ty == FrameType::Push {
+                progress += 1;
+            } else {
+                break frame;
+            }
+        };
+        assert!(
+            progress > 0 && progress < flood,
+            "queued progress drains first: {progress}"
+        );
+        assert_eq!(terminal.header.ty, FrameType::Error);
+        assert_eq!(terminal.header.corr, stalled_corr);
+        let error: ErrorBody = serde_json::from_slice(&terminal.body).unwrap();
+        assert_eq!(error.code, REPLY_QUEUE_OVERFLOW_CODE);
+        let cancel = time::timeout(Duration::from_secs(2), read_frame(&mut server_read))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (cancel.header.ty, cancel.header.channel, cancel.header.corr),
+            (FrameType::Cancel, stalled_route.channel, stalled_corr)
+        );
     }
 
     #[tokio::test]

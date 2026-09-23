@@ -110,6 +110,8 @@ impl TerminalRing {
         }
     }
 
+    /// Capture and read in one step, for tests that own the ring directly.
+    #[cfg(test)]
     pub(crate) fn durable_history(&self, module_id: &str) -> subc_control::TerminalHistory {
         self.capture_durable_history().read(module_id)
     }
