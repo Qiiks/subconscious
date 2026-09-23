@@ -711,7 +711,10 @@ where
     let queued = outbound.enqueued_at.elapsed();
     // Held until this frame has been written, then dropped at the end of this
     // function, which gives its bytes back to the connection's egress budget.
-    let _charge = outbound.charge;
+    let charge = outbound.charge;
+    if let Some(charge) = &charge {
+        charge.taken_by_writer();
+    }
     let frame = outbound.frame;
     if frame.header.channel == 0 && queued >= SLOW_REPLY_QUEUE {
         let write_started = std::time::Instant::now();

@@ -1,10 +1,10 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     error::Error,
     fmt,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc,
     },
     time::{Duration, Instant},
 };
@@ -66,27 +66,34 @@ fn queued_frame_bytes(frame: &Frame) -> usize {
 pub(crate) struct EgressBacklog {
     pub queued_bytes: usize,
     pub queued_frames: usize,
-    /// How long the oldest frame still held by the queue (including one the
-    /// writer is in the middle of writing) has been waiting.
+    /// Now minus the enqueue time of the frame the writer most recently took
+    /// off the queue (the frame it is writing, or has just written), or, if
+    /// the writer has taken nothing since the queue was last empty, of the
+    /// frame that made the queue non-empty. While the writer is blocked on a
+    /// frame this is exactly the oldest frame's age; between frames it can be
+    /// one frame older than the true head. `None` when nothing is queued.
     pub oldest_age: Option<Duration>,
 }
 
-#[derive(Debug, Default)]
-struct EgressQueueTimes {
-    next_seq: u64,
-    /// Admission sequence and instant of every frame still charged, oldest first.
-    queued: VecDeque<(u64, Instant)>,
-}
-
 /// Queued-byte accounting shared by every clone of one connection's
-/// [`FrameSink`] and by every frame that sink has admitted.
+/// [`FrameSink`] and by every frame that sink has admitted. Everything here is
+/// an atomic: this is on the path of every frame a module sends to a client,
+/// so it takes no lock per frame.
 #[derive(Debug)]
 struct EgressAccounting {
     byte_budget: usize,
     queued_bytes: AtomicUsize,
-    times: Mutex<EgressQueueTimes>,
-    /// Woken whenever a charged frame releases its bytes, so an awaited send
-    /// that is waiting for room can re-check.
+    queued_frames: AtomicUsize,
+    /// Origin for the nanosecond timestamps in `oldest_enqueued_nanos`.
+    time_base: Instant,
+    /// Enqueue time, as nanoseconds after `time_base` plus one, of the frame
+    /// described by [`EgressBacklog::oldest_age`]; 0 means none.
+    oldest_enqueued_nanos: AtomicU64,
+    /// Awaited senders currently parked on `freed`. A release only pays for a
+    /// notification when this is non-zero.
+    waiters: AtomicUsize,
+    /// Woken when a charged frame releases its bytes while a sender waits, so
+    /// the awaited send can re-check for room.
     freed: Notify,
 }
 
@@ -95,15 +102,16 @@ impl EgressAccounting {
         Self {
             byte_budget,
             queued_bytes: AtomicUsize::new(0),
-            times: Mutex::new(EgressQueueTimes::default()),
+            queued_frames: AtomicUsize::new(0),
+            time_base: Instant::now(),
+            oldest_enqueued_nanos: AtomicU64::new(0),
+            waiters: AtomicUsize::new(0),
             freed: Notify::new(),
         }
     }
 
-    fn lock_times(&self) -> std::sync::MutexGuard<'_, EgressQueueTimes> {
-        self.times
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    fn stamp(&self, at: Instant) -> u64 {
+        (at.saturating_duration_since(self.time_base).as_nanos() as u64).saturating_add(1)
     }
 
     /// Charge `bytes` if they fit in the budget. A frame larger than the whole
@@ -111,7 +119,9 @@ impl EgressAccounting {
     /// queue, since it could otherwise never be sent at all; it simply has the
     /// queue to itself until it is written.
     fn try_charge(self: &Arc<Self>, bytes: usize) -> Option<EgressCharge> {
-        let mut current = self.queued_bytes.load(Ordering::Acquire);
+        // SeqCst pairs with `release`: either this load sees bytes a release
+        // just freed, or that release sees this sender counted in `waiters`.
+        let mut current = self.queued_bytes.load(Ordering::SeqCst);
         loop {
             if current != 0 && current.saturating_add(bytes) > self.byte_budget {
                 return None;
@@ -119,8 +129,8 @@ impl EgressAccounting {
             match self.queued_bytes.compare_exchange_weak(
                 current,
                 current + bytes,
-                Ordering::AcqRel,
-                Ordering::Acquire,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
             ) {
                 Ok(_) => return Some(self.record(bytes)),
                 Err(actual) => current = actual,
@@ -131,45 +141,59 @@ impl EgressAccounting {
     /// Charge `bytes` regardless of the budget. Used only for a frame whose
     /// queue slot was reserved in advance, which must be sendable.
     fn charge_unconditionally(self: &Arc<Self>, bytes: usize) -> EgressCharge {
-        self.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
+        self.queued_bytes.fetch_add(bytes, Ordering::SeqCst);
         self.record(bytes)
     }
 
     fn record(self: &Arc<Self>, bytes: usize) -> EgressCharge {
-        let mut times = self.lock_times();
-        let seq = times.next_seq;
-        times.next_seq += 1;
         let enqueued_at = Instant::now();
-        times.queued.push_back((seq, enqueued_at));
+        let stamp = self.stamp(enqueued_at);
+        if self.queued_frames.fetch_add(1, Ordering::AcqRel) == 0 {
+            // This frame made the queue non-empty, so it is the head until the
+            // writer takes something.
+            self.oldest_enqueued_nanos.store(stamp, Ordering::Release);
+        }
         EgressCharge {
             accounting: Arc::clone(self),
             bytes,
-            seq,
+            stamp,
             enqueued_at,
         }
     }
 
-    fn release(&self, bytes: usize, seq: u64) {
-        self.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
-        {
-            let mut times = self.lock_times();
-            // Frames almost always leave in admission order, so this is the
-            // front entry; the search covers a frame dropped out of order.
-            if times.queued.front().map(|(front, _)| *front) == Some(seq) {
-                times.queued.pop_front();
-            } else if let Some(index) = times.queued.iter().position(|(s, _)| *s == seq) {
-                times.queued.remove(index);
-            }
+    /// The writer has taken the frame stamped `stamp` off the queue.
+    fn taken_by_writer(&self, stamp: u64) {
+        self.oldest_enqueued_nanos.store(stamp, Ordering::Release);
+    }
+
+    fn release(&self, bytes: usize, stamp: u64) {
+        self.queued_bytes.fetch_sub(bytes, Ordering::SeqCst);
+        if self.queued_frames.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // The queue drained. Clear the marker only if it still names this
+            // frame, so a frame admitted in the meantime keeps its stamp.
+            let _ = self.oldest_enqueued_nanos.compare_exchange(
+                stamp,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
         }
-        self.freed.notify_waiters();
+        if self.waiters.load(Ordering::SeqCst) != 0 {
+            self.freed.notify_waiters();
+        }
     }
 
     fn backlog(&self) -> EgressBacklog {
-        let times = self.lock_times();
+        let queued_frames = self.queued_frames.load(Ordering::Acquire);
+        let stamp = self.oldest_enqueued_nanos.load(Ordering::Acquire);
+        let oldest_age = (queued_frames != 0 && stamp != 0).then(|| {
+            let enqueued = self.time_base + Duration::from_nanos(stamp - 1);
+            enqueued.elapsed()
+        });
         EgressBacklog {
             queued_bytes: self.queued_bytes.load(Ordering::Acquire),
-            queued_frames: times.queued.len(),
-            oldest_age: times.queued.front().map(|(_, at)| at.elapsed()),
+            queued_frames,
+            oldest_age,
         }
     }
 }
@@ -180,13 +204,21 @@ impl EgressAccounting {
 pub(crate) struct EgressCharge {
     accounting: Arc<EgressAccounting>,
     bytes: usize,
-    seq: u64,
+    stamp: u64,
     enqueued_at: Instant,
+}
+
+impl EgressCharge {
+    /// Called by the connection writer when it takes this frame off the queue,
+    /// so the backlog's oldest-age figure follows the writer.
+    pub(crate) fn taken_by_writer(&self) {
+        self.accounting.taken_by_writer(self.stamp);
+    }
 }
 
 impl Drop for EgressCharge {
     fn drop(&mut self) {
-        self.accounting.release(self.bytes, self.seq);
+        self.accounting.release(self.bytes, self.stamp);
     }
 }
 
@@ -311,6 +343,19 @@ impl FrameSink {
     /// when the queue was bounded by frame count alone. Returns `None` if the
     /// writer goes away while waiting.
     async fn charge_waiting(&self, bytes: usize) -> Option<EgressCharge> {
+        if let Some(charge) = self.accounting.try_charge(bytes) {
+            return Some(charge);
+        }
+        // Counted as a waiter for as long as this future is parked, including
+        // when it is cancelled, so releases notify only while someone waits.
+        struct Waiting<'a>(&'a AtomicUsize);
+        impl Drop for Waiting<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        self.accounting.waiters.fetch_add(1, Ordering::SeqCst);
+        let _waiting = Waiting(&self.accounting.waiters);
         loop {
             let freed = self.accounting.freed.notified();
             tokio::pin!(freed);
@@ -1734,6 +1779,40 @@ mod tests {
             bound,
             close_receiver,
         )
+    }
+
+    /// Per-frame cost of the egress sink's admission and release accounting:
+    /// one million 200-byte frames enqueued with `try_send` and taken off the
+    /// queue the way the connection writer does, in batches of 1,000 so the
+    /// queue stays well inside its budget. Prints nanoseconds per frame; it is
+    /// a measurement, not a gate. Run with
+    /// `cargo test --release -p subc-daemon --lib egress_sink_per_frame_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing measurement, run on demand"]
+    fn egress_sink_per_frame_cost() {
+        const FRAMES: usize = 1_000_000;
+        const BATCH: usize = 1_000;
+        let (sink, mut rx) = crate::server::connection_egress();
+        let template = stream_frame(9, 1, 0, vec![b't'; 200]);
+        let started = Instant::now();
+        for _ in 0..FRAMES / BATCH {
+            for _ in 0..BATCH {
+                sink.try_send(template.clone()).unwrap();
+            }
+            for _ in 0..BATCH {
+                let outbound = rx.try_recv().unwrap();
+                if let Some(charge) = &outbound.charge {
+                    charge.taken_by_writer();
+                }
+                drop(std::hint::black_box(outbound));
+            }
+        }
+        let elapsed = started.elapsed();
+        assert_eq!(sink.backlog().queued_bytes, 0);
+        println!(
+            "egress sink: {FRAMES} frames in {elapsed:?}, {:.1} ns/frame",
+            elapsed.as_nanos() as f64 / FRAMES as f64
+        );
     }
 
     fn stream_frame(channel: u16, epoch: u32, corr: u64, body: Vec<u8>) -> Frame {
