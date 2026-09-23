@@ -15,6 +15,7 @@ use subc_protocol::manifest::{
 };
 
 const MODULE_ID: &str = "mcp-stdio-adapter";
+static LOGGER_INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -23,7 +24,12 @@ async fn main() {
     let exit_code = match run().await {
         Ok(()) => 0,
         Err(error) => {
-            eprintln!("ck-mcp-stdio-adapter: {error}");
+            if LOGGER_INSTALLED.load(std::sync::atomic::Ordering::Relaxed) {
+                tracing::error!("adapter failed: {error}");
+            } else {
+                // Offline probes and attestation refusals have no logger yet.
+                eprintln!("ck-mcp-stdio-adapter: {error}");
+            }
             1
         }
     };
@@ -41,9 +47,21 @@ async fn run() -> Result<()> {
         return Ok(());
     }
 
+    if env::args_os().any(|arg| arg == "--version") {
+        println!("ck-mcp-stdio-adapter {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if env::args_os().any(|arg| arg == "--help" || arg == "-h") {
+        println!("usage: ck-mcp-stdio-adapter --subc <connection-file> [--config <path>]");
+        return Ok(());
+    }
+
     // This is intentionally first: no config read or daemon connection may occur
     // before a hand-launched process is refused.
     let attestation = StartupAttestation::require_and_scrub()?;
+    let _logger = cortexkit_log::init_from_env()?;
+    LOGGER_INSTALLED.store(true, std::sync::atomic::Ordering::Relaxed);
+    tracing::info!("adapter starting");
     subc_client_rs::retain_launch_nonce_for_hello(attestation.launch_nonce().to_string())
         .map_err(std::io::Error::other)?;
 
@@ -51,7 +69,7 @@ async fn run() -> Result<()> {
     let config_path = args.config.unwrap_or(default_config_path()?);
     let (registry, warnings) = load(&config_path)?;
     for warning in warnings {
-        eprintln!("ck-mcp-stdio-adapter: warning: {warning}");
+        tracing::warn!(target: "registry", "{warning}");
     }
     let connection_file = args.subc_connection_file.ok_or_else(|| {
         std::io::Error::new(

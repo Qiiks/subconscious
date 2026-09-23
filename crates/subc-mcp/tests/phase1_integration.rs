@@ -52,7 +52,7 @@ use subc_transport::{
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
+    process::{Child, ChildStdin, ChildStdout, Command},
     sync::{mpsc, oneshot, Mutex as TokioMutex},
     task::JoinHandle,
     time::{sleep, timeout, Instant},
@@ -159,7 +159,6 @@ struct ShimProcess {
     child: Child,
     stdin: Option<ChildStdin>,
     stdout: Option<ChildStdout>,
-    stderr: Option<ChildStderr>,
 }
 
 impl ShimProcess {
@@ -2443,7 +2442,7 @@ async fn mcp_project_attempts_to_grant_are_dropped_with_warning() {
         .daemon
         .temp_dir
         .join(format!("{label}-subc-mcp.json"));
-    let (mut module, mut module_stderr) = spawn_module_with_stderr(
+    let mut module = spawn_module(
         &server.daemon.connection_file_path,
         &module_connection_file,
         &user_config_home,
@@ -2468,15 +2467,15 @@ async fn mcp_project_attempts_to_grant_are_dropped_with_warning() {
         list_tool_names_on_peer(client.peer()).await,
         Vec::<String>::new()
     );
-    let stderr = wait_for_child_stderr_contains(
-        &mut module_stderr,
+    let log = wait_for_module_log_contains(
+        &user_config_home,
         "dropping project MCP config field providers.aft.enabled",
         READ_TIMEOUT,
     )
     .await;
     assert!(
-        stderr.contains("cannot enable a provider disabled by the user baseline"),
-        "warning should explain why the grant was dropped: {stderr}"
+        log.contains("cannot enable a provider disabled by the user baseline"),
+        "warning should explain why the grant was dropped: {log}"
     );
 
     let _ = client.cancel().await;
@@ -3598,16 +3597,18 @@ async fn mcp_shim_rejects_unsupported_hello_ack_schema() {
         !exit.success(),
         "shim should fail when the module replies with an unsupported ShimHelloAck schema"
     );
-    let mut stderr = shim
-        .stderr
-        .take()
-        .expect("shim stderr should be available for schema mismatch assertions");
-    let stderr = read_child_stderr(&mut stderr).await;
-    assert!(
-        stderr.contains(&format!(
+    let log_path = xdg_config_home.join("cortexkit/ck-subc-mcp/logs");
+    let log = wait_for_segment_contains(
+        &log_path,
+        &format!(
             "unsupported ShimHelloAck schema {bad_schema} (expected {TEST_SHIM_SCHEMA_VERSION})"
-        )),
-        "shim stderr should report the typed schema mismatch, got: {stderr}"
+        ),
+        READ_TIMEOUT,
+    )
+    .await;
+    assert!(
+        log.contains(" ERROR ck-subc-mcp:"),
+        "typed schema mismatch must be logged: {log}"
     );
     server_task.await.unwrap();
 }
@@ -3681,7 +3682,7 @@ async fn mcp_module_rejects_unsupported_shim_hello_schema_without_opening_routes
         .daemon
         .temp_dir
         .join("mcp-bad-shim-hello-module.json");
-    let (mut module, mut module_stderr) = spawn_module_with_stderr(
+    let mut module = spawn_module(
         &server.daemon.connection_file_path,
         &module_connection_file,
         &xdg_config_home,
@@ -3712,15 +3713,15 @@ async fn mcp_module_rejects_unsupported_shim_hello_schema_without_opening_routes
         response.is_none(),
         "module should close the shim socket instead of replying to an unsupported ShimHello"
     );
-    let stderr = wait_for_child_stderr_contains(
-        &mut module_stderr,
+    let log = wait_for_module_log_contains(
+        &xdg_config_home,
         &format!("unsupported ShimHello schema {bad_schema} (expected {TEST_SHIM_SCHEMA_VERSION})"),
         READ_TIMEOUT,
     )
     .await;
     assert!(
-        stderr.contains("unsupported ShimHello schema"),
-        "module stderr should report the typed schema mismatch, got: {stderr}"
+        log.contains(" ERROR subc-mcp.shim:"),
+        "typed schema mismatch must be logged: {log}"
     );
     assert_no_stub_event_within(&provider_events_path, QUIET_TIMEOUT, |event| {
         event.get("kind") == Some(&Value::String("attach".to_owned()))
@@ -3989,9 +3990,8 @@ fn spawn_module(
     module_connection_file: &Path,
     xdg_config_home: &Path,
 ) -> Child {
-    // Discard stderr with /dev/null, NOT a dropped pipe handle: the attested
-    // module eprintln!s its registration line, and writing to a closed pipe
-    // makes eprintln! panic (exit 101) in the child.
+    // Module diagnostics belong in its dated segment rather than the daemon's
+    // stderr capture.
     let mut command = module_command(
         subc_connection_file,
         module_connection_file,
@@ -4019,22 +4019,6 @@ fn spawn_module_with_extra_env(
     command.spawn().unwrap()
 }
 
-fn spawn_module_with_stderr(
-    subc_connection_file: &Path,
-    module_connection_file: &Path,
-    xdg_config_home: &Path,
-) -> (Child, ChildStderr) {
-    let mut command = module_command(
-        subc_connection_file,
-        module_connection_file,
-        xdg_config_home,
-    );
-    command.stderr(process::Stdio::piped());
-    let mut child = command.spawn().unwrap();
-    let stderr = child.stderr.take().expect("module stderr should be piped");
-    (child, stderr)
-}
-
 fn module_command(
     subc_connection_file: &Path,
     module_connection_file: &Path,
@@ -4048,6 +4032,7 @@ fn module_command(
         .arg("--connection-file")
         .arg(module_connection_file)
         .env("XDG_CONFIG_HOME", xdg_config_home)
+        .env("XDG_DATA_HOME", xdg_config_home)
         .env(subc_protocol::SUBC_MODULE_ID_ENV, TEST_MCP_MODULE_ID)
         .env(subc_protocol::SUBC_LAUNCH_NONCE_ENV, TEST_MCP_LAUNCH_NONCE)
         .kill_on_drop(true);
@@ -4087,19 +4072,19 @@ fn spawn_shim(
         .arg(module_connection_file)
         .env("CLAUDE_PROJECT_DIR", project_root)
         .env("XDG_CONFIG_HOME", xdg_config_home)
+        .env("XDG_DATA_HOME", xdg_config_home)
+        .env_remove(subc_protocol::SUBC_MODULE_ID_ENV)
         .stdin(process::Stdio::piped())
         .stdout(process::Stdio::piped())
-        .stderr(process::Stdio::piped())
+        .stderr(process::Stdio::null())
         .kill_on_drop(true);
     let mut child = command.spawn().unwrap();
     let stdin = child.stdin.take().expect("shim stdin should be piped");
     let stdout = child.stdout.take().expect("shim stdout should be piped");
-    let stderr = child.stderr.take().expect("shim stderr should be piped");
     ShimProcess {
         child,
         stdin: Some(stdin),
         stdout: Some(stdout),
-        stderr: Some(stderr),
     }
 }
 
@@ -4662,40 +4647,29 @@ where
         .map_err(|err| format!("failed to flush JSON message: {err}"))
 }
 
-async fn read_child_stderr(stderr: &mut ChildStderr) -> String {
-    let mut bytes = Vec::new();
-    stderr.read_to_end(&mut bytes).await.unwrap();
-    String::from_utf8_lossy(&bytes).into_owned()
+async fn wait_for_module_log_contains(home: &Path, needle: &str, wait: Duration) -> String {
+    let logs = home.join("cortexkit").join(TEST_MCP_MODULE_ID).join("logs");
+    wait_for_segment_contains(&logs, needle, wait).await
 }
 
-async fn wait_for_child_stderr_contains(
-    stderr: &mut ChildStderr,
-    needle: &str,
-    wait: Duration,
-) -> String {
+async fn wait_for_segment_contains(logs: &Path, needle: &str, wait: Duration) -> String {
     let deadline = Instant::now() + wait;
-    let mut bytes = Vec::new();
-    let mut chunk = [0u8; 512];
     loop {
-        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let text = fs::read_dir(logs)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+            .collect::<String>();
         if text.contains(needle) {
             return text;
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
         assert!(
-            remaining > Duration::ZERO,
-            "stderr did not contain '{needle}' within {wait:?}; stderr so far: {text}"
+            Instant::now() < deadline,
+            "segment did not contain '{needle}' within {wait:?}; log so far: {text}"
         );
-        let read = timeout(remaining, stderr.read(&mut chunk))
-            .await
-            .unwrap_or_else(|_| {
-                panic!("timed out waiting for stderr to contain '{needle}'; stderr so far: {text}")
-            })
-            .unwrap();
-        if read == 0 {
-            panic!("stderr closed before containing '{needle}'; stderr so far: {text}");
-        }
-        bytes.extend_from_slice(&chunk[..read]);
+        sleep(Duration::from_millis(10)).await;
     }
 }
 

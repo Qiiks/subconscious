@@ -248,8 +248,8 @@ fn validate_status_summary(summary: &str) -> Result<(), ErrorData> {
 }
 
 fn log_wrapup(enqueued: &WrapupEnqueued) {
-    eprintln!(
-        "subc-mcp prompt wrapup: status={:?} command_id={} effective_keep={} clamped={} expires_at_ms={}",
+    tracing::info!(target: "prompt",
+        "status={:?} command_id={} effective_keep={} clamped={} expires_at_ms={}",
         enqueued.status,
         enqueued.command_id,
         enqueued.keep,

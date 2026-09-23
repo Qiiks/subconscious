@@ -1074,14 +1074,16 @@ dependencies = [
 
 [[package]]
 name = "mcp-stdio-adapter"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
+ "cortexkit-log",
  "serde",
  "serde_json",
  "subc-client-rs",
  "subc-jsonc",
  "subc-protocol",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1897,8 +1899,9 @@ dependencies = [
 
 [[package]]
 name = "subc-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
+ "cortexkit-log",
  "rmcp",
  "serde",
  "serde_json",
@@ -1908,6 +1911,7 @@ dependencies = [
  "subc-protocol",
  "subc-transport",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

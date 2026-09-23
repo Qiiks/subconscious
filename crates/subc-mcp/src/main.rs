@@ -88,6 +88,7 @@ const FACADE_DEFAULT_DISABLED: &[&str] = &["magic-context", "llm-runner"];
 const MANIFEST_MODULE_ID: &str = "ck-subc-mcp";
 
 static NEXT_CONNECTION_TOKEN: AtomicU64 = AtomicU64::new(1);
+static LOGGER_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 const USAGE: &str = "usage:\n  subc-mcp shim [--module-connection-file <path>] [--harness <name>]\n  subc-mcp module --subc <subc-connection-file> [--connection-file <path>]";
 
@@ -196,8 +197,8 @@ impl RelaySession {
             .map(|info| ReverseCapabilities::from_client(&info.capabilities))
             .unwrap_or_default();
         let mut state = self.peer_state.write().unwrap_or_else(|poisoned| {
-            eprintln!(
-                "subc-mcp module: warning: recovering from poisoned reverse-relay peer-state write lock"
+            tracing::warn!(target: "relay",
+                "recovering from poisoned reverse-relay peer-state write lock"
             );
             poisoned.into_inner()
         });
@@ -207,8 +208,8 @@ impl RelaySession {
 
     fn consumer_capabilities(&self) -> Option<Vec<String>> {
         let state = self.peer_state.read().unwrap_or_else(|poisoned| {
-            eprintln!(
-                "subc-mcp module: warning: recovering from poisoned reverse-relay peer-state read lock"
+            tracing::warn!(target: "relay",
+                "recovering from poisoned reverse-relay peer-state read lock"
             );
             poisoned.into_inner()
         });
@@ -223,8 +224,8 @@ impl RelaySession {
         capability: ReverseCapability,
     ) -> std::result::Result<Peer<RoleServer>, ErrorData> {
         let state = self.peer_state.read().unwrap_or_else(|poisoned| {
-            eprintln!(
-                "subc-mcp module: warning: recovering from poisoned reverse-relay peer-state read lock"
+            tracing::warn!(target: "relay",
+                "recovering from poisoned reverse-relay peer-state read lock"
             );
             poisoned.into_inner()
         });
@@ -276,7 +277,7 @@ impl RelayCancelHandle {
             })
             .await
         {
-            eprintln!("subc-mcp module: failed to cancel reverse MCP request: {error}");
+            tracing::error!(target: "relay", "failed to cancel reverse MCP request: {error}");
         }
     }
 }
@@ -315,9 +316,7 @@ struct AckOnlyAckMetrics {
 impl AckOnlyAckMetrics {
     fn counter_for(&self, tool_name: &str) -> Arc<AtomicU64> {
         let mut counters = self.counters.write().unwrap_or_else(|poisoned| {
-            eprintln!(
-                "subc-mcp module: warning: recovering from poisoned ack-only metrics write lock"
-            );
+            tracing::warn!("recovering from poisoned ack-only metrics write lock");
             poisoned.into_inner()
         });
         Arc::clone(
@@ -329,9 +328,7 @@ impl AckOnlyAckMetrics {
 
     fn snapshot(&self) -> BTreeMap<String, u64> {
         let counters = self.counters.read().unwrap_or_else(|poisoned| {
-            eprintln!(
-                "subc-mcp module: warning: recovering from poisoned ack-only metrics read lock"
-            );
+            tracing::warn!("recovering from poisoned ack-only metrics read lock");
             poisoned.into_inner()
         });
         counters
@@ -444,8 +441,8 @@ impl ReverseRelay {
         let valid = self.live_epochs.lock().await.get(&channel) == Some(&epoch);
         if !valid {
             self.stale_epoch_drops.fetch_add(1, Ordering::Relaxed);
-            eprintln!(
-                "subc-mcp module: dropping subc frame type={frame_type:?} for uninstalled or stale route handle=({channel}, {epoch})"
+            tracing::warn!(target: "route",
+                "dropping subc frame type={frame_type:?} for uninstalled or stale route handle=({channel}, {epoch})"
             );
         }
         valid
@@ -760,7 +757,7 @@ impl ReverseRelay {
         let body = match serde_json::to_vec(&error) {
             Ok(body) => body,
             Err(error) => {
-                eprintln!("subc-mcp module: failed to encode reverse MCP error: {error}");
+                tracing::error!(target: "relay", "failed to encode reverse MCP error: {error}");
                 Vec::new()
             }
         };
@@ -776,7 +773,7 @@ impl ReverseRelay {
         body: Vec<u8>,
     ) {
         if handle.connection_token != self.connection_token {
-            eprintln!("subc-mcp module: refusing reverse reply for a stale subc connection");
+            tracing::warn!(target: "relay", "refusing reverse reply for a stale subc connection");
             return;
         }
         let frame = match build_frame(
@@ -789,12 +786,12 @@ impl ReverseRelay {
         ) {
             Ok(frame) => frame,
             Err(error) => {
-                eprintln!("subc-mcp module: failed to build reverse relay frame: {error}");
+                tracing::error!(target: "relay", "failed to build reverse relay frame: {error}");
                 return;
             }
         };
         if let Err(error) = self.tx.send(frame).await {
-            eprintln!("subc-mcp module: failed to send reverse relay frame: {error}");
+            tracing::error!(target: "relay", "failed to send reverse relay frame: {error}");
         }
     }
 }
@@ -805,9 +802,7 @@ fn reverse_relay_ttl_from_env() -> Duration {
             Ok(0) => DEFAULT_REVERSE_RELAY_TTL,
             Ok(ms) => Duration::from_millis(ms),
             Err(error) => {
-                eprintln!(
-                    "subc-mcp module: ignoring invalid {REVERSE_RELAY_TTL_MS_ENV}={raw:?}: {error}"
-                );
+                tracing::warn!("ignoring invalid {REVERSE_RELAY_TTL_MS_ENV}={raw:?}: {error}");
                 DEFAULT_REVERSE_RELAY_TTL
             }
         },
@@ -850,6 +845,10 @@ async fn main() {
     }
     // Side-effect-free provenance probe, evaluated before any runtime arg
     // parsing or I/O so `ck-subc-mcp --version` never reaches shim/module setup.
+    if env::args_os().any(|arg| arg == "--help" || arg == "-h") {
+        println!("{USAGE}");
+        process::exit(0);
+    }
     if env::args_os().nth(1).is_some_and(|arg| arg == "--version") {
         println!("ck-subc-mcp {}", env!("CARGO_PKG_VERSION"));
         process::exit(0);
@@ -858,10 +857,20 @@ async fn main() {
     let code = match run_from_env().await {
         Ok(()) => 0,
         Err(error) => {
-            eprintln!("subc-mcp: {error}");
+            if LOGGER_INSTALLED.load(Ordering::Relaxed) {
+                tracing::error!("subc-mcp: {error}");
+            } else {
+                // Argument and attestation refusals precede logger initialization.
+                eprintln!("subc-mcp: {error}");
+            }
             let mut source = error.source();
             while let Some(err) = source {
-                eprintln!("  caused by: {err}");
+                if LOGGER_INSTALLED.load(Ordering::Relaxed) {
+                    tracing::error!("caused by: {err}");
+                } else {
+                    // Startup refusals still need a channel before logging exists.
+                    eprintln!("  caused by: {err}");
+                }
                 source = err.source();
             }
             1
@@ -880,8 +889,25 @@ async fn main() {
 
 async fn run_from_env() -> Result<()> {
     match parse_args(env::args_os())? {
-        CommandMode::Shim(args) => run_shim(args).await,
-        CommandMode::Module(args) => run_module(args).await,
+        CommandMode::Shim(args) => {
+            // The MCP host launches the shim outside daemon supervision. Its stdout
+            // is protocol-only; diagnostics append to the module's dated segment
+            // with a harness binding, not to the host's stderr channel.
+            let _logger = cortexkit_log::init(cortexkit_log::Config::for_plugin(
+                MANIFEST_MODULE_ID,
+                &args.harness,
+            ))?;
+            LOGGER_INSTALLED.store(true, Ordering::Relaxed);
+            tracing::info!(target: "shim", "shim starting");
+            run_shim(args).await
+        }
+        CommandMode::Module(args) => {
+            require_spawn_attestation()?;
+            let _logger = cortexkit_log::init_from_env()?;
+            LOGGER_INSTALLED.store(true, Ordering::Relaxed);
+            tracing::info!("module starting");
+            run_module(args).await
+        }
     }
 }
 
@@ -1388,7 +1414,7 @@ impl SubcClient {
                         }
                     }
                     Err(error) => {
-                        eprintln!("subc-mcp module: catalog poll failed: {error}");
+                        tracing::warn!(target: "catalog", "catalog poll failed: {error}");
                     }
                 }
             }
@@ -1624,7 +1650,6 @@ async fn run_shim(args: ShimArgs) -> Result<()> {
 }
 
 async fn run_module(args: ModuleArgs) -> Result<()> {
-    require_spawn_attestation()?;
     let subc_stream = connect_authenticated(&args.subc_connection_file).await?;
     let subc = SubcClient::start(subc_stream);
     let _supervision_task =
@@ -1655,7 +1680,7 @@ async fn run_module(args: ModuleArgs) -> Result<()> {
         let key = key.clone();
         tokio::spawn(async move {
             if let Err(error) = handle_shim_connection(stream, subc, key, daemon_id).await {
-                eprintln!("subc-mcp module: shim connection failed: {error}");
+                tracing::error!(target: "shim", "shim connection failed: {error}");
             }
         });
     }
@@ -1686,7 +1711,7 @@ async fn start_supervision_connection_if_configured(
     let task_module_id = module_id.clone();
     let task = tokio::spawn(async move {
         if let Err(error) = supervision_control_loop(stream, relay, task_module_id).await {
-            eprintln!("subc-mcp module: supervision control loop failed: {error}");
+            tracing::error!("supervision control loop failed: {error}");
         }
     });
     Ok(Some(task))
@@ -1752,7 +1777,7 @@ async fn send_supervision_hello(stream: &mut TcpStream, module_id: &str) -> Resu
                     "failed to decode supervision HELLO_ACK for module_id={module_id}: {source}"
                 ))
                 })?;
-            eprintln!("subc-mcp module: registered for supervision module_id={module_id}");
+            tracing::info!("registered for supervision module_id={module_id}");
             Ok(())
         }
         FrameType::Error => {
@@ -1787,7 +1812,7 @@ async fn supervision_control_loop(
             ))
         })?
         else {
-            eprintln!("subc-mcp module: supervision connection closed for module_id={module_id}");
+            tracing::error!("supervision connection closed for module_id={module_id}");
             return Ok(());
         };
 
@@ -2121,8 +2146,8 @@ async fn attach_session(subc: &SubcClient, hello: &ShimHello) -> Result<Attached
                 routes.insert(provider.module_id.clone(), route);
             }
             Err(error) if error.is::<RouteOpenRefused>() => {
-                eprintln!(
-                    "subc-mcp module: skipping provider '{}' for this session: {error}",
+                tracing::error!(
+                    "skipping provider '{}' for this session: {error}",
                     provider.module_id
                 );
                 refused.push(provider.module_id.clone());
@@ -2373,8 +2398,8 @@ fn desired_session_from_catalog(
         // is the failure mode this fix must not introduce.
         let namespace = config.provider_namespace(&entry.module_id);
         if let Err(message) = validate_mcp_name_component("provider namespace", &namespace) {
-            eprintln!(
-                "subc-mcp: skipping provider '{}': invalid MCP namespace '{namespace}': {message}; set providers.{}.namespace to an MCP-safe value",
+            tracing::debug!(
+                "skipping provider '{}': invalid MCP namespace '{namespace}': {message}; set providers.{}.namespace to an MCP-safe value",
                 entry.module_id, entry.module_id
             );
             continue;
@@ -2383,9 +2408,10 @@ fn desired_session_from_catalog(
         let mut tools = Vec::new();
         for tool in manifest_tools {
             if let Err(message) = validate_mcp_name_component("tool name", &tool.name) {
-                eprintln!(
-                    "subc-mcp: skipping tool '{}.{}': manifest name is not MCP-safe: {message}",
-                    entry.module_id, tool.name
+                tracing::debug!(
+                    "skipping tool '{}.{}': manifest name is not MCP-safe: {message}",
+                    entry.module_id,
+                    tool.name
                 );
                 continue;
             }
@@ -2395,8 +2421,8 @@ fn desired_session_from_catalog(
 
             let exposed_name = format!("{namespace}_{}", tool.name);
             if is_reserved_meta_tool_name(&exposed_name) {
-                eprintln!(
-                    "subc-mcp: skipping tool '{}.{}': exposed name '{exposed_name}' collides with a reserved meta-tool",
+                tracing::debug!(
+                    "skipping tool '{}.{}': exposed name '{exposed_name}' collides with a reserved meta-tool",
                     entry.module_id, tool.name
                 );
                 continue;
@@ -2412,8 +2438,8 @@ fn desired_session_from_catalog(
                     exposed_name.clone(),
                     (other_module.clone(), other_bare.clone()),
                 );
-                eprintln!(
-                    "subc-mcp: skipping tool '{}.{}': exposed name '{exposed_name}' already claimed by '{other_module}.{other_bare}'",
+                tracing::debug!(
+                    "skipping tool '{}.{}': exposed name '{exposed_name}' already claimed by '{other_module}.{other_bare}'",
                     entry.module_id, tool.name
                 );
                 continue;
@@ -2493,30 +2519,28 @@ fn session_inner_from_desired(
 impl SessionState {
     fn read_config(&self) -> RwLockReadGuard<'_, ConfigSnapshot> {
         self.config.read().unwrap_or_else(|poisoned| {
-            eprintln!("subc-mcp module: warning: recovering from poisoned config read lock");
+            tracing::warn!(target: "catalog", "recovering from poisoned config read lock");
             poisoned.into_inner()
         })
     }
 
     fn write_config(&self) -> RwLockWriteGuard<'_, ConfigSnapshot> {
         self.config.write().unwrap_or_else(|poisoned| {
-            eprintln!("subc-mcp module: warning: recovering from poisoned config write lock");
+            tracing::warn!(target: "catalog", "recovering from poisoned config write lock");
             poisoned.into_inner()
         })
     }
 
     fn read_inner(&self) -> RwLockReadGuard<'_, SessionInner> {
         self.inner.read().unwrap_or_else(|poisoned| {
-            eprintln!("subc-mcp module: warning: recovering from poisoned session-state read lock");
+            tracing::warn!("recovering from poisoned session-state read lock");
             poisoned.into_inner()
         })
     }
 
     fn write_inner(&self) -> RwLockWriteGuard<'_, SessionInner> {
         self.inner.write().unwrap_or_else(|poisoned| {
-            eprintln!(
-                "subc-mcp module: warning: recovering from poisoned session-state write lock"
-            );
+            tracing::warn!("recovering from poisoned session-state write lock");
             poisoned.into_inner()
         })
     }
@@ -3427,7 +3451,7 @@ fn merge_project_override_mode(
 }
 
 fn warn_project_drop(field: &str, reason: &str) {
-    eprintln!("subc-mcp module: warning: dropping project MCP config field {field}: {reason}");
+    tracing::warn!(target: "catalog", "dropping project MCP config field {field}: {reason}");
 }
 
 fn deserialize_maybe_set<'de, D, T>(deserializer: D) -> std::result::Result<MaybeSet<T>, D::Error>
@@ -3482,8 +3506,8 @@ async fn reconcile_session_from_catalog(
         {
             Ok(route) => route,
             Err(error) if error.is::<RouteOpenRefused>() => {
-                eprintln!(
-                    "subc-mcp module: skipping provider '{}' on policy refresh: {error}",
+                tracing::error!(target: "catalog",
+                    "skipping provider '{}' on policy refresh: {error}",
                     provider.module_id
                 );
                 refused.push(provider.module_id.clone());
@@ -3604,7 +3628,7 @@ async fn session_lifecycle(
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        eprintln!("subc-mcp module: keeping previous MCP policy after proactive config refresh failed: {error}");
+                        tracing::error!(target: "catalog", "keeping previous MCP policy after proactive config refresh failed: {error}");
                     }
                 }
             }
@@ -3649,12 +3673,12 @@ async fn session_lifecycle(
                                     }
                                     Ok(false) => {}
                                     Err(error) => {
-                                        eprintln!("subc-mcp module: keeping previous MCP tool snapshot after catalog reconciliation failed: {error}");
+                                        tracing::error!(target: "catalog", "keeping previous MCP tool snapshot after catalog reconciliation failed: {error}");
                                     }
                                 }
                             }
                             Err(error) => {
-                                eprintln!("subc-mcp module: failed to refresh catalog after generation {generation}: {error}");
+                                tracing::error!(target: "catalog", "failed to refresh catalog after generation {generation}: {error}");
                             }
                         }
                     }
@@ -3689,12 +3713,12 @@ async fn session_lifecycle(
                                     }
                                     Ok(false) => {}
                                     Err(error) => {
-                                        eprintln!("subc-mcp module: keeping previous MCP tool snapshot after lagged catalog reconciliation failed: {error}");
+                                        tracing::error!(target: "catalog", "keeping previous MCP tool snapshot after lagged catalog reconciliation failed: {error}");
                                     }
                                 }
                             }
                             Err(error) => {
-                                eprintln!("subc-mcp module: failed to refresh catalog after lagged events: {error}");
+                                tracing::error!(target: "catalog", "failed to refresh catalog after lagged events: {error}");
                             }
                         }
                     }
@@ -3709,7 +3733,7 @@ async fn notify_tool_list_changed(peer: &Peer<RoleServer>) -> bool {
     match peer.notify_tool_list_changed().await {
         Ok(()) => true,
         Err(error) => {
-            eprintln!("subc-mcp module: failed to notify MCP tools/list_changed: {error}");
+            tracing::error!("failed to notify MCP tools/list_changed: {error}");
             false
         }
     }
@@ -3719,7 +3743,7 @@ async fn notify_prompt_list_changed(peer: &Peer<RoleServer>) -> bool {
     match peer.notify_prompt_list_changed().await {
         Ok(()) => true,
         Err(error) => {
-            eprintln!("subc-mcp module: failed to notify MCP prompts/list_changed: {error}");
+            tracing::debug!(target: "prompt", "failed to notify MCP prompts/list_changed: {error}");
             false
         }
     }
@@ -3793,7 +3817,7 @@ fn unwrap_result_envelope(
     value: serde_json::Value,
 ) -> std::result::Result<serde_json::Value, PromptBackendError> {
     let missing = || {
-        eprintln!("subc-mcp prompt backend: thalamus response is missing the result envelope");
+        tracing::debug!(target: "prompt", "thalamus response is missing the result envelope");
         PromptBackendError::Internal
     };
     match value {
@@ -3851,24 +3875,24 @@ impl SubcPromptRouteClient {
         )
         .await
         .map_err(|error| {
-            eprintln!("subc-mcp prompt backend: failed to open {target_label} route: {error}");
+            tracing::debug!(target: "prompt", "failed to open {target_label} route: {error}");
             PromptRouteFailure::Transport
         })?;
 
         let response = async {
             let body = serde_json::to_vec(&body).map_err(|error| {
-                eprintln!("subc-mcp prompt backend: failed to encode route request: {error}");
+                tracing::debug!(target: "prompt", "failed to encode route request: {error}");
                 PromptRouteFailure::Malformed
             })?;
             let corr = self.subc.next_corr().map_err(|error| {
-                eprintln!("subc-mcp prompt backend: failed to allocate correlation id: {error}");
+                tracing::debug!(target: "prompt", "failed to allocate correlation id: {error}");
                 PromptRouteFailure::Transport
             })?;
             let frame = self
                 .subc
                 .build_route_frame(FrameType::Request, data_flags(), route, corr, body)
                 .map_err(|error| {
-                    eprintln!("subc-mcp prompt backend: failed to build route request: {error}");
+                    tracing::debug!(target: "prompt", "failed to build route request: {error}");
                     PromptRouteFailure::Transport
                 })?;
             let frame = self
@@ -3876,28 +3900,28 @@ impl SubcPromptRouteClient {
                 .request(frame, SUBC_RESPONSE_TIMEOUT)
                 .await
                 .map_err(|error| {
-                    eprintln!("subc-mcp prompt backend: route request failed: {error}");
+                    tracing::debug!(target: "prompt", "route request failed: {error}");
                     PromptRouteFailure::Transport
                 })?;
             match frame.header.ty {
                 FrameType::Response => serde_json::from_slice(&frame.body).map_err(|error| {
-                    eprintln!("subc-mcp prompt backend: malformed route response: {error}");
+                    tracing::debug!(target: "prompt", "malformed route response: {error}");
                     PromptRouteFailure::Malformed
                 }),
                 FrameType::Error => {
                     let error =
                         serde_json::from_slice::<ErrorBody>(&frame.body).map_err(|source| {
-                            eprintln!("subc-mcp prompt backend: malformed route error: {source}");
+                            tracing::debug!(target: "prompt", "malformed route error: {source}");
                             PromptRouteFailure::Malformed
                         })?;
-                    eprintln!(
-                        "subc-mcp prompt backend: {target_label} returned error code={}",
+                    tracing::debug!(target: "prompt",
+                        "{target_label} returned error code={}",
                         error.code
                     );
                     Err(PromptRouteFailure::Remote(error.code))
                 }
                 ty => {
-                    eprintln!("subc-mcp prompt backend: unexpected route response frame {ty:?}");
+                    tracing::debug!(target: "prompt", "unexpected route response frame {ty:?}");
                     Err(PromptRouteFailure::Malformed)
                 }
             }
@@ -3905,7 +3929,7 @@ impl SubcPromptRouteClient {
         .await;
 
         if let Err(error) = send_route_goodbye(&self.subc, route).await {
-            eprintln!("subc-mcp prompt backend: failed to close {target_label} route: {error}");
+            tracing::debug!(target: "prompt", "failed to close {target_label} route: {error}");
         }
         response
     }
@@ -3996,8 +4020,8 @@ impl PromptBackend for RouteBackend {
                 // Unknown or expired token: the conversation has not produced
                 // provider traffic yet (fresh launch) or the mapping aged out.
                 // A user-facing retry message, never an internal error.
-                eprintln!(
-                    "subc-mcp prompt backend: session.resolve returned no session for the \
+                tracing::debug!(target: "prompt",
+                    "session.resolve returned no session for the \
                      instance token; conversation has no provider traffic yet or the mapping \
                      expired"
                 );
@@ -4787,8 +4811,8 @@ async fn subc_reader_loop<R>(
                 }
 
                 if frame.header.ty == FrameType::Push && frame.header.channel == 0 {
-                    eprintln!(
-                        "subc-mcp module: ignoring unrecognized channel-0 Push corr={}",
+                    tracing::debug!(
+                        "ignoring unrecognized channel-0 Push corr={}",
                         frame.header.corr
                     );
                     continue;
@@ -4843,8 +4867,8 @@ async fn subc_reader_loop<R>(
                                 if let Err(error) =
                                     relay.install_route(handle, Arc::clone(route_session)).await
                                 {
-                                    eprintln!(
-                                        "subc-mcp module: rejected invalid route.open handle: {error}"
+                                    tracing::error!(target: "route",
+                                        "rejected invalid route.open handle: {error}"
                                     );
                                     continue;
                                 }
@@ -4862,8 +4886,8 @@ async fn subc_reader_loop<R>(
                         }
                     }
                 } else {
-                    eprintln!(
-                        "subc-mcp module: dropping unsolicited subc frame type={:?} handle=({}, {}) corr={}",
+                    tracing::warn!(target: "route",
+                        "dropping unsolicited subc frame type={:?} handle=({}, {}) corr={}",
                         frame.header.ty,
                         frame.header.channel,
                         frame.header.epoch,
@@ -4872,11 +4896,11 @@ async fn subc_reader_loop<R>(
                 }
             }
             Ok(None) => {
-                eprintln!("subc-mcp module: subc connection closed");
+                tracing::error!("subc connection closed");
                 break;
             }
             Err(error) => {
-                eprintln!("subc-mcp module: subc read failed: {error}");
+                tracing::error!("subc read failed: {error}");
                 break;
             }
         }
@@ -4913,14 +4937,14 @@ async fn fail_pending_on_route(
         }) {
             Ok(body) => body,
             Err(error) => {
-                eprintln!("subc-mcp module: failed to encode route GOODBYE error: {error}");
+                tracing::error!(target: "route", "failed to encode route GOODBYE error: {error}");
                 Vec::new()
             }
         };
         let frame = match build_frame(FrameType::Error, data_flags(), channel, epoch, corr, body) {
             Ok(frame) => frame,
             Err(error) => {
-                eprintln!("subc-mcp module: failed to build route GOODBYE error: {error}");
+                tracing::error!(target: "route", "failed to build route GOODBYE error: {error}");
                 continue;
             }
         };
@@ -4958,7 +4982,7 @@ async fn subc_writer_loop(
             }
         };
         if let Err(error) = write_frame(&mut writer, &frame).await {
-            eprintln!("subc-mcp module: subc write failed: {error}");
+            tracing::error!("subc write failed: {error}");
             return;
         }
         while let Ok(frame) = rx.try_recv() {
@@ -4966,12 +4990,12 @@ async fn subc_writer_loop(
                 return;
             }
             if let Err(error) = write_frame(&mut writer, &frame).await {
-                eprintln!("subc-mcp module: subc write failed: {error}");
+                tracing::error!("subc write failed: {error}");
                 return;
             }
         }
         if let Err(error) = writer.flush().await {
-            eprintln!("subc-mcp module: subc flush failed: {error}");
+            tracing::error!("subc flush failed: {error}");
             return;
         }
     }
@@ -5120,8 +5144,8 @@ impl ModuleConnectionFileSource {
 fn default_module_connection_file_path() -> PathBuf {
     let (path, source) =
         default_module_connection_file_path_with_source(non_empty_os_var("XDG_RUNTIME_DIR"));
-    eprintln!(
-        "subc-mcp: module connection file path={} source={} reason={}",
+    tracing::debug!(
+        "module connection file path={} source={} reason={}",
         path.display(),
         source.name(),
         source.reason()
@@ -5211,8 +5235,8 @@ fn bind_session_from_hello(hello: &ShimHello) -> Result<String> {
     match hello.instance_token.as_deref() {
         Some(token) if valid_instance_token(token) => Ok(token.to_string()),
         Some(_) => {
-            eprintln!(
-                "subc-mcp module: ignoring invalid instance token from shim hello; using synthetic session id"
+            tracing::warn!(target: "shim",
+                "ignoring invalid instance token from shim hello; using synthetic session id"
             );
             generated_session_id(&hello.shim_session_id)
         }
@@ -5244,8 +5268,8 @@ fn instance_token_from_env() -> Option<String> {
     if valid_instance_token(&raw) {
         Some(raw)
     } else {
-        eprintln!(
-            "subc-mcp shim: ignoring {INSTANCE_TOKEN_ENV}: must be non-empty, at most {MAX_INSTANCE_TOKEN_LEN} bytes, charset [A-Za-z0-9._-]"
+        tracing::debug!(target: "shim",
+            "ignoring {INSTANCE_TOKEN_ENV}: must be non-empty, at most {MAX_INSTANCE_TOKEN_LEN} bytes, charset [A-Za-z0-9._-]"
         );
         None
     }
