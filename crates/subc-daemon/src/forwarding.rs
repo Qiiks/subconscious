@@ -1748,7 +1748,7 @@ fn begin_drain_locked(
 }
 
 /// What a drain that timed out was still waiting on, for the log line that
-/// reports the timeout. Counts only: per-request ages are not tracked.
+/// reports the timeout. Per-request ages are not tracked.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct DrainHoldouts {
     /// Requests still counted against the drain (subscriptions flagged as
@@ -1761,7 +1761,19 @@ pub(crate) struct DrainHoldouts {
     /// The client connections holding the most requests, largest first, at
     /// most three: enough to name the consumer without listing every route.
     pub(crate) top_connections: Vec<(u64, usize)>,
+    /// The held requests themselves, as the module saw them, so its own log
+    /// can say what each one was: `(module channel, corr)`, ordered by channel
+    /// then corr, at most [`DRAIN_HELD_REQUESTS_LISTED`]. The daemon never reads
+    /// request bodies, so it cannot name a request's method; the module can,
+    /// from the channel and corr. A request is released only when the module
+    /// sends a terminal frame (Response, Error or StreamEnd) with its corr on
+    /// its route, so every pair listed here is one the module ended, if at all,
+    /// without sending that frame.
+    pub(crate) held: Vec<(u16, u64)>,
 }
+
+/// How many held requests the drain-timeout line lists by channel and corr.
+pub(crate) const DRAIN_HELD_REQUESTS_LISTED: usize = 32;
 
 impl ForwardingTable {
     /// Summarise the requests one endpoint's drain is still waiting on.
@@ -1784,7 +1796,16 @@ impl ForwardingTable {
             holdouts.requests += held;
             holdouts.routes += 1;
             *by_connection.entry(key.connection_id.get()).or_default() += held;
+            holdouts.held.extend(
+                route
+                    .flow
+                    .drain_held_corrs()
+                    .into_iter()
+                    .map(|corr| (route.module_channel, corr)),
+            );
         }
+        holdouts.held.sort_unstable();
+        holdouts.held.truncate(DRAIN_HELD_REQUESTS_LISTED);
         let mut connections = by_connection.into_iter().collect::<Vec<_>>();
         connections.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
         connections.truncate(3);
@@ -2613,6 +2634,23 @@ impl CreditLedger {
             .filter(|credit| !credit.excluded_from_drain)
             .count()
     }
+
+    /// The correlation ids of the requests a drain still waits on, one entry
+    /// per held credit, in ascending order.
+    fn drain_held_corrs(&self) -> Vec<u64> {
+        let mut corrs = self
+            .by_corr
+            .iter()
+            .flat_map(|(corr, credits)| {
+                credits
+                    .iter()
+                    .filter(|credit| !credit.excluded_from_drain)
+                    .map(move |_| *corr)
+            })
+            .collect::<Vec<_>>();
+        corrs.sort_unstable();
+        corrs
+    }
 }
 
 #[derive(Debug, Default)]
@@ -2705,6 +2743,14 @@ impl ChannelFlow {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .credits
             .drain_in_flight()
+    }
+
+    pub(crate) fn drain_held_corrs(&self) -> Vec<u64> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .credits
+            .drain_held_corrs()
     }
 
     #[cfg(test)]
@@ -3158,7 +3204,7 @@ mod tests {
         };
         let holding = bound(61);
         let _idle = bound(62);
-        holding.flow.acquire_tagged(1, false).await.unwrap();
+        holding.flow.acquire_tagged(7, false).await.unwrap();
         holding.flow.acquire_tagged(2, false).await.unwrap();
         holding.flow.acquire_tagged(3, true).await.unwrap();
         forwarding
@@ -3173,6 +3219,9 @@ mod tests {
                 routes: 1,
                 total_routes: 2,
                 top_connections: vec![(client.get(), 2)],
+                // The held requests by the module's channel and corr, ascending,
+                // without the excluded subscription (corr 3).
+                held: vec![(holding.module_channel, 2), (holding.module_channel, 7)],
             }
         );
     }

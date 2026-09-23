@@ -6034,6 +6034,14 @@ async fn begin_forwarding_drain_with(
                 held_routes = holdouts.routes,
                 total_routes = holdouts.total_routes,
                 top_connections = ?holdouts.top_connections,
+                // `module_channel:corr`, so the module can find each held request
+                // in its own log; capped, so `held_requests` is the full count.
+                held = %holdouts
+                    .held
+                    .iter()
+                    .map(|(channel, corr)| format!("{channel}:{corr}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
                 "route drain timed out before request quiescence; forcing teardown"
             );
         }
