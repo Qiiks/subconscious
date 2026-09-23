@@ -401,8 +401,12 @@ fi
 # and how an invalid one gets waved through; the pair plus the table name is decidable.
 count_in() {  # count_in <table> <file> <needle>
   case "$1" in
-    nm) nm -a "$2" 2>/dev/null | grep -cF "$3" || true ;;
-    *)  strings "$2" | grep -cF "$3" || true ;;
+    # `--` ends grep's options: a needle beginning with `-` (a CLI flag such
+    # as `--ready-ms` is a natural marker) was otherwise parsed as an option,
+    # grep printed nothing, and the gate refused a valid card as if the
+    # marker were absent.
+    nm) nm -a "$2" 2>/dev/null | grep -cF -- "$3" || true ;;
+    *)  strings "$2" | grep -cF -- "$3" || true ;;
   esac
 }
 # A MARKER CAN DISCRIMINATE IN BOTH TABLES, AND THEN THE CONTROL PICKS WHICH ONE.
@@ -490,7 +494,7 @@ if [ -n "$CONTROL" ]; then
 else
   # --control IS REQUIRED, and the reason is the counter one layer down.
   #
-  #   count_in nm  -> nm -a "$f" 2>/dev/null | grep -cF "$needle" || true
+  #   count_in nm  -> nm -a "$f" 2>/dev/null | grep -cF -- "$needle" || true
   #
   # That returns 0 when the needle is ABSENT and 0 when THE TOOL FAILED --
   # stderr suppressed, `|| true` swallowing the status. Measured: `nm -a` on a
