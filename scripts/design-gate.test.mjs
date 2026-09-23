@@ -161,6 +161,20 @@ describe("parseLinkedIssue", () => {
     // not a link for this gate at all.
     ["Closes https://github.com/other/repo/issues/12", null],
     ["Closes other/repo#12", null],
+    // Non-closing links: the template's own line, and the forms for a pull
+    // request that is one step of an issue and must leave it open.
+    ["Approved issue: #12", 12],
+    ["approved issue: #12", 12],
+    [`Approved issue: ${REPO}#12`, 12],
+    [`Approved issue: https://github.com/${REPO}/issues/12`, 12],
+    ["Refs #12", 12],
+    ["refs: #12", 12],
+    ["Refs #12 (not closing)", 12],
+    [`Refs https://github.com/${REPO}/issues/12`, 12],
+    ["Part of #12", 12],
+    ["PART OF #12", 12],
+    ["Refs other/repo#12", null],
+    ["Approved issue: https://github.com/other/repo/issues/12", null],
     // Negative control: a bare reference with no closing keyword is a
     // mention, not a link. GitHub does not close it and neither do we.
     ["See #123 for context", null],
@@ -192,6 +206,24 @@ describe("parseLinkedIssue", () => {
     assert.equal(parseLinkedIssue(body, REPO).number, 9);
   });
 
+  test("skips a cross-repo Refs and takes the first same-repo link", () => {
+    const linked = parseLinkedIssue("Refs cortexkit/other#1\nRefs #9", REPO);
+    assert.equal(linked.number, 9);
+    assert.equal(linked.kind, "reference");
+  });
+
+  test("the first link wins across keyword families", () => {
+    assert.equal(parseLinkedIssue("Refs #7\nCloses #9", REPO).number, 7);
+    assert.equal(parseLinkedIssue("Closes #9\nApproved issue: #7", REPO).number, 9);
+  });
+
+  test("reports which keyword family matched", () => {
+    assert.equal(parseLinkedIssue("Approved issue: #1", REPO).kind, "approved");
+    assert.equal(parseLinkedIssue("Refs #1", REPO).kind, "reference");
+    assert.equal(parseLinkedIssue("Part of #1", REPO).kind, "reference");
+    assert.equal(parseLinkedIssue("Closes #1", REPO).kind, "closing");
+  });
+
   test("an unfilled pull request template does not link", () => {
     // Keep in step with .github/pull_request_template.md: a template nobody
     // filled in must fail the gate, not silently satisfy it.
@@ -200,7 +232,9 @@ describe("parseLinkedIssue", () => {
       "utf8",
     );
     assert.equal(parseLinkedIssue(template, REPO), null);
-    assert.equal(parseLinkedIssue(template.replace("Closes #", "Closes #42"), REPO).number, 42);
+    const filled = template.replace("Approved issue: #", "Approved issue: #42");
+    assert.notEqual(filled, template, "template no longer carries an `Approved issue: #` line");
+    assert.equal(parseLinkedIssue(filled, REPO).number, 42);
   });
 
   test("ignores references GitHub would not linkify", () => {
@@ -208,6 +242,13 @@ describe("parseLinkedIssue", () => {
     assert.equal(parseLinkedIssue("<!-- Closes #5 -->\nCloses #6", REPO).number, 6);
     assert.equal(parseLinkedIssue("Write `Closes #5` in the description", REPO), null);
     assert.equal(parseLinkedIssue("```\nCloses #5\n```", REPO), null);
+  });
+
+  test("ignores a Refs link GitHub would not linkify", () => {
+    assert.equal(parseLinkedIssue("<!-- Refs #5 -->", REPO), null);
+    assert.equal(parseLinkedIssue("Write `Refs #5` in the description", REPO), null);
+    assert.equal(parseLinkedIssue("```\nRefs #5\n```", REPO), null);
+    assert.equal(parseLinkedIssue("<!-- Refs #5 -->\nRefs #6", REPO).number, 6);
   });
 });
 
@@ -277,6 +318,16 @@ describe("decide", () => {
     assert.equal(decision.message, GATE_MESSAGE);
   });
 
+  // Every accepted link form satisfies the gate against an approved issue,
+  // not only the closing keywords the gate used to require.
+  for (const body of ["Approved issue: #42", "Refs #42", "Part of #42", "Closes #42"]) {
+    test(`${JSON.stringify(body)} on a design-approved issue passes`, () => {
+      const decision = decide({ pullRequest: pullRequest({ body }), repoFullName: REPO, issue: approved });
+      assert.equal(decision.conclusion, "success");
+      assert.equal(decision.linkedIssue, 42);
+    });
+  }
+
   test("linked issue with the label passes", () => {
     const decision = decide({
       pullRequest: pullRequest({ body: "Closes #42" }),
@@ -312,6 +363,10 @@ describe("decide", () => {
     ["synchronize", "failure-unapproved", "Closes #42", unapproved, false],
     ["edited", "failure-no-issue", "", null, false],
     ["reopened", "failure-unapproved", "Closes #42", unapproved, false],
+    // Label changes re-run the gate (the caller triggers on them so `trivial`
+    // takes effect at once) but are not the pull request entering ready.
+    ["labeled", "failure-no-issue", "", null, false],
+    ["unlabeled", "failure-unapproved", "Refs #42", unapproved, false],
   ];
 
   for (const [action, name, body, issue, convertToDraft] of draftCases) {
@@ -332,10 +387,31 @@ describe("contributor-facing text", () => {
     assert.equal(
       GATE_MESSAGE,
       "This PR needs a linked issue with the `design-approved` label before it can be reviewed " +
-        "or merged. Add `Closes #<issue>` to the description; a maintainer will apply the label " +
-        "on the issue once the design is agreed. Trivial fixes: a maintainer can add the " +
-        "`trivial` label to this PR instead.",
+        "or merged. Link the approved issue with `Approved issue: #<issue>` (or `Refs #<issue>`) " +
+        "in the description. A maintainer will apply the `design-approved` label on the issue, or " +
+        "`trivial` on the pull request when there is genuinely no design to agree. The issue " +
+        "stays open until the change ships; maintainers take care of it then.",
     );
+  });
+
+  // A contributor who is told to write a closing keyword makes GitHub close
+  // the issue on merge, before the fix ships. This checks every rendering a
+  // blocked contributor can read, against GitHub's closing grammar, so a later
+  // edit cannot reintroduce one even as an ordinary word.
+  test("the blocked-PR message contains no closing keyword", () => {
+    const closingKeyword = /\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\b/i;
+    const rendered = [
+      decide({ pullRequest: pullRequest({ body: "" }), repoFullName: REPO }),
+      decide({
+        pullRequest: pullRequest({ body: "Refs #42" }),
+        repoFullName: REPO,
+        issue: { number: 42, state: "open", labels: [] },
+        action: "ready_for_review",
+      }),
+    ].map((decision) => buildCommentBody(decision, { draftConverted: true }));
+    for (const body of [GATE_MESSAGE, ...rendered]) {
+      assert.doesNotMatch(body, closingKeyword);
+    }
   });
 
   test("a passing pull request with no existing comment gets no comment", () => {
@@ -419,6 +495,41 @@ describe("runPullRequestGate", () => {
         "Converted back to draft; it will be marked ready automatically once #42 is design-approved.",
       ),
     );
+  });
+
+  test("a labeled event re-evaluates without converting to draft", async () => {
+    // A label event's payload carries the pull request's current labels.
+    const blocked = pullRequest({ body: "Refs #42" });
+    const { api, checkApi, state } = createFixtureApi({
+      issues: [{ number: 42, state: "open", labels: [] }],
+      pullRequests: [blocked],
+    });
+    const failing = await runPullRequestGate({
+      api,
+      checkApi,
+      repoFullName: REPO,
+      pullRequest: blocked,
+      action: "labeled",
+      log: silentLog,
+    });
+    assert.equal(failing.conclusion, "failure");
+    assert.equal(failing.draftConverted, false);
+    assert.deepEqual(state.convertedToDraft, []);
+    assert.equal(state.checkRuns.at(-1).conclusion, "failure");
+
+    // The maintainer applies `trivial`: the same event re-runs and passes.
+    const trivial = { ...blocked, labels: ["trivial"] };
+    const passing = await runPullRequestGate({
+      api,
+      checkApi,
+      repoFullName: REPO,
+      pullRequest: trivial,
+      action: "labeled",
+      log: silentLog,
+    });
+    assert.equal(passing.conclusion, "success");
+    assert.deepEqual(state.convertedToDraft, []);
+    assert.equal(state.checkRuns.at(-1).conclusion, "success");
   });
 
   test("a refused draft conversion still fails the gate", async () => {
@@ -633,7 +744,28 @@ describe("runIssueLabeled", () => {
     assert.ok(!state.comments[0].body.includes(GATE_MESSAGE));
   });
 
-  test("ignores drafts that only mention the issue without a closing keyword", async () => {
+  test("releases a draft linked with the template's non-closing line", async () => {
+    const waiting = pullRequest({
+      number: 106,
+      nodeId: "PR_node_106",
+      isDraft: true,
+      body: "Approved issue: #42",
+    });
+    const { api, checkApi, state } = createFixtureApi({ issues: [labelled], pullRequests: [waiting] });
+
+    const { released } = await runIssueLabeled({
+      api,
+      checkApi,
+      repoFullName: REPO,
+      issue: labelled,
+      log: silentLog,
+    });
+
+    assert.deepEqual(released, [106]);
+    assert.equal(state.checkRuns[0].conclusion, "success");
+  });
+
+  test("ignores drafts that only mention the issue without a linking keyword", async () => {
     const mention = pullRequest({
       number: 102,
       nodeId: "PR_node_102",

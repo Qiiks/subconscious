@@ -3,7 +3,7 @@
  * Design-approved gate for contributor pull requests.
  *
  * The rule: a pull request is reviewable and mergeable only once the issue it
- * closes carries a maintainer's `design-approved` label. GitHub has no native
+ * links carries a maintainer's `design-approved` label. GitHub has no native
  * "issue first" setting, so the rule is assembled from two primitives — this
  * script's exit code (surfaced as a required status check) and the pull
  * request's draft state.
@@ -48,21 +48,35 @@ export const MAINTAINER_BRANCH_PREFIXES = ["train", "alfonso", "ci"];
  * The only text a blocked contributor reads. Keep it exact: it has to explain
  * the rule, the fix, and the escape hatch without any other context.
  */
+/*
+ * It must not contain any of GitHub's closing keywords (close, fix, resolve and
+ * their inflections), not even as ordinary words: telling a contributor to
+ * write one makes GitHub close the issue when the pull request merges, before
+ * the release that carries the change has shipped. The test suite pins this.
+ */
 export const GATE_MESSAGE = [
   "This PR needs a linked issue with the `design-approved` label before it can be reviewed or",
-  "merged. Add `Closes #<issue>` to the description; a maintainer will apply the label on the",
-  "issue once the design is agreed. Trivial fixes: a maintainer can add the `trivial` label to",
-  "this PR instead.",
+  "merged. Link the approved issue with `Approved issue: #<issue>` (or `Refs #<issue>`) in the",
+  "description. A maintainer will apply the `design-approved` label on the issue, or `trivial`",
+  "on the pull request when there is genuinely no design to agree. The issue stays open until",
+  "the change ships; maintainers take care of it then.",
 ].join(" ");
 
 /**
- * GitHub's own closing-keyword grammar: a keyword, optional colon, whitespace,
- * then either `#N`, `owner/repo#N`, or a full issue URL. Matching what GitHub
- * matches means the gate and the "linked issues" sidebar never disagree.
+ * The ways a pull request body links an issue: a keyword, optional colon,
+ * whitespace, then either `#N`, `owner/repo#N`, or a full issue URL.
+ *
+ * Three keyword families count, and only the first one closes anything:
+ * - GitHub's closing keywords (`Closes`, `Fixes`, `Resolves` and their
+ *   inflections). Contributors keep writing them, so they are still accepted,
+ *   but GitHub closes the issue on merge, so the gate never asks for them.
+ * - `Approved issue:`, the line the pull request template carries.
+ * - `Refs` and `Part of`, for a pull request that is one step of an issue and
+ *   must leave it open.
  */
-const CLOSING_LINK_PATTERN = new RegExp(
+const ISSUE_LINK_PATTERN = new RegExp(
   [
-    String.raw`\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s+`,
+    String.raw`\b(?:(?<closing>close[sd]?|fix(?:e[sd])?|resolve[sd]?)|(?<approved>approved\s+issue)|(?<reference>refs|part\s+of))\b\s*:?\s+`,
     "(?:",
     String.raw`https?://github\.com/(?<urlOwner>[\w.-]+)/(?<urlRepo>[\w.-]+)/issues/(?<urlNumber>\d+)`,
     String.raw`|(?:(?<refOwner>[\w.-]+)/(?<refRepo>[\w.-]+))?#(?<refNumber>\d+)`,
@@ -74,7 +88,7 @@ const CLOSING_LINK_PATTERN = new RegExp(
 /**
  * GitHub does not turn references inside HTML comments, fenced blocks, or code
  * spans into links, so neither does the gate. Pull request templates routinely
- * carry an example `Closes #` inside an HTML comment; that must not count as a
+ * carry an example `Approved issue: #` inside an HTML comment; that must not count as a
  * real link.
  */
 function stripUnlinkedRegions(body) {
@@ -89,24 +103,29 @@ function sameRepo(a, b) {
 }
 
 /**
- * First issue this body closes in `repoFullName`, or null.
+ * First issue this body links in `repoFullName`, or null.
  *
  * References to other repositories are not links here at all — they are
  * skipped, and a later same-repo reference still wins.
  *
- * @returns {{ number: number, text: string } | null}
+ * `kind` says which keyword family matched: `closing` (GitHub will close the
+ * issue on merge), `approved` (the template's `Approved issue:` line) or
+ * `reference` (`Refs` / `Part of`). The gate treats all three the same.
+ *
+ * @returns {{ number: number, text: string, kind: "closing" | "approved" | "reference" } | null}
  */
 export function parseLinkedIssue(body, repoFullName) {
   if (!body) return null;
   const haystack = stripUnlinkedRegions(body);
-  CLOSING_LINK_PATTERN.lastIndex = 0;
-  for (const match of haystack.matchAll(CLOSING_LINK_PATTERN)) {
+  ISSUE_LINK_PATTERN.lastIndex = 0;
+  for (const match of haystack.matchAll(ISSUE_LINK_PATTERN)) {
     const groups = match.groups ?? {};
     const owner = groups.urlOwner ?? groups.refOwner;
     const repo = groups.urlRepo ?? groups.refRepo;
     const number = groups.urlNumber ?? groups.refNumber;
     if (owner && !sameRepo(`${owner}/${repo}`, repoFullName)) continue;
-    return { number: Number.parseInt(number, 10), text: match[0].trim() };
+    const kind = groups.closing ? "closing" : groups.approved ? "approved" : "reference";
+    return { number: Number.parseInt(number, 10), text: match[0].trim(), kind };
   }
   return null;
 }
@@ -181,6 +200,10 @@ export function decide({ pullRequest, repoFullName, issue = null, action = "open
     // draft conversion is then the only enforcement the gate has, and a
     // contributor who opens a non-draft pull request with no linked issue
     // would otherwise stay ready for review until a human drafted it by hand.
+    //
+    // `labeled` and `unlabeled` are also comment-only: the caller triggers on
+    // them so that a maintainer applying `trivial` re-runs the gate, and a
+    // label change is not the pull request entering the ready state.
     convertToDraft: action === "opened" || action === "ready_for_review",
     skipped: false,
   });

@@ -10,7 +10,7 @@ name: Design gate
 # used to start only once the code already existed — on an issue opened after
 # the fact, or on a competing PR. This workflow moves that conversation in
 # front of the code: a PR is reviewable and mergeable only once the issue it
-# closes carries a maintainer's `design-approved` label.
+# links carries a maintainer's `design-approved` label.
 #
 # GitHub has no "issue first" setting, so the rule is built from two
 # primitives: the check this workflow reports (made a required status check
@@ -32,10 +32,11 @@ name: Design gate
 # `scripts/design-gate.test.mjs` asserts it against this file and the action.
 #
 # The triggers live in the CALLER, because a reusable workflow cannot add any.
-# Note what the caller's trigger list must include: label changes on a PR do
-# not re-run this workflow. When a maintainer applies `trivial` to an
-# already-failing PR, re-run from the checks tab (or push) to turn the check
-# green.
+# The canonical caller in docs/contribution-gate.md includes `labeled` and
+# `unlabeled` in its `pull_request_target` types, so a maintainer applying
+# `trivial` to an already-failing PR re-runs the gate and turns the check
+# green. A caller that leaves them out only re-evaluates on the next push or a
+# manual re-run from the checks tab.
 
 on:
   workflow_call:

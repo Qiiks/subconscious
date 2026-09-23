@@ -45,7 +45,7 @@ name: Design gate
 
 on:
   pull_request_target:
-    types: [opened, edited, reopened, synchronize, ready_for_review]
+    types: [opened, edited, reopened, synchronize, ready_for_review, labeled, unlabeled]
   issues:
     types: [labeled]
 
@@ -67,6 +67,13 @@ Both trigger blocks are required: `pull_request_target` evaluates pull
 requests, and `issues: labeled` is what releases the drafts waiting on an issue
 when a maintainer approves it. A caller that declares only the first gets a
 gate that blocks and never unblocks.
+
+`labeled` and `unlabeled` are in the pull request types so that a maintainer
+applying `trivial` to a failing pull request (or removing it) re-runs the gate
+and the check follows the label. The payload of a label event carries the pull
+request's current labels, so the gate simply re-evaluates; a label change never
+converts a pull request back to draft — only `opened` and `ready_for_review`
+do.
 
 The `permissions:` block is an obligation rather than a knob, and `checks:
 write` is the half worth understanding. The gate publishes the `design-gate`
@@ -121,11 +128,24 @@ operator's, not the seat's.
 
 ### 4. The pull request template
 
-Copy `.github/pull_request_template.md` from this repository. It carries the
-`Closes #` line in the place a contributor actually reads, and the gate's
-parser is pinned against it: `scripts/design-gate.test.mjs` asserts that an
-unfilled template does not satisfy the gate and that filling in the number
-does.
+Copy `.github/pull_request_template.md` from this repository. The line that
+matters is the first one under its heading:
+
+```markdown
+Approved issue: #
+```
+
+It sits in the place a contributor actually reads, and the gate's parser is
+pinned against it: `scripts/design-gate.test.mjs` asserts that an unfilled
+template does not satisfy the gate and that filling in the number does.
+
+The gate accepts `Approved issue: #N`, `Refs #N`, `Part of #N`, and GitHub's
+closing keywords (`Closes #N` and friends), each also as `owner/repo#N` or an
+issue URL in the same repository. It never asks for a closing keyword: GitHub
+closes the issue the moment the pull request merges, before the release that
+carries the change has shipped, and a pull request that is one step of an issue
+would have to claim a closure it does not intend. Maintainers close issues when
+the fix ships.
 
 ### 5. Branch protection
 
@@ -168,10 +188,10 @@ trigger means a docs-only pull request produces no run, no run produces no
 pull request unmergeable with an empty check list. Copy the `on:` block above
 as it stands.
 
-The `types:` list matters for the same reason in the other direction: label
-changes on a pull request do not appear in it, so applying `trivial` to an
-already-failing pull request does not re-run the gate. Re-run it from the
-checks tab, or push.
+The `types:` list matters for the same reason in the other direction: leave
+`labeled` and `unlabeled` out and applying `trivial` to an already-failing pull
+request does not re-run the gate, so the check stays red until someone re-runs
+it from the checks tab or pushes.
 
 ## Why there is no checkout
 
@@ -194,8 +214,8 @@ against both files that actually run the gate.
 node --test scripts/design-gate.test.mjs
 ```
 
-**The suite is 87 arms.** That number is pinned here on purpose: a lift that
-reports anything other than `# tests 87` has a setup defect before it has a
+**The suite is 112 arms.** That number is pinned here on purpose: a lift that
+reports anything other than `# tests 112` has a setup defect before it has a
 gate. The security arms read the workflow and the action from disk, and a
 missing file reports as a named failure — `workflow file missing at <path>` —
 rather than as arms that quietly fail to register.
