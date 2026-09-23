@@ -2760,6 +2760,104 @@ async fn policy_resolver_reply_revision_invalidates_every_older_cache_entry() {
     harness.stop().await;
 }
 
+/// A long-lived resolver that sees many subjects must not grow without bound:
+/// once a subject's entries expire, its entry, its route (observed from the
+/// resolver module's side) and its subscription task all go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn policy_resolver_releases_expired_subjects_entries_routes_and_tasks() {
+    const SUBJECTS: usize = 6;
+    let replies = (0..SUBJECTS + 2).map(|_| PolicyScript::Reply {
+        verdict: "allow",
+        revision: 1,
+        ttl_ms: 50,
+    });
+    let harness = start_policy_harness(replies).await;
+    let consumer = SubcConsumer::connect(&harness.daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    let resolver = policy_resolver(consumer, Duration::from_secs(1));
+    let project_root = policy_project_root();
+    let resolve = |subject: String| {
+        resolver.resolve(
+            "approval",
+            "plexus.github_write",
+            Subject::AgentId(subject),
+            ProjectRef::Root(project_root.clone()),
+        )
+    };
+
+    assert_eq!(resolve("agent-0".into()).await, Ok(PolicyVerdict::Allow));
+    assert_eq!(policy_module_routes_reaching(&harness.handler, 1).await, 1);
+    let baseline = resolver.footprint();
+    assert_eq!((baseline.entries, baseline.routes), (1, 1));
+
+    for index in 1..=SUBJECTS {
+        assert_eq!(
+            resolve(format!("agent-{index}")).await,
+            Ok(PolicyVerdict::Allow)
+        );
+    }
+    assert_eq!(
+        policy_module_routes_reaching(&harness.handler, SUBJECTS + 1).await,
+        SUBJECTS + 1,
+        "each subject holds its own route while its entry is live"
+    );
+
+    // Every entry so far expires; the next resolve (a new subject) sweeps them.
+    sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        resolve("agent-fresh".into()).await,
+        Ok(PolicyVerdict::Allow)
+    );
+    assert_eq!(
+        policy_module_routes_reaching(&harness.handler, 1).await,
+        1,
+        "expired subjects' routes must be closed at the resolver module"
+    );
+    // The fake serves one held policy.subscribe stream per harness: agent-0's.
+    // Every later subscribe is refused and its task ends on its own, so the
+    // only task that can outlive its subject is agent-0's, and once its route
+    // is released no task should remain. (An aborted task is counted until
+    // the runtime drops it, hence the wait.)
+    assert_eq!(baseline.subscriptions, 1);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut after = resolver.footprint();
+    while after.subscriptions > 0 && Instant::now() < deadline {
+        sleep(Duration::from_millis(10)).await;
+        after = resolver.footprint();
+    }
+    assert_eq!(
+        (after.entries, after.routes),
+        (baseline.entries, baseline.routes),
+        "entry and route counts return to the one-subject baseline"
+    );
+    assert_eq!(
+        after.subscriptions, 0,
+        "the expired subject's subscription task must end with its route: {after:?}"
+    );
+    assert_eq!(harness.handler.calls(), SUBJECTS as u64 + 2);
+
+    drop(resolver);
+    harness.stop().await;
+}
+
+/// The resolver module's live route count once it reaches `expected`, or
+/// whatever it is at the deadline.
+async fn policy_module_routes_reaching(handler: &PolicyModuleHandler, expected: usize) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let routes = handler
+            .routes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
+        if routes == expected || Instant::now() >= deadline {
+            return routes;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn policy_resolver_refetches_after_ttl_expiry() {
     let harness = start_policy_harness([

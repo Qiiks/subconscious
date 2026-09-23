@@ -11,8 +11,8 @@ pub use consumer::{
     DEFAULT_LIVENESS_PROBE_WINDOW, DEFAULT_ROUTE_RETRY_DEADLINE,
 };
 pub use policy_cache::{
-    PolicyResolveError, PolicyResolver, PolicyResolverConfig, PolicyVerdict, ProjectRef, Subject,
-    DEFAULT_POLICY_RESOLVER_MODULE_ID,
+    PolicyResolveError, PolicyResolver, PolicyResolverConfig, PolicyResolverFootprint,
+    PolicyVerdict, ProjectRef, Subject, DEFAULT_POLICY_RESOLVER_MODULE_ID,
 };
 
 use std::{

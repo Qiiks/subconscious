@@ -1,11 +1,14 @@
 //! Revision-aware policy resolution for modules that enforce fleet gates.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     error::Error,
     fmt,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -13,7 +16,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use subc_protocol::{BindIdentity, RouteTarget};
 use tokio::time::timeout;
 
-use crate::{CallOptions, RouteHandle, SubcConsumer, SubscribeOptions};
+use crate::{CallOptions, CloseRouteOptions, RouteHandle, SubcConsumer, SubscribeOptions};
 
 /// The resolver module used when a deployment does not override the target.
 pub const DEFAULT_POLICY_RESOLVER_MODULE_ID: &str = "prefrontal-core";
@@ -146,6 +149,17 @@ impl fmt::Display for PolicyResolveError {
 impl Error for PolicyResolveError {}
 
 /// Shared resolve-with-cache helper for fleet policy gates.
+///
+/// Each subject (per project root) resolves over its own route, which also
+/// carries a `policy.subscribe` task. State for a subject is released once its
+/// verdicts expire: expired entries are removed, and a route whose last verdict
+/// has expired, with no resolve in flight on it, is closed and its subscription
+/// task aborted. That happens in a sweep at the start of `resolve`, which runs
+/// only once the earliest recorded expiry has passed, so a resolver holds state
+/// only for subjects with a verdict still live, plus at most whatever expired
+/// since its last call. Expiry was chosen over an LRU cap because TTL is what
+/// already bounds a verdict's usefulness, and a cap would either close routes
+/// with live verdicts or need a size nobody can pick for every deployment.
 pub struct PolicyResolver {
     // Arc so the bump-subscription task can hold the consumer without
     // demanding Clone on SubcConsumer's public surface.
@@ -153,12 +167,41 @@ pub struct PolicyResolver {
     resolver_module_id: String,
     config: PolicyResolverConfig,
     cache: Arc<Mutex<CacheState>>,
+    /// Held by a sweep while it chooses and closes idle routes, and by a
+    /// resolve while it opens its route. Without it a sweep could close a
+    /// route that a resolve had just reopened from the consumer's cache.
+    route_gate: tokio::sync::Mutex<()>,
+    /// Running subscription tasks, counted by the tasks themselves.
+    live_subscriptions: Arc<AtomicUsize>,
 }
+
+/// A resolver route's identity: bind root and route session. Two subjects or
+/// projects that bind the same identity share the route.
+type RouteIdentity = (PathBuf, String);
 
 struct CacheState {
     last_known_revision: u64,
     entries: HashMap<CacheKey, CacheEntry>,
-    push_routes: HashSet<RouteHandle>,
+    routes: HashMap<RouteIdentity, RouteState>,
+    /// Earliest instant at which some entry or route may have become
+    /// releasable; `None` when nothing is waiting to expire.
+    next_sweep_at: Option<Instant>,
+    next_subscription_id: u64,
+}
+
+struct RouteState {
+    handle: Option<RouteHandle>,
+    /// Expiry of the latest verdict resolved over this route. A revision bump
+    /// invalidates verdicts but not the route; it stays until this passes.
+    live_until: Instant,
+    in_flight: usize,
+    subscription: Option<SubscriptionTask>,
+}
+
+struct SubscriptionTask {
+    id: u64,
+    handle: RouteHandle,
+    abort: tokio::task::AbortHandle,
 }
 
 impl CacheState {
@@ -166,7 +209,9 @@ impl CacheState {
         Self {
             last_known_revision: 0,
             entries: HashMap::new(),
-            push_routes: HashSet::new(),
+            routes: HashMap::new(),
+            next_sweep_at: None,
+            next_subscription_id: 0,
         }
     }
 
@@ -175,6 +220,96 @@ impl CacheState {
             self.last_known_revision = revision;
             self.entries.clear();
         }
+    }
+
+    fn schedule_sweep(&mut self, at: Instant) {
+        self.next_sweep_at = Some(self.next_sweep_at.map_or(at, |next| next.min(at)));
+    }
+
+    fn sweep_due(&self, now: Instant) -> bool {
+        self.next_sweep_at.is_some_and(|at| at <= now)
+    }
+
+    /// Remove expired entries and idle routes; return the route handles the
+    /// caller must close. Aborting a subscription task drops its
+    /// `Subscription`, which sends the provider a Cancel.
+    fn evict_expired(&mut self, now: Instant) -> Vec<RouteHandle> {
+        self.entries.retain(|_, entry| entry.expires_at > now);
+        let mut closing = Vec::new();
+        self.routes.retain(|_, route| {
+            if route.in_flight > 0 || route.live_until > now {
+                return true;
+            }
+            if let Some(subscription) = route.subscription.take() {
+                subscription.abort.abort();
+            }
+            closing.extend(route.handle);
+            false
+        });
+        self.next_sweep_at = None;
+        let pending = self
+            .entries
+            .values()
+            .map(|entry| entry.expires_at)
+            .chain(self.routes.values().map(|route| route.live_until))
+            .collect::<Vec<_>>();
+        for at in pending {
+            self.schedule_sweep(at);
+        }
+        closing
+    }
+}
+
+/// Marks a resolve in flight on a route so a sweep leaves the route open.
+struct InFlight {
+    cache: Arc<Mutex<CacheState>>,
+    route: RouteIdentity,
+}
+
+impl InFlight {
+    fn enter(cache: &Arc<Mutex<CacheState>>, route: RouteIdentity) -> Self {
+        let now = Instant::now();
+        let mut state = lock(cache);
+        state
+            .routes
+            .entry(route.clone())
+            .or_insert_with(|| RouteState {
+                handle: None,
+                live_until: now,
+                in_flight: 0,
+                subscription: None,
+            })
+            .in_flight += 1;
+        Self {
+            cache: Arc::clone(cache),
+            route,
+        }
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        let mut state = lock(&self.cache);
+        let Some(route) = state.routes.get_mut(&self.route) else {
+            return;
+        };
+        route.in_flight -= 1;
+        if route.in_flight == 0 {
+            // A failed or cancelled resolve leaves no verdict to extend the
+            // route's life; let the next sweep consider it.
+            let live_until = route.live_until;
+            state.schedule_sweep(live_until);
+        }
+    }
+}
+
+/// Decrements the live subscription count when its task ends, including by
+/// abort (which drops the task's future, and this with it).
+struct LiveSubscription(Arc<AtomicUsize>);
+
+impl Drop for LiveSubscription {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, AtomicOrdering::SeqCst);
     }
 }
 
@@ -267,6 +402,17 @@ struct PolicyRevisionBump {
     body: PolicyRevisionBumpBody,
 }
 
+/// Per-subject state a [`PolicyResolver`] holds, from [`PolicyResolver::footprint`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolicyResolverFootprint {
+    /// Cached verdicts.
+    pub entries: usize,
+    /// Resolver routes held open, one per subject and project root.
+    pub routes: usize,
+    /// Running `policy.subscribe` tasks, at most one per held route.
+    pub subscriptions: usize,
+}
+
 impl PolicyResolver {
     /// Create a resolver that targets [`DEFAULT_POLICY_RESOLVER_MODULE_ID`].
     pub fn new(consumer: SubcConsumer, config: PolicyResolverConfig) -> Self {
@@ -284,6 +430,8 @@ impl PolicyResolver {
             resolver_module_id: resolver_module_id.into(),
             config,
             cache: Arc::new(Mutex::new(CacheState::new())),
+            route_gate: tokio::sync::Mutex::new(()),
+            live_subscriptions: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -302,9 +450,12 @@ impl PolicyResolver {
             project: project.clone(),
         };
 
+        self.sweep_expired().await;
         if let Some(verdict) = self.cached_verdict(&key) {
             return Ok(verdict);
         }
+        let route_id: RouteIdentity = (project.bind_root(), subject.route_session());
+        let _in_flight = InFlight::enter(&self.cache, route_id.clone());
 
         let request = PolicyResolveRequest {
             method: POLICY_RESOLVE_OP,
@@ -329,6 +480,7 @@ impl PolicyResolver {
         };
 
         let wire_call = async {
+            let gate = self.route_gate.lock().await;
             let route = self
                 .consumer
                 .open_route(
@@ -343,7 +495,8 @@ impl PolicyResolver {
                 )
                 .await
                 .map_err(|e| PolicyResolveError::fault(format!("route open: {e}")))?;
-            self.install_push_receiver(route)?;
+            drop(gate);
+            self.install_push_receiver(&route_id, route);
             self.consumer
                 .request(&route, body, call_options)
                 .await
@@ -372,6 +525,10 @@ impl PolicyResolver {
             ));
         }
         cache.observe_revision(reply.revision);
+        if let Some(route) = cache.routes.get_mut(&route_id) {
+            route.live_until = route.live_until.max(expires_at);
+        }
+        cache.schedule_sweep(expires_at);
         cache.entries.insert(
             key,
             CacheEntry {
@@ -383,12 +540,47 @@ impl PolicyResolver {
         Ok(reply.verdict)
     }
 
-    fn cached_verdict(&self, key: &CacheKey) -> Option<PolicyVerdict> {
+    /// How much per-subject state this resolver holds right now.
+    pub fn footprint(&self) -> PolicyResolverFootprint {
         let cache = lock(&self.cache);
+        PolicyResolverFootprint {
+            entries: cache.entries.len(),
+            routes: cache
+                .routes
+                .values()
+                .filter(|route| route.handle.is_some())
+                .count(),
+            subscriptions: self.live_subscriptions.load(AtomicOrdering::SeqCst),
+        }
+    }
+
+    /// Release expired entries and the routes and subscription tasks of
+    /// subjects with no live verdict. A no-op until the earliest recorded
+    /// expiry has passed.
+    async fn sweep_expired(&self) {
+        if !lock(&self.cache).sweep_due(Instant::now()) {
+            return;
+        }
+        let _gate = self.route_gate.lock().await;
+        let closing = lock(&self.cache).evict_expired(Instant::now());
+        for handle in closing {
+            // A handle from an earlier connection generation fails locally;
+            // that route is already gone with its connection.
+            let _ = self
+                .consumer
+                .close_handle(&handle, CloseRouteOptions::default())
+                .await;
+        }
+    }
+
+    fn cached_verdict(&self, key: &CacheKey) -> Option<PolicyVerdict> {
+        let mut cache = lock(&self.cache);
         let entry = cache.entries.get(key)?;
         if entry.expires_at > Instant::now() && entry.revision == cache.last_known_revision {
             Some(entry.verdict.clone())
         } else {
+            // Never usable again: expired, or from an older revision.
+            cache.entries.remove(key);
             None
         }
     }
@@ -402,27 +594,41 @@ impl PolicyResolver {
     /// the stream dying only means staleness reverts to the TTL bound, so the
     /// holder re-subscribes on the next resolve rather than retrying in a
     /// loop.
-    fn install_push_receiver(&self, route: RouteHandle) -> Result<(), PolicyResolveError> {
-        {
-            let mut cache = lock(&self.cache);
-            if !cache.push_routes.insert(route) {
-                return Ok(());
+    ///
+    /// One task per held route: the task is recorded on the route's state, is
+    /// replaced when the route's handle changes (a reconnect), and is aborted
+    /// when a sweep closes the route.
+    fn install_push_receiver(&self, route_id: &RouteIdentity, route: RouteHandle) {
+        let mut cache = lock(&self.cache);
+        let id = cache.next_subscription_id;
+        let Some(state) = cache.routes.get_mut(route_id) else {
+            return;
+        };
+        state.handle = Some(route);
+        if let Some(existing) = &state.subscription {
+            if existing.handle == route {
+                return;
             }
+            existing.abort.abort();
         }
         let consumer = std::sync::Arc::clone(&self.consumer);
-        let cache = Arc::clone(&self.cache);
+        let task_cache = Arc::clone(&self.cache);
+        let task_route_id = route_id.clone();
+        self.live_subscriptions.fetch_add(1, AtomicOrdering::SeqCst);
+        let live = LiveSubscription(Arc::clone(&self.live_subscriptions));
         let body = serde_json::to_vec(&serde_json::json!({
             "method": POLICY_SUBSCRIBE_OP,
             "params": {},
         }))
         .expect("static subscribe body serializes");
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
+            let _live = live;
             match consumer
                 .subscribe_route(&route, body, SubscribeOptions::default())
                 .await
             {
                 Ok(mut subscription) => {
-                    drain_revision_bumps(subscription.events(), Arc::clone(&cache)).await;
+                    drain_revision_bumps(subscription.events(), Arc::clone(&task_cache)).await;
                 }
                 Err(_) => {
                     // No bump lane: TTL alone bounds staleness (constraint 4
@@ -430,9 +636,23 @@ impl PolicyResolver {
                     // lets the next resolve retry the subscription.
                 }
             }
-            lock(&cache).push_routes.remove(&route);
+            let mut cache = lock(&task_cache);
+            if let Some(state) = cache.routes.get_mut(&task_route_id) {
+                if state
+                    .subscription
+                    .as_ref()
+                    .is_some_and(|task| task.id == id)
+                {
+                    state.subscription = None;
+                }
+            }
         });
-        Ok(())
+        state.subscription = Some(SubscriptionTask {
+            id,
+            handle: route,
+            abort: task.abort_handle(),
+        });
+        cache.next_subscription_id += 1;
     }
 }
 
