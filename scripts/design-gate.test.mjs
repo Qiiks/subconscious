@@ -168,6 +168,7 @@ describe("parseLinkedIssue", () => {
     [`Approved issue: ${REPO}#12`, 12],
     [`Approved issue: https://github.com/${REPO}/issues/12`, 12],
     ["Refs #12", 12],
+    ["Ref #12", 12],
     ["refs: #12", 12],
     ["Refs #12 (not closing)", 12],
     [`Refs https://github.com/${REPO}/issues/12`, 12],
@@ -178,6 +179,7 @@ describe("parseLinkedIssue", () => {
     // Negative control: a bare reference with no closing keyword is a
     // mention, not a link. GitHub does not close it and neither do we.
     ["See #123 for context", null],
+    ["see #42 for background", null],
     ["#123", null],
     ["Related to #123", null],
     // Keyword-lookalikes must not match.

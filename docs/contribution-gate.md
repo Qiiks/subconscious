@@ -214,8 +214,8 @@ against both files that actually run the gate.
 node --test scripts/design-gate.test.mjs
 ```
 
-**The suite is 112 arms.** That number is pinned here on purpose: a lift that
-reports anything other than `# tests 112` has a setup defect before it has a
+**The suite is 114 arms.** That number is pinned here on purpose: a lift that
+reports anything other than `# tests 114` has a setup defect before it has a
 gate. The security arms read the workflow and the action from disk, and a
 missing file reports as a named failure — `workflow file missing at <path>` —
 rather than as arms that quietly fail to register.

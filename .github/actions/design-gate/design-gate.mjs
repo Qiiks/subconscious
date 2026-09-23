@@ -71,12 +71,14 @@ export const GATE_MESSAGE = [
  *   inflections). Contributors keep writing them, so they are still accepted,
  *   but GitHub closes the issue on merge, so the gate never asks for them.
  * - `Approved issue:`, the line the pull request template carries.
- * - `Refs` and `Part of`, for a pull request that is one step of an issue and
- *   must leave it open.
+ * - `Ref`/`Refs` and `Part of`, for a pull request that is one step of an
+ *   issue and must leave it open. `See #N` is deliberately not a link: it is how
+ *   prose mentions an issue, and with the first link winning it could select an
+ *   unrelated approved issue.
  */
 const ISSUE_LINK_PATTERN = new RegExp(
   [
-    String.raw`\b(?:(?<closing>close[sd]?|fix(?:e[sd])?|resolve[sd]?)|(?<approved>approved\s+issue)|(?<reference>refs|part\s+of))\b\s*:?\s+`,
+    String.raw`\b(?:(?<closing>close[sd]?|fix(?:e[sd])?|resolve[sd]?)|(?<approved>approved\s+issue)|(?<reference>refs?|part\s+of))\b\s*:?\s+`,
     "(?:",
     String.raw`https?://github\.com/(?<urlOwner>[\w.-]+)/(?<urlRepo>[\w.-]+)/issues/(?<urlNumber>\d+)`,
     String.raw`|(?:(?<refOwner>[\w.-]+)/(?<refRepo>[\w.-]+))?#(?<refNumber>\d+)`,
