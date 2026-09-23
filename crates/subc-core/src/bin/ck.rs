@@ -3441,7 +3441,7 @@ fn collect_daemon_triage(candidates: &[PathBuf], run_dir: &Path) -> TriageReport
         .and_then(|(_, _, pid)| *pid)
         .and_then(|pid| u32::try_from(pid).ok());
     let process_fact = triage_process_fact(pid);
-    let log_path = effective_run_dir.join("subc.log");
+    let log_path = triage_daemon_log_path(effective_run_dir);
     let log_fact = triage_log_fact(&log_path);
     let connection_present = selected.is_some()
         || connection_candidates
@@ -3626,6 +3626,39 @@ fn triage_process_fact(pid: Option<u32>) -> Value {
     })
 }
 
+/// The daemon log a triage should tail: the newest dated segment
+/// (`logs/subc.<YYYY-MM-DD>.log`, where the daemon writes since fleet-logging
+/// r2), else the r1 file in `logs/`, else the older stderr redirect beside the
+/// connection file.
+///
+/// The r1 files are never deleted by an upgrade, only abandoned, so preferring
+/// them would show the tail from the day the daemon was upgraded as though it
+/// were current. Segments are picked by the date in their name, the same rule
+/// `ck module logs` uses; the fact reports the file's mtime so a stale choice is
+/// visible rather than silent.
+fn triage_daemon_log_path(run_dir: &Path) -> PathBuf {
+    let logs = run_dir.join("logs");
+    let newest_segment = fs::read_dir(&logs).ok().and_then(|entries| {
+        entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                let day = segment_day("subc", name.to_str()?)?;
+                Some((day, entry.path()))
+            })
+            .max_by_key(|(day, _)| *day)
+            .map(|(_, path)| path)
+    });
+    if let Some(path) = newest_segment {
+        return path;
+    }
+    let r1 = logs.join("subc.log");
+    if r1.exists() {
+        return r1;
+    }
+    run_dir.join("subc.log")
+}
+
 fn triage_log_fact(path: &Path) -> Value {
     let Ok(metadata) = fs::metadata(path) else {
         return if path.exists() {
@@ -3666,6 +3699,17 @@ fn triage_log_fact(path: &Path) -> Value {
     let mut fact = serde_json::Map::new();
     fact.insert("path".into(), json!(path.display().to_string()));
     fact.insert("status".into(), json!("present"));
+    // A tail carries no age of its own: a file nothing has written for days
+    // reads exactly like a current one unless the fact says when it was last
+    // written.
+    if let Some(modified_ms) = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|since| since.as_millis() as u64)
+    {
+        fact.insert("modified_at_ms".into(), json!(modified_ms));
+    }
     fact.insert("lines".into(), json!(tail));
     fact.insert("tail_lines".into(), json!(tail.len()));
     if truncated {
@@ -3732,8 +3776,18 @@ fn print_daemon_triage(report: &TriageReport) {
     );
     println!("log-tail:");
     let log = &report.json["log_tail"];
+    let written = log
+        .get("modified_at_ms")
+        .and_then(Value::as_u64)
+        .map(|modified_ms| {
+            format!(
+                ", last written {}",
+                format_age_from_epoch_ms_now(modified_ms)
+            )
+        })
+        .unwrap_or_default();
     println!(
-        "  {}: {}",
+        "  {}: {}{written}",
         triage_string(log.get("path")),
         triage_string(log.get("status"))
     );
@@ -8872,6 +8926,54 @@ mod tests {
         let rendered = serde_json::to_string(log_fact).unwrap();
         assert!(rendered.contains("newest-line"));
         assert!(!rendered.contains("oldest-line"));
+    }
+
+    /// After an upgrade to fleet-logging r2 the daemon writes dated segments in
+    /// `logs/` and abandons, but never deletes, the r1 files. Triage runs when
+    /// the daemon is down, so tailing an abandoned file shows the day of the
+    /// upgrade as though it were the latest output.
+    #[test]
+    fn daemon_triage_tails_the_newest_dated_segment_over_abandoned_r1_logs() {
+        let dir = triage_fixture_dir("log-r2");
+        let connection = dir.join(CONNECTION_FILE_NAME);
+        let logs = dir.join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(dir.join("subc.log"), "stderr-redirect-line\n").unwrap();
+        fs::write(logs.join("subc.log"), "r1-line\n").unwrap();
+        fs::write(logs.join("subc.2026-09-20.log"), "older-segment-line\n").unwrap();
+        fs::write(logs.join("subc.2026-09-22.log"), "newest-segment-line\n").unwrap();
+        fs::write(logs.join("subc.stderr.log"), "not-the-daemon-log\n").unwrap();
+
+        let report = collect_daemon_triage(std::slice::from_ref(&connection), &dir);
+        let fact = &report.json["log_tail"];
+        assert_eq!(
+            fact["path"],
+            logs.join("subc.2026-09-22.log").display().to_string()
+        );
+        let rendered = serde_json::to_string(fact).unwrap();
+        assert!(rendered.contains("newest-segment-line"), "{rendered}");
+        assert!(
+            fact["modified_at_ms"].as_u64().is_some(),
+            "the fact must say when the file was last written: {rendered}"
+        );
+    }
+
+    /// A host that has not moved to r2 has no segment yet: its r1 file is
+    /// still the live log and must still be read.
+    #[test]
+    fn daemon_triage_falls_back_to_the_r1_log_when_no_segment_exists() {
+        let dir = triage_fixture_dir("log-r1");
+        let connection = dir.join(CONNECTION_FILE_NAME);
+        let logs = dir.join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(dir.join("subc.log"), "stderr-redirect-line\n").unwrap();
+        fs::write(logs.join("subc.log"), "r1-line\n").unwrap();
+
+        let report = collect_daemon_triage(std::slice::from_ref(&connection), &dir);
+        assert_eq!(
+            report.json["log_tail"]["path"],
+            logs.join("subc.log").display().to_string()
+        );
     }
 
     #[test]
