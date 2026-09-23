@@ -154,6 +154,22 @@ done
 # Raised by ENGRAM (2026-09-19) on a fix that deletes one call and adds a
 # comment. They stated "no markers by strings" on the card rather than reaching
 # for a literal that would have read 1/1 and looked like a passing arm.
+# --module IS THE SUPERVISOR'S MODULE ID (`plexus`), not the binary name
+# (`ck-plexus`). The binary name is derived from it for the default --dest and
+# the currency lookup, but the restart step passes --module to `ck module
+# restart` verbatim. Passing the binary name placed the bytes, then the restart
+# was refused as an unknown module, pipefail aborted the script with nothing
+# printed after warm-exec, and the module kept running the OLD inode (PLEX's
+# 6adcb26, 2026-09-23). So a restarting placement resolves the id against the
+# supervisor BEFORE anything is mutated.
+if [ "$RESTART" -eq 1 ] && ! ck module status "$MODULE" >/dev/null 2>&1; then
+  hint=""
+  if [ "${MODULE#ck-}" != "$MODULE" ] && ck module status "${MODULE#ck-}" >/dev/null 2>&1; then
+    hint=" -- did you mean --module ${MODULE#ck-}? (--module is the supervisor id, not the binary name)"
+  fi
+  echo "REFUSED: the supervisor does not know module '$MODULE', so the restart step would fail after placement${hint}; pass --no-restart to place without restarting" >&2
+  exit 2
+fi
 DEST="${DEST:-$BIN_DIR/ck-$MODULE}"
 [ -f "$STAGED" ] || { echo "REFUSED: staged artifact not found: $STAGED" >&2; exit 2; }
 [ -f "$DEST" ] || { echo "REFUSED: destination does not exist, so this is an install rather than a placement: $DEST" >&2; exit 2; }
@@ -676,7 +692,12 @@ fi
 
 if [ "$RESTART" -eq 1 ]; then
   say "=== restart"
-  ck module restart "$MODULE" 2>&1 | tail -1
+  # Checked, not piped away: a refused restart leaves the module on the old
+  # inode with the new bytes on disk, which reads as placed.
+  if ! restart_out=$(ck module restart "$MODULE" 2>&1); then
+    refuse "restart of '$MODULE' failed after placement; the new bytes are on disk but the module still runs the old inode: ${restart_out}"
+  fi
+  printf '%s\n' "$restart_out" | tail -1
     say "$(date -u +%FT%TZ) restart initiated -- verify on a lane opened AFTER this point:"
     # THE PID COMES FROM PROVENANCE, NOT FROM `pgrep` AND NOT FROM `module status`.
     #
