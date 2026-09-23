@@ -1801,7 +1801,7 @@ dependencies = [
 
 [[package]]
 name = "subc-client-rs"
-version = "0.18.2"
+version = "0.18.3"
 dependencies = [
  "async-trait",
  "serde",
@@ -1851,7 +1851,7 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.20.26"
+version = "0.20.27"
 dependencies = [
  "cortexkit-log",
  "cortexkit-paths",

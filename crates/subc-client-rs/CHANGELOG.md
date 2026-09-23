@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.18.2 — 2026-09-23
+## 0.18.3 — 2026-09-23
 
 - `PolicyResolver` releases a subject's state once its verdicts expire: expired
   cache entries are removed, and the subject's resolver route is closed and its
