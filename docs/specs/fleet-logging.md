@@ -112,6 +112,29 @@ line, each carrying the full prefix and a `logger` of `<module>.panic`; the
 crate installs a panic hook that does this so a module's last words land in
 its own file, not only the daemon's ring.
 
+**Control characters are escaped per field, never stripped across the line.**
+Each message and each value is handled on its own, before it is placed in the
+line:
+
+1. A complete terminal escape sequence inside that one field is removed: CSI
+   (`ESC [` … final byte `0x40`–`0x7e`, or C1 `U+009B` …), and OSC (`ESC ]` or C1
+   `U+009D` … ended by `BEL`, `ESC \` or C1 `U+009C`). A sequence that does not
+   end inside the field is not a sequence and is not removed.
+2. Every control character still left — `U+0000`–`U+001F` other than `\n` and
+   `\r` (which keep those escapes), `U+007F`, and `U+0080`–`U+009F` — is written
+   as `\u` plus four lowercase hex digits (`\u001b`, `\u0009`, `\u0085`).
+   Backslash is escaped first, so a literal `\u0041` in the text renders as
+   `\\u0041` and cannot be read back as an escape.
+3. A value that contains any escape is quoted, like one containing a space.
+
+The guard after a module's redactor escapes any raw control character the
+redactor introduces the same way; it never strips. Stripping on the whole line
+was the r2.0 behaviour and it lost data: a stray `ESC ]` in one value began an
+OSC that consumed the rest of that value, its closing quote and every field
+after it, up to a terminator that never came. A rendered line therefore never
+contains a raw control character, which is what the `ansi-in-line` parse
+reject checks.
+
 Nothing marks where the message ends and event fields begin. A message that
 contains a literal `key=value` is ambiguous to a field parser. This is the same
 trade `tracing`'s fmt layer and zerolog's console writer make, and it is
@@ -289,11 +312,23 @@ invariant from the other end.
 
 ## Redaction
 
-Unchanged from r1. The sink takes a `Redactor` (a `fn(&str) -> Cow<str>` on
-Rust, a `(line: string) => string` on TS) applied to every complete line before
-the write. Fleet default redacts credential shapes (bearer/JWT-looking tokens,
-`ckh_` handles, `sk-`/`ghp_`-style keys, `Authorization:` values); a module
-composes its own on top (MC's sanitizer; claustrum's hand-written redacting
+The sink takes a `Redactor` (a `fn(&str) -> Cow<str>` on Rust, a
+`(line: string) => string` on TS) applied to every complete line before the
+write. The fleet default redacts, and both twins pin it with the fixture's
+`redaction` section:
+
+- `Authorization:` values, `Bearer …`, JWT-shaped tokens, `ckh_` handles and
+  `sk-` keys;
+- GitHub tokens: `ghp_`, `gho_`, `ghs_`, `ghu_`, `ghr_` and fine-grained
+  `github_pat_`;
+- URL userinfo, `scheme://user:pass@host` or `scheme://token@host`, to
+  `scheme://[REDACTED]@host`;
+- credential query parameters (`access_token`, `token`, `api_key`, `apikey`,
+  `password`, `secret`, `client_secret`) after `?` or `&`, value only. AFT found
+  that a generic `key=value` rule misses `?access_token=` inside a URL because
+  `https:` matches as the key, which is why the query rule is its own pattern.
+
+A module composes its own on top (MC's sanitizer; claustrum's hand-written redacting
 `Debug` impls remain the first line of defence). A module MUST NOT log prompt
 text, message bodies, or credential payloads at any level; the redactor is the
 backstop, not the policy.
