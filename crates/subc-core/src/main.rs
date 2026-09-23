@@ -78,7 +78,7 @@ async fn main() {
         eprintln!("subc-core: {err}");
         process::exit(1);
     }
-    // The bounded SIGTERM path has already announced the cut, closed every
+    // The bounded SIGTERM path has already announced the shutdown, closed every
     // connection so modules saw EOF, and ended any child still running after a
     // short grace. Exit without dropping the Tokio runtime: tearing down every
     // task adds nothing at this point, and supervised Child handles use
