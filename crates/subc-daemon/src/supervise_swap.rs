@@ -15,29 +15,48 @@
 //! * The candidate is reached only by connection or by endpoint, never by
 //!   module id, because every by-id lookup resolves the incumbent.
 //!
-//! The whole swap runs inside the module's supervise loop, like a restart:
-//! commands queue behind it and the incumbent is not health-probed while it
-//! runs. The operator's reply is sent at cutover or failure, before the
-//! incumbent's drain, so a caller whose own requests ride the incumbent is not
-//! left waiting on a drain that is waiting on it.
+//! The whole swap runs inside the module's supervise loop, like a restart, and
+//! the incumbent is not health-probed while it runs. But the candidate's warm-up
+//! can take the whole readiness budget, so it keeps serving the module's
+//! commands meanwhile (see [`serve_command_while_warming`]): an operator stop,
+//! disable or retire aborts the swap and is then carried out on the incumbent,
+//! instead of queueing for up to the budget. The operator's reply is sent at
+//! cutover or failure, before the incumbent's drain, so a caller whose own
+//! requests ride the incumbent is not left waiting on a drain that is waiting
+//! on it.
 
 use super::*;
 use crate::registry::RegistrationSlot;
 
-/// The key naming a process's cgroup and stderr capture file.
+/// The cgroup directory name for one process of `module_id`.
 ///
-/// A swap overlaps two processes of one module, so they need different keys:
-/// the same cgroup would make them one kill domain, and the same capture file
-/// would interleave them. Keys alternate between the bare module id and
-/// `<module_id>@swap`: a candidate takes whichever key the incumbent is not
-/// using, and after cutover keeps it, so the next swap's candidate takes the
-/// other one. Two keys per module, never more, so capture files do not pile up.
-pub(crate) fn swap_slot_key(module_id: &str, alternate: bool) -> String {
-    if alternate {
-        format!("{module_id}@swap")
-    } else {
-        module_id.to_string()
+/// A swap overlaps two processes of one module and they must not share a
+/// cgroup (it would make them one kill domain), so each module has two names
+/// and a swap's candidate takes whichever the incumbent is not using, keeping
+/// it after cutover. The alternate name is the primary one plus `_swap`.
+///
+/// The encoding is injective, so no module id can name another module's
+/// cgroup, swap or not. Bytes outside `[A-Za-z0-9.-]`, the underscore
+/// included, are written as `_` and two lowercase hex digits; so every `_`
+/// the encoding produces is followed by two hex digits, and `_swap` (with `s`
+/// not a hex digit) can only be the suffix. The cgroup library's own escaping
+/// leaves this alphabet untouched. Before swap existed the library's encoding
+/// was used directly, and it passes `_` through, so `a_40swap` and `a@swap`
+/// (and `a` + `_40swap`) named one directory; for ids containing `_` the
+/// primary name therefore differs from what earlier daemons created.
+pub(crate) fn cgroup_name(module_id: &str, alternate: bool) -> String {
+    let mut name = String::with_capacity(module_id.len() + 5);
+    for byte in module_id.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.') {
+            name.push(char::from(byte));
+        } else {
+            name.push_str(&format!("_{byte:02x}"));
+        }
     }
+    if alternate {
+        name.push_str("_swap");
+    }
+    name
 }
 
 /// How a candidate's warm-up ended.
@@ -46,6 +65,22 @@ enum Warm {
     /// this connection.
     Ready(ConnectionId),
     Failed(CandidateFailure),
+    /// An operator command that must win over the swap arrived while the
+    /// candidate warmed. `connection` is the candidate's, if it registered.
+    Interrupted {
+        command: Option<SupervisorCommand>,
+        connection: Option<ConnectionId>,
+    },
+}
+
+/// What a swap hands back to the supervise loop when it ends.
+#[derive(Default)]
+pub(super) struct SwapEnd {
+    /// Commands for the loop to run next, in arrival order: configuration
+    /// updates that arrived during the warm-up (already answered, applied now
+    /// that the swap no longer holds the spec), then the stop, disable or
+    /// retire that interrupted the swap, if one did.
+    pub(super) requeue: Vec<SupervisorCommand>,
 }
 
 struct CandidateFailure {
@@ -77,8 +112,39 @@ pub(super) async fn run_swap(
     process_liveness: &SupervisorProcessLiveness,
     snapshot: &SharedSnapshot,
     child: &mut Option<SupervisedChild>,
+    commands: &mut mpsc::Receiver<SupervisorCommand>,
     ready_timeout: Duration,
     reply: oneshot::Sender<Result<(), SuperviseError>>,
+) -> SwapEnd {
+    let mut end = SwapEnd::default();
+    run_swap_inner(
+        spec,
+        runtime,
+        registry,
+        process_liveness,
+        snapshot,
+        child,
+        commands,
+        ready_timeout,
+        reply,
+        &mut end,
+    )
+    .await;
+    end
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_swap_inner(
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+    registry: &Registry,
+    process_liveness: &SupervisorProcessLiveness,
+    snapshot: &SharedSnapshot,
+    child: &mut Option<SupervisedChild>,
+    commands: &mut mpsc::Receiver<SupervisorCommand>,
+    ready_timeout: Duration,
+    reply: oneshot::Sender<Result<(), SuperviseError>>,
+    end: &mut SwapEnd,
 ) {
     let module_id = spec.module_id.as_str();
     let (forwarding, handle, incumbent_connection) =
@@ -91,11 +157,10 @@ pub(super) async fn run_swap(
             }
         };
 
-    // The candidate takes whichever slot key the incumbent is not using.
+    // The candidate takes whichever cgroup the incumbent is not using.
     let candidate_alternate = !lock_snapshot(snapshot)
         .map(|state| state.in_alternate_slot)
         .unwrap_or(false);
-    let slot_key = swap_slot_key(module_id, candidate_alternate);
     let mut candidate = match spawn_child_in_slot(
         spec,
         runtime.connection_file_path.as_deref(),
@@ -105,7 +170,7 @@ pub(super) async fn run_swap(
         #[cfg(target_os = "linux")]
         runtime.cgroup_placement.as_ref(),
         SpawnRole::SwapCandidate,
-        &slot_key,
+        candidate_alternate,
     ) {
         Ok(candidate) => candidate,
         Err(err) => {
@@ -123,7 +188,7 @@ pub(super) async fn run_swap(
     info!(
         module_id,
         candidate_pid = candidate.pid,
-        slot_key = %slot_key,
+        cgroup = %cgroup_name(module_id, candidate_alternate),
         incumbent_connection_id = incumbent_connection.get(),
         ready_timeout_ms = ready_timeout.as_millis() as u64,
         "swap candidate spawned; routing stays on the incumbent until it is ready"
@@ -135,10 +200,36 @@ pub(super) async fn run_swap(
         &mut candidate,
         incumbent_connection,
         ready_timeout,
+        commands,
+        end,
     )
     .await;
     let candidate_connection = match warm {
         Warm::Ready(connection) => connection,
+        Warm::Interrupted {
+            command,
+            connection,
+        } => {
+            let failure = CandidateFailure {
+                arm: SwapFailureArm::Interrupted,
+                detail: "an operator stop, disable or retire arrived while the candidate warmed"
+                    .to_string(),
+                exit: None,
+                connection,
+            };
+            abandon_candidate(
+                module_id,
+                registry,
+                &forwarding,
+                &handle,
+                candidate,
+                &failure,
+            )
+            .await;
+            let _ = reply.send(Err(failure.into_error(module_id)));
+            end.requeue.extend(command);
+            return;
+        }
         Warm::Failed(failure) => {
             abandon_candidate(
                 module_id,
@@ -213,8 +304,8 @@ pub(super) async fn run_swap(
             return;
         }
     };
-    match registry.promote_candidate(module_id) {
-        Ok(Some(_)) => {}
+    let promoted = match registry.promote_candidate(module_id) {
+        Ok(Some(cutover)) => cutover.promoted,
         Ok(None) | Err(_) => {
             // Forwarding promoted the candidate and the registry could not: its
             // registration went away between the two calls, so the process that
@@ -259,11 +350,14 @@ pub(super) async fn run_swap(
             }
             return;
         }
-    }
+    };
 
-    // The candidate is the module now: its nonce is the module's nonce, and
-    // the snapshot describes its process.
+    // The candidate is the module now: its nonce is the module's nonce, the
+    // control plane's capability state is recomputed from its manifest (its
+    // HELLO skipped that, not being routable then), and the snapshot describes
+    // its process.
     handle.promote_swap_nonce(module_id, spec.reserved);
+    handle.notify_swap_promoted(&promoted);
     let incumbent_generation = lock_snapshot(snapshot)
         .map(|state| state.spawn_generation)
         .unwrap_or(0);
@@ -296,6 +390,68 @@ pub(super) async fn run_swap(
     )
     .await;
     handle.close_swap(module_id);
+}
+
+/// Answer one module command that arrived while the candidate warmed, or hand
+/// it back when it must interrupt the swap.
+///
+/// A stop, disable or retire interrupts: the operator's intent wins over a
+/// swap, as it does over a pending crash respawn, and it must not wait out the
+/// readiness budget. It is returned so the swap can kill its candidate and the
+/// loop can then carry it out on the incumbent. Restart, reload and a second
+/// swap are refused with a typed error rather than queued; enabling an already
+/// enabled module is answered as the no-op it is. A configuration update is
+/// answered at once and applied when the swap ends, since the swap is using the
+/// spec it replaces.
+fn serve_command_while_warming(
+    module_id: &str,
+    command: SupervisorCommand,
+    end: &mut SwapEnd,
+) -> Option<SupervisorCommand> {
+    let in_progress = || SuperviseError::SwapInProgress {
+        module_id: module_id.to_string(),
+    };
+    match command {
+        SupervisorCommand::Drain { .. }
+        | SupervisorCommand::Retire { .. }
+        | SupervisorCommand::SetEnabled { enabled: false, .. } => Some(command),
+        SupervisorCommand::SetEnabled {
+            enabled: true,
+            reply,
+        } => {
+            let _ = reply.send(Ok(false));
+            None
+        }
+        SupervisorCommand::Restart { reply, .. } | SupervisorCommand::Reload { reply } => {
+            let _ = reply.send(Err(in_progress()));
+            None
+        }
+        SupervisorCommand::Swap { reply, .. } => {
+            let _ = reply.send(Err(SuperviseError::SwapRefused {
+                module_id: module_id.to_string(),
+                reason: SwapRefusal::AlreadySwapping,
+            }));
+            None
+        }
+        SupervisorCommand::UpdateConfiguration {
+            spec,
+            health,
+            drain_timeout_ms,
+            reply,
+        } => {
+            let _ = reply.send(());
+            // The caller has its answer; the replayed command's reply channel
+            // has no receiver and is only there to fit the command's shape.
+            let (unanswered, _) = oneshot::channel();
+            end.requeue.push(SupervisorCommand::UpdateConfiguration {
+                spec,
+                health,
+                drain_timeout_ms,
+                reply: unanswered,
+            });
+            None
+        }
+    }
 }
 
 /// Every check a swap makes before spawning anything. Returns the forwarding
@@ -349,12 +505,18 @@ fn admit_swap(
 /// `catalog.update(ready: true)` updates through its connection (the registry
 /// searches every slot by connection for exactly this). Nothing here goes
 /// through a by-id lookup, all of which resolve the incumbent.
+///
+/// The module's commands are served meanwhile; see
+/// [`serve_command_while_warming`].
+#[allow(clippy::too_many_arguments)]
 async fn warm_candidate(
     module_id: &str,
     registry: &Registry,
     candidate: &mut SupervisedChild,
     incumbent_connection: ConnectionId,
     ready_timeout: Duration,
+    commands: &mut mpsc::Receiver<SupervisorCommand>,
+    end: &mut SwapEnd,
 ) -> Warm {
     let deadline = Instant::now() + ready_timeout;
     let mut registered: Option<ConnectionId> = None;
@@ -444,6 +606,16 @@ async fn warm_candidate(
                     exit: Some(exit),
                     connection: registered,
                 });
+            }
+            command = commands.recv() => {
+                // A closed channel means the module handle is gone; the loop
+                // will see the same and stop, so abandon the candidate first.
+                let Some(command) = command else {
+                    return Warm::Interrupted { command: None, connection: registered };
+                };
+                if let Some(command) = serve_command_while_warming(module_id, command, end) {
+                    return Warm::Interrupted { command: Some(command), connection: registered };
+                }
             }
             _ = sleep(poll) => {}
         }
@@ -713,11 +885,32 @@ mod tests {
         assert!(!handle.spawned_consumer_authorized("aft", "incumbent"));
     }
 
-    /// The two processes of a swap never share a cgroup or capture-file key,
-    /// and a module only ever uses two.
+    /// A module has two cgroup names, and no module id, however it is
+    /// spelled, can produce another module's name of either kind. The ids
+    /// here are the ones the cgroup library's own encoding merges: an `@`, its
+    /// escape spelled out literally, and an id ending in the swap suffix.
     #[test]
-    fn swap_slot_keys_alternate_between_two_names() {
-        assert_eq!(swap_slot_key("aft", false), "aft");
-        assert_eq!(swap_slot_key("aft", true), "aft@swap");
+    fn cgroup_names_are_injective_across_ids_and_slots() {
+        assert_eq!(cgroup_name("aft", false), "aft");
+        assert_eq!(cgroup_name("aft", true), "aft_swap");
+        let ids = [
+            "aft",
+            "aft@swap",
+            "aft_40swap",
+            "aft_swap",
+            "aft_",
+            "mcp:x",
+            "mcp_3ax",
+        ];
+        let mut names = std::collections::HashSet::new();
+        for id in ids {
+            for alternate in [false, true] {
+                assert!(
+                    names.insert(cgroup_name(id, alternate)),
+                    "{id:?} (alternate: {alternate}) names a directory another id or slot already has: {}",
+                    cgroup_name(id, alternate)
+                );
+            }
+        }
     }
 }

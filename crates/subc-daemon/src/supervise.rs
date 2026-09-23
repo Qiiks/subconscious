@@ -86,7 +86,7 @@ const SPAWN_SUBSCRIBER_BUFFER: usize = SPAWN_EVENT_RING_CAPACITY + 1;
 struct SupervisedChild {
     child: Child,
     /// The name of this process's cgroup: the module id, or for a swap
-    /// candidate its slot key (see `swap::swap_slot_key`).
+    /// candidate the alternate name (see `swap::cgroup_name`).
     #[cfg(target_os = "linux")]
     module_id: String,
     #[cfg(target_os = "linux")]
@@ -637,9 +637,9 @@ struct SupervisorSnapshot {
     last_exit: Option<ExitReport>,
     health: ModuleHealthStatus,
     /// Whether the current process was started as a swap candidate and so
-    /// uses the alternate slot key for its cgroup and capture file. The next
-    /// swap's candidate takes the other key, so the two processes of a swap
-    /// never share either. A plain spawn always uses the primary key.
+    /// lives in the module's alternate cgroup. The next swap's candidate takes
+    /// the other one, so the two processes of a swap never share a cgroup. A
+    /// plain spawn always uses the primary cgroup.
     in_alternate_slot: bool,
 }
 
@@ -1202,10 +1202,36 @@ pub struct SupervisorHandle {
     /// id is gated on the swap token (see [`Self::swap_hello_admission`]) and
     /// consumer attestation accepts both processes' nonces.
     swaps: Arc<Mutex<HashMap<String, OpenSwap>>>,
+    /// Told when a swap promotes its candidate; see [`SwapPromotionObserver`].
+    promotion_observer: PromotionObserverSlot,
     /// Serializes module-set reconciliation with operator lifecycle commands. Without
     /// this daemon-wide ordering, a rescan could retire or update a module while a
     /// concurrent reload still held its old handle and launch specification.
     operation_lock: Arc<AsyncMutex<()>>,
+}
+
+/// Told when a swap has promoted its candidate to be the module's active
+/// registration.
+///
+/// An ordinary HELLO runs the control plane's registration side effects (the
+/// capability cache, the deny census, the requirement recompute) as it
+/// registers. A swap candidate's HELLO does not, because it is not routable;
+/// promotion is when those must run instead, and promotion happens in the
+/// supervisor, which has no other way into the control handler.
+pub(crate) trait SwapPromotionObserver: Send + Sync {
+    fn swap_promoted(&self, registration: &crate::registry::ModuleRegistration);
+}
+
+/// The installed [`SwapPromotionObserver`], held weakly: the observer (the
+/// control handler) owns this handle, so a strong reference back would be a
+/// cycle that keeps both alive.
+#[derive(Clone, Default)]
+struct PromotionObserverSlot(Arc<Mutex<Option<std::sync::Weak<dyn SwapPromotionObserver>>>>);
+
+impl fmt::Debug for PromotionObserverSlot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PromotionObserverSlot")
+    }
 }
 
 /// The nonces of one open swap.
@@ -1492,6 +1518,34 @@ impl SupervisorHandle {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(module_id);
+    }
+
+    /// Install the observer told about swap promotions, replacing any earlier
+    /// one.
+    pub(crate) fn set_swap_promotion_observer(
+        &self,
+        observer: std::sync::Weak<dyn SwapPromotionObserver>,
+    ) {
+        *self
+            .promotion_observer
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(observer);
+    }
+
+    /// Tell the installed observer, if it is still alive, that a swap promoted
+    /// `registration`.
+    fn notify_swap_promoted(&self, registration: &crate::registry::ModuleRegistration) {
+        let observer = self
+            .promotion_observer
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade);
+        if let Some(observer) = observer {
+            observer.swap_promoted(registration);
+        }
     }
 
     /// Whether a swap is open for `module_id`.
@@ -2754,6 +2808,12 @@ pub enum SuperviseError {
     CommandClosed {
         module_id: String,
     },
+    /// A restart or reload arrived while a swap's candidate was warming. The
+    /// swap owns the module until it cuts over or fails; a stop or disable
+    /// would have aborted it instead.
+    SwapInProgress {
+        module_id: String,
+    },
     /// A swap was refused before anything was spawned.
     SwapRefused {
         module_id: String,
@@ -2816,6 +2876,10 @@ pub enum SwapFailureArm {
     CandidateExited,
     /// The candidate declared itself ready but failed its health probe.
     CandidateUnhealthy,
+    /// An operator stop, disable or retire arrived while the candidate warmed.
+    /// The candidate was killed and the operator's command then carried out on
+    /// the incumbent.
+    Interrupted,
     /// The candidate's connection closed at the moment of cutover. If it
     /// closed before forwarding moved, the incumbent is untouched. If it closed
     /// between the forwarding and registry halves of cutover, forwarding can no
@@ -2831,6 +2895,7 @@ impl SwapFailureArm {
             Self::NeverReady => "never_ready",
             Self::CandidateExited => "candidate_exited",
             Self::CandidateUnhealthy => "candidate_unhealthy",
+            Self::Interrupted => "interrupted",
             Self::CutoverLost => "cutover_lost",
         }
     }
@@ -2907,6 +2972,10 @@ impl fmt::Display for SuperviseError {
                     "supervisor command channel for module '{module_id}' is closed"
                 )
             }
+            Self::SwapInProgress { module_id } => write!(
+                f,
+                "module '{module_id}' is being swapped; retry once the swap has cut over or failed, or stop the module to abort the swap"
+            ),
             Self::SwapRefused { module_id, reason } => match reason {
                 SwapRefusal::OverlapExclusive => write!(
                     f,
@@ -2959,6 +3028,7 @@ impl Error for SuperviseError {
             | Self::RegistrationStillActive { .. }
             | Self::StatePoisoned { .. }
             | Self::CommandClosed { .. }
+            | Self::SwapInProgress { .. }
             | Self::SwapRefused { .. }
             | Self::SwapFailed { .. } => None,
         }
@@ -4016,7 +4086,31 @@ async fn supervise_loop(
     // it is set the loop serves commands instead of sleeping inside the exit
     // arm, so a disable or drain lands immediately and cancels the respawn.
     let mut pending_respawn: Option<Instant> = None;
+    // Commands a swap handed back to run next (see `swap::SwapEnd`). Served
+    // before anything else so a stop that interrupted a swap runs at once.
+    let mut requeued: VecDeque<SupervisorCommand> = VecDeque::new();
     loop {
+        if let Some(command) = requeued.pop_front() {
+            if !handle_supervisor_command(
+                command,
+                &mut spec,
+                &mut runtime,
+                &registry,
+                &process_liveness,
+                &snapshot,
+                &mut child,
+                &mut commands,
+                &mut requeued,
+            )
+            .await
+            {
+                return;
+            }
+            if child.is_some() || !respawn_still_pending(&snapshot) {
+                pending_respawn = None;
+            }
+            continue;
+        }
         if child.is_some() {
             health_probe.refresh_registration(&spec, &runtime, &registry, &snapshot);
             let probe_sleep = sleep(health_probe.wake_after());
@@ -4107,6 +4201,8 @@ async fn supervise_loop(
                         &process_liveness,
                         &snapshot,
                         &mut child,
+                        &mut commands,
+                        &mut requeued,
                     ).await {
                         return;
                     }
@@ -4171,6 +4267,8 @@ async fn supervise_loop(
                         &process_liveness,
                         &snapshot,
                         &mut child,
+                        &mut commands,
+                        &mut requeued,
                     ).await {
                         return;
                     }
@@ -4195,6 +4293,8 @@ async fn supervise_loop(
                 &process_liveness,
                 &snapshot,
                 &mut child,
+                &mut commands,
+                &mut requeued,
             )
             .await
             {
@@ -4234,6 +4334,7 @@ enum NextAction {
     },
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_supervisor_command(
     command: SupervisorCommand,
     spec: &mut ModuleSpec,
@@ -4242,6 +4343,8 @@ async fn handle_supervisor_command(
     process_liveness: &SupervisorProcessLiveness,
     snapshot: &SharedSnapshot,
     child: &mut Option<SupervisedChild>,
+    commands: &mut mpsc::Receiver<SupervisorCommand>,
+    requeued: &mut VecDeque<SupervisorCommand>,
 ) -> bool {
     match command {
         SupervisorCommand::Drain { reply } => {
@@ -4397,17 +4500,19 @@ async fn handle_supervisor_command(
             ready_timeout,
             reply,
         } => {
-            swap::run_swap(
+            let end = swap::run_swap(
                 spec,
                 runtime,
                 registry,
                 process_liveness,
                 snapshot,
                 child,
+                commands,
                 ready_timeout.unwrap_or(DEFAULT_SWAP_READY_TIMEOUT),
                 reply,
             )
             .await;
+            requeued.extend(end.requeue);
             true
         }
     }
@@ -5121,18 +5226,22 @@ fn spawn_child(
         #[cfg(target_os = "linux")]
         cgroup_placement,
         SpawnRole::Plain,
-        &spec.module_id,
+        false,
     )
 }
 
 /// Spawn one process of `spec` into a slot.
 ///
-/// `slot_key` names the process's cgroup and its stderr capture file. A plain
-/// spawn uses the bare module id, as it always has. A swap candidate needs a
-/// different key from the process it is replacing, which is still alive: with
-/// the same key it would join the incumbent's cgroup (one kill domain, so
-/// killing a failed candidate could take the incumbent) and interleave into its
-/// capture file. See `swap::swap_slot_key`.
+/// `alternate_slot` picks the process's cgroup name (see `swap::cgroup_name`).
+/// A swap candidate needs a different cgroup from the process it is replacing,
+/// which is still alive: in the same cgroup the two would be one kill domain,
+/// and killing a failed candidate could take the incumbent with it.
+///
+/// The stderr capture file is `<module_id>.stderr.log` for every process of
+/// the module, whichever slot it is in, because that is the one file
+/// `ck module logs` reads. During a swap's overlap both processes append to it;
+/// the daemon writes whole lines, so the two interleave by line, which is also
+/// the merged view an operator wants while a swap runs.
 #[allow(clippy::too_many_arguments)]
 fn spawn_child_in_slot(
     spec: &ModuleSpec,
@@ -5142,8 +5251,12 @@ fn spawn_child_in_slot(
     capture_logs_dir: Option<&std::path::Path>,
     #[cfg(target_os = "linux")] cgroup_placement: Option<&subc_cgroup::Placement>,
     role: SpawnRole,
-    slot_key: &str,
+    alternate_slot: bool,
 ) -> Result<SupervisedChild, SuperviseError> {
+    #[cfg(target_os = "linux")]
+    let cgroup_name = swap::cgroup_name(&spec.module_id, alternate_slot);
+    #[cfg(not(target_os = "linux"))]
+    let _ = alternate_slot;
     let mut command = Command::new(&spec.program);
     command.args(&spec.args);
     // AMBIENT `CK_LOG` MUST NOT LEAK INTO AN OTHERWISE UNCONFIGURED MODULE — but
@@ -5181,7 +5294,7 @@ fn spawn_child_in_slot(
 
     #[cfg(target_os = "linux")]
     let cgroup_path = cgroup_placement
-        .map(|placement| placement.module_path(slot_key))
+        .map(|placement| placement.module_path(&cgroup_name))
         .transpose()
         .map_err(|source| SuperviseError::Cgroup {
             module_id: spec.module_id.clone(),
@@ -5193,14 +5306,14 @@ fn spawn_child_in_slot(
     if let Some(path) = &cgroup_path {
         if let Err(error) = apply_cgroup_placement(&mut command, spec, path) {
             if let Some(placement) = cgroup_placement {
-                remove_module_cgroup(placement, slot_key);
+                remove_module_cgroup(placement, &cgroup_name);
             }
             return Err(error);
         }
     }
 
     let output_sink = if let Some(logs_dir) = capture_logs_dir {
-        let path = logs_dir.join(format!("{slot_key}.stderr.log"));
+        let path = logs_dir.join(format!("{}.stderr.log", spec.module_id));
         match ChildOutputSink::open(&path, capture_retention(spec)) {
             Ok(sink) => sink,
             Err(error) => {
@@ -5225,7 +5338,7 @@ fn spawn_child_in_slot(
         Err(source) => {
             #[cfg(target_os = "linux")]
             if let Some(placement) = cgroup_placement {
-                remove_module_cgroup(placement, slot_key);
+                remove_module_cgroup(placement, &cgroup_name);
             }
             return Err(SuperviseError::Spawn {
                 program: spec.program.clone(),
@@ -5284,7 +5397,7 @@ fn spawn_child_in_slot(
     Ok(SupervisedChild {
         child,
         #[cfg(target_os = "linux")]
-        module_id: slot_key.to_string(),
+        module_id: cgroup_name,
         #[cfg(target_os = "linux")]
         cgroup_placement: cgroup_placement.cloned(),
         stdout_pump,

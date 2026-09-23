@@ -259,6 +259,9 @@ pub struct Router {
 
 impl Router {
     pub fn with_control_handler(control: Arc<ControlHandler>) -> Self {
+        // The handler the router serves is the one a swap must tell when it
+        // promotes a candidate; this is where it first sits behind an `Arc`.
+        control.install_swap_promotion_observer();
         let forwarding = control.forwarding();
         let counters = control.counters();
         Self {

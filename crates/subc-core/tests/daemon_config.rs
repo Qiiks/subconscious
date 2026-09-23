@@ -1771,3 +1771,185 @@ async fn an_unset_capture_dir_captures_nowhere() {
         leaked.display()
     );
 }
+
+/// A daemon booted from config with a capability consumer and a provider
+/// declared `overlap: "safe"`, whose config is then changed (as an operator
+/// would) so the replacement provides the capability the consumer requires,
+/// rescanned, and swapped.
+///
+/// The replacement crashes 1.5 s after it starts, well after cutover, which
+/// leaves the provider enabled but unregistered for a while: the one state in
+/// which the capability evaluator answers from its cached manifest rather than
+/// from the live registry. The incumbent declares a busy gauge that never
+/// reaches zero, so its drain after cutover holds for the module's 3 s budget
+/// and the supervisor does not respawn the crashed replacement before then.
+async fn swapped_provider_daemon(name: &str) -> RunningDaemon {
+    let consumer = stub_module(
+        "swap-consumer",
+        true,
+        [(
+            "FAKE_AFT_CAPABILITIES",
+            r#"{"requires":[{"capability":"swap-capability/v1","need":"required"}]}"#,
+        )],
+    );
+    let provider = |extra: &[(&str, &str)]| {
+        let mut env = vec![
+            ("FAKE_AFT_ADVERTISE_HEALTH", "1"),
+            ("FAKE_AFT_BUSY_GAUGES", "runs_in_flight"),
+            ("FAKE_AFT_HEALTH_METRICS", r#"{"runs_in_flight":1}"#),
+        ];
+        env.extend_from_slice(extra);
+        let mut env_map = BTreeMap::from([(
+            "FAKE_AFT_MODULE_ID".to_string(),
+            "swap-provider".to_string(),
+        )]);
+        for (key, value) in env {
+            env_map.insert(key.to_string(), value.to_string());
+        }
+        let mut module = module_doc(
+            "swap-provider",
+            Path::new(env!("CARGO_BIN_EXE_fake-aft-stub")),
+            true,
+            env_map,
+        );
+        module["overlap"] = json!("safe");
+        module["drain_timeout_ms"] = json!(3000);
+        module
+    };
+    let daemon =
+        RunningDaemon::start(name, Some(config_doc([consumer.clone(), provider(&[])]))).await;
+    wait_for_catalog_module(&daemon.connection_file_path, "swap-consumer", STATE_TIMEOUT).await;
+    wait_for_catalog_module(&daemon.connection_file_path, "swap-provider", STATE_TIMEOUT).await;
+
+    fs::write(
+        &daemon.config_path,
+        config_doc([
+            consumer,
+            provider(&[
+                (
+                    "FAKE_AFT_CAPABILITIES",
+                    r#"{"provides":["swap-capability/v1"]}"#,
+                ),
+                ("FAKE_AFT_ECHO_ENV", "SUBC_SPAWN_ROLE"),
+                ("FAKE_AFT_CRASH_AFTER_MS", "1500"),
+            ]),
+        ]),
+    )
+    .unwrap();
+    supervisor_rescan(&daemon.connection_file_path, 960).await;
+
+    let mut client = wait_for_client(&daemon.connection_file_path, START_TIMEOUT).await;
+    match control_rpc_result_on_stream(
+        &mut client,
+        961,
+        ClientControlRequest::SupervisorSwap {
+            module_id: "swap-provider".to_string(),
+            ready_timeout_ms: Some(10_000),
+        },
+    )
+    .await
+    {
+        Ok(ClientControlResponse::SupervisorAck { applied: true, .. }) => {}
+        other => panic!("swap did not cut over: {other:?}"),
+    }
+    daemon
+}
+
+async fn swap_capability_status(
+    path: &Path,
+    corr: u64,
+) -> subc_control::CapabilityRequirementStatus {
+    let mut client = wait_for_client(path, START_TIMEOUT).await;
+    let ClientControlResponse::ServerDescribe {
+        capability_requirements,
+        ..
+    } = control_rpc_on_stream(&mut client, corr, ClientControlRequest::ServerDescribe {}).await
+    else {
+        panic!("server.describe response expected");
+    };
+    capability_requirements
+        .iter()
+        .find(|status| {
+            status.consumer == "swap-consumer" && status.capability == "swap-capability/v1"
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("no requirement status: {capability_requirements:?}"))
+}
+
+/// A swap candidate's HELLO skips the capability bookkeeping an ordinary HELLO
+/// does, because it is not routable yet; promotion must run it.
+///
+/// `server.describe` recomputes requirements from the live registry on every
+/// read, so while the promoted provider is registered its capability shows as
+/// provided either way. What promotion's bookkeeping changes is the
+/// evaluator's cached manifest, which is what answers while the provider is
+/// enabled but not registered (here: after the replacement crashes). With the
+/// promoted manifest cached, the requirement is `pending` and satisfiable by
+/// config; with the incumbent's still cached, which provided nothing, it would
+/// read `never_provided` and unsatisfiable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn swap_promotion_caches_the_promoted_manifest_for_capability_requirements() {
+    let daemon = swapped_provider_daemon("swap-capabilities").await;
+    let path = &daemon.connection_file_path;
+    let live = swap_capability_status(path, 962).await;
+    assert_eq!(live.verdict, "provided", "{live:?}");
+
+    let deadline = Instant::now() + STATE_TIMEOUT;
+    let mut corr = 963;
+    let absent = loop {
+        let status = swap_capability_status(path, corr).await;
+        if !status.runtime_available {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the replacement never went away: {status:?}"
+        );
+        corr += 1;
+        sleep(Duration::from_millis(20)).await;
+    };
+    assert!(
+        absent.config_satisfiable && absent.verdict == "pending",
+        "with the provider unregistered, the requirement is answered from a cached manifest \
+         that is not the promoted one: {absent:?}"
+    );
+}
+
+/// Every process of a module writes `<module_id>.stderr.log`, the one file
+/// `ck module logs` reads, whichever cgroup slot it runs in. After a swap the
+/// promoted process's stderr is found there, and there is no second file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn swap_promoted_process_writes_the_modules_one_capture_file() {
+    let daemon = swapped_provider_daemon("swap-capture-file").await;
+    let logs = daemon.temp_dir.join("run").join("logs");
+    let capture = logs.join("swap-provider.stderr.log");
+    let deadline = Instant::now() + STATE_TIMEOUT;
+    loop {
+        let contents = fs::read_to_string(&capture).unwrap_or_default();
+        if contents.contains("echo-env SUBC_SPAWN_ROLE=swap_candidate") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the promoted process's stderr is not in {}; files: {:?}",
+            capture.display(),
+            fs::read_dir(&logs)
+                .map(|entries| entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name())
+                    .collect::<Vec<_>>())
+                .unwrap_or_default()
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+    let other_files = fs::read_dir(&logs)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("swap-provider") && name != "swap-provider.stderr.log")
+        .collect::<Vec<_>>();
+    assert!(
+        other_files.is_empty(),
+        "a swap must not create a second capture file: {other_files:?}"
+    );
+}

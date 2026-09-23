@@ -897,6 +897,39 @@ impl ControlHandler {
         Ok((runtime, registrations))
     }
 
+    /// The capability side effects of a module becoming the active registration
+    /// for its id: cache its manifest (warning if its claims drifted), run the
+    /// deny census when its declarations call for one, and recompute the
+    /// requirement statuses. An ordinary HELLO does this as it registers; a swap
+    /// candidate's does not, and the supervisor does it at promotion instead,
+    /// through [`crate::supervise::SwapPromotionObserver`].
+    fn apply_registration_capabilities(&self, registration: &crate::registry::ModuleRegistration) {
+        let cached_registration = RegisteredModule {
+            module_id: registration.manifest.module_id.clone(),
+            module_version: registration.manifest.module_version.clone(),
+            capabilities: registration.manifest.capabilities.clone(),
+        };
+        if self.capability_evaluator.record_hello(&cached_registration) {
+            warn!(
+                module_id = %cached_registration.module_id,
+                "capability claims drifted from the cached manifest"
+            );
+        }
+        if capability_census_trigger(None, registration.manifest.capabilities.as_ref()) {
+            self.enforce_capability_denies();
+        }
+        self.refresh_capability_requirements();
+    }
+
+    /// Point the shared supervisor handle at this handler for swap promotions.
+    /// Called wherever a handler is put behind the `Arc` the router serves, so
+    /// it can be held weakly.
+    pub(crate) fn install_swap_promotion_observer(self: &Arc<Self>) {
+        let observer: std::sync::Weak<dyn crate::supervise::SwapPromotionObserver> =
+            Arc::downgrade(self) as std::sync::Weak<ControlHandler>;
+        self.supervisor.set_swap_promotion_observer(observer);
+    }
+
     pub fn refresh_capability_requirements(&self) {
         match self.runtime_capability_snapshot() {
             Ok((runtime, registrations)) => {
@@ -1699,21 +1732,7 @@ impl ControlHandler {
             );
         }
 
-        let cached_registration = RegisteredModule {
-            module_id: registration.manifest.module_id.clone(),
-            module_version: registration.manifest.module_version.clone(),
-            capabilities: registration.manifest.capabilities.clone(),
-        };
-        if self.capability_evaluator.record_hello(&cached_registration) {
-            warn!(
-                module_id = %cached_registration.module_id,
-                "capability claims drifted from the cached manifest"
-            );
-        }
-        if capability_census_trigger(None, registration.manifest.capabilities.as_ref()) {
-            self.enforce_capability_denies();
-        }
-        self.refresh_capability_requirements();
+        self.apply_registration_capabilities(&registration);
 
         info!(
             module_id = %registration.manifest.module_id,
@@ -3291,6 +3310,9 @@ impl ControlHandler {
                 crate::supervise::SuperviseError::Disabled { .. } => {
                     ("module_disabled", err.to_string())
                 }
+                crate::supervise::SuperviseError::SwapInProgress { .. } => {
+                    ("swap_in_progress", err.to_string())
+                }
                 _ => (
                     "target_unavailable",
                     format!("failed to restart module_id '{module_id}': {err}"),
@@ -3319,9 +3341,18 @@ impl ControlHandler {
         module_id: String,
         ready_timeout_ms: Option<u64>,
     ) -> Result<Vec<Frame>, RouterError> {
-        let operation_lock = self.supervisor.operation_lock();
-        let _operation_guard = operation_lock.lock().await;
-        let Some(module) = self.supervisor.get(&module_id) else {
+        // The daemon-wide operation lock is held only to resolve the handle,
+        // not across the swap. The swap can take its whole readiness budget,
+        // and `supervisor.set_enabled` (ck module stop) takes the same lock:
+        // holding it here would park an operator's stop behind the swap it is
+        // meant to abort. A rescan or stop that reaches the module during the
+        // swap is served by the swap itself (see `supervise_swap`).
+        let module = {
+            let operation_lock = self.supervisor.operation_lock();
+            let _operation_guard = operation_lock.lock().await;
+            self.supervisor.get(&module_id)
+        };
+        let Some(module) = module else {
             return Ok(vec![control_error_frame(
                 &frame,
                 "unknown_module",
@@ -3393,6 +3424,9 @@ impl ControlHandler {
             let (code, message) = match err {
                 crate::supervise::SuperviseError::Disabled { .. } => {
                     ("module_disabled", err.to_string())
+                }
+                crate::supervise::SuperviseError::SwapInProgress { .. } => {
+                    ("swap_in_progress", err.to_string())
                 }
                 _ => (
                     "reload_failed",
@@ -4511,6 +4545,12 @@ impl ControlHandler {
 impl Default for ControlHandler {
     fn default() -> Self {
         Self::new(Arc::new(Registry::default()))
+    }
+}
+
+impl crate::supervise::SwapPromotionObserver for ControlHandler {
+    fn swap_promoted(&self, registration: &crate::registry::ModuleRegistration) {
+        self.apply_registration_capabilities(registration);
     }
 }
 

@@ -492,6 +492,16 @@ The swap runs inside the module's supervise loop, like a restart
 the incumbent drains after the answer, so a caller whose own lane rides the
 incumbent is not waiting on a drain that waits on it.
 
+While the candidate warms, the loop keeps serving the module's commands. A
+stop, disable or retire aborts the swap (arm `interrupted`): the candidate is
+killed on its own reap path with no budget spent, and the command then runs
+on the incumbent. Restart and reload are refused `swap_in_progress`; a config
+update is answered at once and applied when the swap ends. The control
+handler holds the daemon-wide operation lock only to look the module up, not
+across the swap, since `ck module stop` takes the same lock. After cutover,
+while the incumbent drains, commands wait as they do behind a plain restart's
+drain (at most the drain budget).
+
 B's seven obligations:
 
 1. HELLO: a swap gate runs before the reserved gate. While a swap is open for
@@ -519,7 +529,9 @@ B's seven obligations:
    process forwarding does not already route to. If the candidate vanishes
    between the two calls, the incumbent cannot be restored (B has no
    un-supersede), so the swap reports `cutover_lost` and falls back to a plain
-   restart.
+   restart. KNOWN GAP: that restart drains by module id, which finds no active
+   endpoint, so the incumbent's routes are closed as a crash rather than
+   drained. The race is between two adjacent calls and is untested.
 7. `drain_child_to_state` was not threaded; the incumbent is retired by its own
    function, which drains with `begin_endpoint_drain` (reason `Restart`),
    reaps the process, and waits for release by `Connection`. The module's
@@ -533,14 +545,26 @@ classified and reaped on its own path and never reaches `next_crash_restart`.
 If the incumbent's registration goes away while the candidate warms, the
 candidate is promoted as soon as it has registered, ready or not.
 
+Promotion runs the control plane's registration bookkeeping that the
+candidate's HELLO skipped (capability cache, deny census, requirement
+recompute), through a promotion observer the router installs on the shared
+supervisor handle. `server.describe` recomputes requirements from the live
+registry on every read, so what promotion changes observably is the cached
+manifest, which answers while the module is enabled but unregistered.
+
 Found against the design:
 
 - `overlap` is not mirrored on the manifest: that is a subc-protocol field,
   outside this slice. It lives in `ModuleSpec` and `subc.jsonc` only, and
   `catalog.update` carries no overlap field, so it is frozen by construction.
-- The candidate's cgroup and capture file alternate between `<id>` and
-  `<id>@swap`: after cutover the promoted process keeps its key, so the next
-  swap's candidate takes the other one.
+- Both processes of a swap write `<id>.stderr.log`, the file `ck module logs`
+  reads; the daemon appends whole lines, so the overlap interleaves by line.
+  The cgroup must differ, so it alternates between two names, and the
+  promoted process keeps its name. The daemon now encodes cgroup names
+  injectively (every byte outside `[A-Za-z0-9.-]`, `_` included, as `_xx`;
+  the alternate name adds `_swap`), because the cgroup library's encoding
+  passes `_` through and let `a@swap`, `a_40swap` and `a`'s swap cgroup name
+  one directory. Plain cgroup names change for ids containing `_`.
 - The candidate emits no spawn event until cutover (the spawn feed holds one
   live process per id); the superseded incumbent's exit is emitted for its own
   generation without clearing the promoted process's entry. Its stderr goes to

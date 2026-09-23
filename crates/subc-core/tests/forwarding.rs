@@ -8764,3 +8764,87 @@ async fn swap_of_an_exclusive_module_is_refused_and_spawns_nothing() {
     assert!(server.registry.get_candidate(module_id).unwrap().is_none());
     module.stop().await.unwrap();
 }
+
+/// An operator disable issued while a swap's candidate is warming must not
+/// wait out the readiness budget. It aborts the swap: the candidate is killed
+/// on its own path (no crash budget spent), the swap answers `interrupted`,
+/// and the disable is then carried out on the incumbent. Sent over the wire,
+/// because the control handler's operation lock is part of what could make it
+/// wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disabling_a_module_mid_swap_aborts_the_swap_without_waiting_for_it() {
+    let module_id = "fake-aft-swap-disabled-mid-warm";
+    let ready_budget = Duration::from_secs(30);
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module = supervisor
+        .spawn(swap_spec(
+            &server,
+            module_id,
+            std::iter::empty::<(&str, &str)>(),
+        ))
+        .unwrap();
+    wait_for_registration(&server.registry, module_id, SETUP_TIMEOUT).await;
+    let before = module.status().unwrap();
+    module
+        .update_spec_for_test(swap_spec(
+            &server,
+            module_id,
+            [("FAKE_AFT_READY_FALSE", "1")],
+        ))
+        .await
+        .unwrap();
+
+    let mut swap_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    write_frame(
+        &mut swap_client,
+        &send_swap(module_id, 1, ready_budget.as_millis() as u64),
+    )
+    .await
+    .unwrap();
+    swap_client.flush().await.unwrap();
+    let candidate = wait_for_candidate(&server.registry, module_id, SETUP_TIMEOUT).await;
+
+    let disable_started = Instant::now();
+    let mut disable_client = connect_authed_client(&server.connection_file_path)
+        .await
+        .unwrap();
+    assert!(
+        supervisor_ack_on_stream(
+            &mut disable_client,
+            2,
+            ClientControlRequest::SupervisorSetEnabled {
+                module_id: module_id.to_string(),
+                enabled: false,
+            },
+            module_id,
+        )
+        .await,
+        "the disable must apply"
+    );
+    let waited = disable_started.elapsed();
+    assert!(
+        waited < Duration::from_secs(10),
+        "the disable waited {waited:?} behind a swap whose readiness budget is {ready_budget:?}"
+    );
+
+    let error = read_control_error_on_stream(&mut swap_client, 1, "swap_failed").await;
+    assert_eq!(error.detail.unwrap()["arm"], "interrupted");
+    assert!(server.registry.get_candidate(module_id).unwrap().is_none());
+    assert!(
+        server
+            .registry
+            .get_module_by_connection(candidate.connection_id)
+            .unwrap()
+            .is_none(),
+        "the candidate is still registered"
+    );
+    let after = module.status().unwrap();
+    assert_eq!(after.state, ModuleState::Disabled);
+    assert!(!after.enabled);
+    assert_eq!(after.restart_count, before.restart_count);
+    assert_eq!(after.lifetime_restarts, before.lifetime_restarts);
+    assert!(server.registry.get_module(module_id).unwrap().is_none());
+}
