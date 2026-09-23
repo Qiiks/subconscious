@@ -2602,6 +2602,27 @@ async fn supervisor_reload_rejects_new_work_during_drain() {
     let applied = read_supervisor_ack_on_stream(&mut control_client, 413, module_id).await;
     assert!(applied);
 
+    // The data-plane `module_reloading` is a pre-send guarantee callers retry
+    // on (see `error_codes::MODULE_RELOADING`): the module must never have
+    // received the request the daemon rejected. The slow request is the
+    // positive control, since the same journal records it.
+    let events = stub_events(&events_path);
+    assert!(
+        events
+            .iter()
+            .any(|event| event_is_request_received(event, ack.route_channel, slow_corr)),
+        "control: the stub journal should record the in-flight slow request"
+    );
+    assert!(
+        !events.iter().any(|event| event_is_request_received(
+            event,
+            ack.route_channel,
+            rejected_corr
+        )),
+        "module_reloading must be answered before forwarding, but the module received \
+         the rejected request (corr {rejected_corr})"
+    );
+
     module.stop().await.unwrap();
 }
 

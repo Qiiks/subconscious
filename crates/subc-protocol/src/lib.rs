@@ -46,6 +46,19 @@ pub mod tool_call;
 pub mod error_codes {
     pub const UNKNOWN_MODULE: &str = "unknown_module";
     pub const MODULE_REMOVED: &str = "module_removed";
+    /// The target module's endpoint is draining for a reload, restart or disable.
+    ///
+    /// On the data plane (an `ERROR` frame answering a `REQUEST` on a bound route)
+    /// this code is a PRE-SEND GUARANTEE: the daemon returns it only when the
+    /// request could not take a route credit because the endpoint is draining,
+    /// and it returns it BEFORE forwarding, so the module never received the
+    /// request. A caller may therefore re-dispatch the same request once the
+    /// route is reopened without risking a duplicated side effect, exactly as it
+    /// may after `unknown_channel`. The daemon keeps this guarantee:
+    /// `supervisor_reload_rejects_new_work_during_drain` asserts the module's
+    /// event journal never records the rejected request. A request the module
+    /// already received is answered by the module (or its route closes with
+    /// `route.closed`), never by this code.
     pub const MODULE_RELOADING: &str = "module_reloading";
     pub const MODULE_WARMING: &str = "module_warming";
     pub const TARGET_UNAVAILABLE: &str = "target_unavailable";

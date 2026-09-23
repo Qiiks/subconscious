@@ -687,6 +687,12 @@ impl ForwardBackend {
                 .acquire_tagged(corr, frame.header.flags.is_subscription())
                 .await
             {
+                // `module_reloading` here is answered BEFORE the frame is
+                // forwarded, so the module never sees the request and callers
+                // may re-dispatch it after reopening the route. That is a wire
+                // guarantee documented on `error_codes::MODULE_RELOADING`; do
+                // not emit this code for a request that already reached
+                // `module_sink.send` below.
                 if self
                     .forwarding
                     .endpoint_is_draining(route.module_endpoint)
