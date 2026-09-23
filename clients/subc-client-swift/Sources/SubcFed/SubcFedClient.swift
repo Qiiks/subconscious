@@ -705,6 +705,7 @@ public actor SubcFedClient {
             let kind = frame.terminalKind ?? "error"
             let code = frame.terminalCode
             let message = frame.terminalMessage
+            let hostRefusal = frame.terminalHostRefusal
             await resolvePendingCall(seq: effect.seq) { pending in
                 do {
                     let body = try await session.engine.handleInboundTerminal(
@@ -714,6 +715,7 @@ public actor SubcFedClient {
                         bodyOmitted: frame.body.isEmpty,
                         errorCode: code,
                         errorMessage: message,
+                        hostRefusal: hostRefusal,
                         isMutation: pending.isMutation,
                         permit: pending.permit
                     )

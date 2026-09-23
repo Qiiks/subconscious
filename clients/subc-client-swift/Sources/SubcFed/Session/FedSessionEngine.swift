@@ -476,6 +476,7 @@ public actor FedSessionEngine {
         bodyOmitted: Bool,
         errorCode: String?,
         errorMessage: String? = nil,
+        hostRefusal: FedHostRefusalHint? = nil,
         isMutation: Bool,
         permit: FedAdmissionPermit,
         provenance: FedDispatchProvenance = .afterDispatchOrUnknown
@@ -509,7 +510,13 @@ public actor FedSessionEngine {
             // Reporting it as one converts every remote refusal into a network
             // fault, so the caller retries a call that will refuse identically and
             // never learns the reason. Carry the module's own code through.
-            throw FedFailure.moduleError(code: errorCode ?? "unspecified", message: errorMessage)
+            // The host-refusal hint is informational only: it rides on the failure
+            // and changes no disposition (the mutating path above never carries it).
+            throw FedFailure.moduleError(
+                code: errorCode ?? "unspecified",
+                message: errorMessage,
+                hostRefusal: hostRefusal
+            )
         }
         return body
     }

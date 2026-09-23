@@ -139,16 +139,45 @@ public struct FedFrame: Sendable, Equatable {
         errorBodyField("message")
     }
 
+    /// The host-warming hint from a terminal `call_frame` error body, applying
+    /// the closed-set decoding rule documented on `FedHostRefusalHint`.
+    ///
+    /// Returns nil unless the body's code is exactly `fed_target_unavailable`
+    /// and its `detail.host_refusal` is one of the known values. A malformed or
+    /// unknown hint never fails the call; it is simply absent.
+    public var terminalHostRefusal: FedHostRefusalHint? {
+        guard terminalCode == "fed_target_unavailable",
+              let object = errorBodyObject(),
+              let detail = object["detail"] as? [String: Any],
+              let refusalText = detail["host_refusal"] as? String,
+              let refusal = FedHostRefusalHint.HostRefusal(rawValue: refusalText)
+        else {
+            return nil
+        }
+        var reason: FedHostRefusalHint.HostReason?
+        if refusal == .moduleWarming, let reasonText = detail["host_reason"] as? String {
+            reason = FedHostRefusalHint.HostReason(rawValue: reasonText)
+        }
+        return FedHostRefusalHint(hostRefusal: refusal, hostReason: reason)
+    }
+
     /// The code of a `bye`/`goodbye` frame, which genuinely lives in the header.
     public var byeCode: String? {
         guard case .string(let value) = header["code"] else { return nil }
         return value
     }
 
-    private func errorBodyField(_ name: String) -> String? {
+    private func errorBodyObject() -> [String: Any]? {
         guard !body.isEmpty,
-              let parsed = try? JSONSerialization.jsonObject(with: body),
-              let object = parsed as? [String: Any],
+              let parsed = try? JSONSerialization.jsonObject(with: body)
+        else {
+            return nil
+        }
+        return parsed as? [String: Any]
+    }
+
+    private func errorBodyField(_ name: String) -> String? {
+        guard let object = errorBodyObject(),
               let value = object[name] as? String,
               !value.isEmpty
         else {

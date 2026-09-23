@@ -421,6 +421,77 @@ final class FedAuditHardeningTests: XCTestCase {
         }
     }
 
+    /// A host that is warming its target module refuses with
+    /// `fed_target_unavailable` plus a `detail` hint. The hint must reach the
+    /// caller on the module error, read from the frame body through the same
+    /// accessors `SubcFedClient.handleInboundFrames` uses, so an app can say
+    /// "your Mac is starting up" instead of "cannot reach your Mac".
+    func testTargetUnavailableRefusalCarriesHostWarmingHint() async throws {
+        let store = FedMemoryStateStore()
+        _ = try await store.open(localPublicKey: localKey)
+        let clock = FedFakeClock()
+        let admission = FedAdmissionController(
+            responderStaticPublicKey: responder,
+            configuration: .init(policy: try FedAdmissionPolicySnapshot(), peerMaxInFlight: 2),
+            clock: clock
+        )
+        let effectLog = FedOriginEffectLog(store: store, responderStaticPublicKey: responder)
+        let transport = FedLoopbackByteTransport()
+        let engine = FedSessionEngine(deps: .init(
+            transport: transport,
+            store: store,
+            clock: clock,
+            localPublicKey: localKey,
+            responderStaticPublicKey: responder,
+            helloPolicy: try FedHelloPolicy(),
+            connectionAttemptID: String(repeating: "a", count: 32),
+            sharedAdmission: admission,
+            sharedEffectLog: effectLog
+        ))
+        try await establishReady(engine: engine, transport: transport, modulesJSON: mutateCatalog)
+
+        let admitted = try await engine.admitManagementCall(
+            moduleID: "prefrontal-core",
+            method: "board.state",
+            params: FedJSONObject([:]),
+            policy: try FedAdmissionPolicySnapshot()
+        )
+        let frame = FedFrame(
+            type: "call_frame",
+            fields: ["k": .string("error"), "last": .bool(true)],
+            body: Data(#"""
+            {"code":"fed_target_unavailable","message":"module is starting",
+             "detail":{"host_refusal":"module_warming","host_reason":"required_capability_unprovided"}}
+            """#.utf8)
+        )
+        do {
+            _ = try await engine.handleInboundTerminal(
+                effect: admitted.effect,
+                kind: frame.terminalKind ?? "error",
+                body: frame.body,
+                bodyOmitted: frame.body.isEmpty,
+                errorCode: frame.terminalCode,
+                errorMessage: frame.terminalMessage,
+                hostRefusal: frame.terminalHostRefusal,
+                isMutation: false,
+                permit: admitted.permit
+            )
+            XCTFail("a module error must reach the caller")
+        } catch let error as FedFailure {
+            XCTAssertEqual(
+                error,
+                .moduleError(
+                    code: "fed_target_unavailable",
+                    message: "module is starting",
+                    hostRefusal: FedHostRefusalHint(
+                        hostRefusal: .moduleWarming,
+                        hostReason: .requiredCapabilityUnprovided
+                    )
+                )
+            )
+        }
+    }
+
     // MARK: - Helpers
 
     private var mutateCatalog: String {
