@@ -8,3 +8,10 @@ test("module_removed is terminal while a reloading module remains retryable", ()
   expect(isRetryableRouteOpenCode("invalid_project_root")).toBe(false);
   expect(isRetryableRouteOpenCode("capability_forbidden")).toBe(false);
 });
+
+test("unknown_module is terminal; only late-target codes stay retryable", () => {
+  expect(isRetryableRouteOpenCode("unknown_module")).toBe(false);
+  expect(isRetryableRouteOpenCode("module_warming")).toBe(true);
+  expect(isRetryableRouteOpenCode("target_unavailable")).toBe(true);
+  expect(isRetryableRouteOpenCode("module_timeout")).toBe(true);
+});

@@ -14,7 +14,7 @@
     "op_not_allowed": "terminal",
     "route_limit": "terminal",
     "target_unavailable": "retryable",
-    "unknown_module": "retryable"
+    "unknown_module": "terminal"
   },
   "route_close_disposition": {
     "capability_denied": "must_not_reopen",

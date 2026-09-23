@@ -1921,7 +1921,11 @@ function isRouteOpenRefusal(err: unknown): err is SubcError & { code: string } {
  * within ROUTE_OPEN_RETRY_DEADLINE_MS. Permanent rejections (module_removed,
  * bad_consumer_identity, config_divergence, unknown_target, ...) are excluded — they are pre-send but
  * would never succeed, so retrying them would only storm the daemon. In
- * particular, capability_forbidden is an explicit non-retryable policy refusal.
+ * particular, capability_forbidden is an explicit non-retryable policy refusal,
+ * and unknown_module is terminal: it now means only "no module of this id is
+ * registered or supervised here" (a typo or an undeployed peer), because the
+ * daemon reports a configured-but-late target with module_warming or
+ * target_unavailable.
  * Kept byte-identical to subc-client-rs is_retryable_route_open_code for cross-client
  * classification parity.
  */
@@ -1929,7 +1933,6 @@ export function isRetryableRouteOpenCode(code: string | undefined): boolean {
   // A capability deny is policy, never a transient target-availability failure.
   if (code === "capability_forbidden") return false;
   return (
-    code === "unknown_module" ||
     code === "module_reloading" ||
     code === "module_warming" ||
     code === "target_unavailable" ||

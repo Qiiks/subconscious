@@ -907,7 +907,7 @@ async fn subc_consumer_reports_outcome_unknown_mid_call_then_reopens_after_resta
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn subc_consumer_retries_unknown_module_until_provider_registers_and_bounds_absence() {
+async fn subc_consumer_recovers_after_daemon_restart_and_refuses_unknown_module_terminally() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
@@ -958,21 +958,10 @@ async fn subc_consumer_retries_unknown_module_until_provider_registers_and_bound
     daemon.restart(&daemon_bin);
     wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
 
-    let racing_call = {
-        let consumer = Arc::clone(&consumer);
-        let identity = identity.clone();
-        tokio::spawn(async move {
-            consumer
-                .call(
-                    tool_target(CONSUMER_MODULE_A),
-                    identity,
-                    br#"{"kind":"unary","value":"after-register"}"#.to_vec(),
-                    fast_call_options(),
-                )
-                .await
-        })
-    };
-    sleep(Duration::from_millis(250)).await;
+    // unknown_module is a terminal route.open refusal: a call that races a
+    // provider's registration now fails instead of retrying in place, so the
+    // provider's HELLO must land before the call. wait_for_catalog_module is
+    // that registration barrier.
     let restarted_events = temp_dir.join("restarted-provider.jsonl");
     let _provider = spawn_provider(
         &module_bin,
@@ -981,20 +970,39 @@ async fn subc_consumer_retries_unknown_module_until_provider_registers_and_bound
         &restarted_events,
     );
     wait_for_catalog_module(&daemon.connection_file, CONSUMER_MODULE_A, START_TIMEOUT).await;
-    let raced = racing_call.await.unwrap().unwrap();
+    let raced = consumer
+        .call(
+            tool_target(CONSUMER_MODULE_A),
+            identity.clone(),
+            br#"{"kind":"unary","value":"after-register"}"#.to_vec(),
+            fast_call_options(),
+        )
+        .await
+        .unwrap();
     assert_eq!(json_body(&raced)["echo"]["value"], "after-register");
 
+    // A terminal refusal must also not burn the retry budget: the call fails
+    // after one route.open, well before the first retry backoff would fire.
+    // terminal_absence_options makes that backoff two seconds, so a consumer
+    // that retried unknown_module anyway would blow past this bound.
+    let started = Instant::now();
     let absent = consumer
         .call(
             tool_target("subc-client-rs-never-registers"),
             identity,
             br#"{"kind":"unary","value":"missing"}"#.to_vec(),
-            bounded_absence_options(),
+            terminal_absence_options(),
         )
         .await;
+    let absent_elapsed = started.elapsed();
     assert!(
         matches!(absent, Err(CallError::NotSent(_))),
-        "bounded target absence should terminate as NotSent, got {absent:?}"
+        "target absence should terminate as NotSent, got {absent:?}"
+    );
+    assert!(
+        absent_elapsed < Duration::from_secs(1),
+        "unknown_module is terminal: the refusal took {absent_elapsed:?}, at or past the \
+         one-second bound a single unretried route.open must stay well under"
     );
 }
 
@@ -1809,15 +1817,19 @@ fn fast_call_options() -> CallOptions {
     }
 }
 
-fn bounded_absence_options() -> CallOptions {
+/// A call against a target that will never register must fail on the first
+/// route.open refusal. The two-second first backoff is the tell: any in-place
+/// retry of a terminal code sleeps it before the second attempt, which the
+/// caller-side elapsed bound catches.
+fn terminal_absence_options() -> CallOptions {
     CallOptions {
-        timeout: Duration::from_secs(2),
+        timeout: Duration::from_secs(8),
         route_retry: RetryBackoff {
-            base: Duration::from_millis(25),
-            cap: Duration::from_millis(50),
+            base: Duration::from_secs(2),
+            cap: Duration::from_secs(2),
             max_attempts: 4,
         },
-        route_retry_deadline: Duration::from_millis(300),
+        route_retry_deadline: Duration::from_secs(6),
         ..CallOptions::default()
     }
 }

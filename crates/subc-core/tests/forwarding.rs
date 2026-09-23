@@ -759,11 +759,12 @@ async fn protocol_none_teardown_sigterms_first_and_only_kills_a_child_that_ignor
 /// something that can never exist, and the refusal has to say so in a code the
 /// SDKs classify as terminal.
 ///
-/// `unknown_module` and `target_unavailable` are both RETRYABLE, and both would
-/// be lies here: the module is configured, running, and supervised, and no
-/// amount of waiting changes the answer. A retryable code turns every consumer
-/// that reaches for this module into a retry loop against the daemon for the
-/// lifetime of the process.
+/// `target_unavailable` is RETRYABLE and `unknown_module` only means "no module
+/// of this id is registered or supervised here", and both would be lies here:
+/// the module is configured, running, and supervised, and no amount of waiting
+/// changes the answer. A retryable code turns every consumer that reaches for
+/// this module into a retry loop against the daemon for the lifetime of the
+/// process.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn route_open_to_a_protocol_none_module_is_refused_as_terminal_and_counted() {
     let server = TestServer::start().await;

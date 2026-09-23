@@ -4991,7 +4991,6 @@ mod tests {
     #[test]
     fn retryable_route_open_codes_are_code_specific() {
         for code in [
-            "unknown_module",
             "module_reloading",
             "module_warming",
             "target_unavailable",
@@ -4999,6 +4998,14 @@ mod tests {
         ] {
             assert!(is_retryable_route_open_code(code), "{code} should retry");
         }
+        // "No module of this id is registered or supervised here" is a typo or
+        // an undeployed peer: the daemon reports a configured-but-late target
+        // with module_warming/target_unavailable, so retrying unknown_module
+        // in place only papers over an unsupervised module's HELLO race.
+        assert!(
+            !is_retryable_route_open_code(error_codes::UNKNOWN_MODULE),
+            "unknown_module is terminal"
+        );
         assert!(!is_retryable_route_open_code(error_codes::MODULE_REMOVED));
         assert!(!is_retryable_route_open_code("invalid_project_root"));
         assert!(!is_retryable_route_open_code("route_rejected"));

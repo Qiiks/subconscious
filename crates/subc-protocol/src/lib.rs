@@ -55,10 +55,10 @@ pub mod error_codes {
     /// never accept a route. The daemon supervises its process and nothing else.
     ///
     /// TERMINAL, and deliberately neither of its two neighbours. It is not
-    /// `unknown_module`, which means "never heard of it, it may appear" and is
-    /// retried; retrying here would storm the daemon forever, because the answer
-    /// is a property of the module's declaration rather than of its current
-    /// state. It is not `module_removed` either: the module is configured,
+    /// `unknown_module`, which means "no module of this id is registered or
+    /// supervised here" and is likewise terminal; retrying here would storm the
+    /// daemon forever, because the answer is a property of the module's
+    /// declaration rather than of its current state. It is not `module_removed` either: the module is configured,
     /// running, and supervised. Only an edit to its configuration can change
     /// this answer, and a caller cannot wait that out.
     pub const MODULE_NO_PROTOCOL: &str = "module_no_protocol";
@@ -75,14 +75,17 @@ pub mod error_codes {
     ///
     /// Unknown codes are terminal: a refusal this crate has never heard of
     /// must not be retried on the strength of a match-all arm.
+    ///
+    /// `unknown_module` is terminal: it now means only "no module of this id
+    /// is registered or supervised here" — a typo, or a peer not deployed on
+    /// this host. The daemon reports a configured-but-late target with its own
+    /// retryable codes (`module_warming`, `target_unavailable`), so a caller
+    /// that races an unsupervised module's HELLO owns its own retry; retrying
+    /// in place only papers over that race for one narrow window.
     pub fn is_retryable_route_open(code: &str) -> bool {
         matches!(
             code,
-            UNKNOWN_MODULE
-                | MODULE_RELOADING
-                | MODULE_WARMING
-                | TARGET_UNAVAILABLE
-                | MODULE_TIMEOUT
+            MODULE_RELOADING | MODULE_WARMING | TARGET_UNAVAILABLE | MODULE_TIMEOUT
         )
     }
 }
