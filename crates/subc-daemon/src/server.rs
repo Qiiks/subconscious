@@ -24,12 +24,33 @@ use crate::{
     write_frame, FrameIoError, RouterError,
 };
 
-pub const CONNECTION_EGRESS_BUFFER: usize = 64;
-/// A pending `route.open` owns one slot in the connection's shared egress queue
-/// until its module answers. Limit binds to one eighth of that queue so even a
-/// client spending its whole bind allowance leaves seven eighths available for
-/// data-plane responses and other control traffic.
-pub(crate) const MAX_PENDING_ROUTE_OPENS_PER_CONNECTION: usize = CONNECTION_EGRESS_BUFFER / 8;
+/// Bytes (envelope header plus body) one connection's egress queue may hold
+/// before a non-waiting enqueue is refused, which closes that connection.
+///
+/// Sized for a client that is slow but still reading: one connection can
+/// multiplex many token streams, and at roughly 200-byte frames (21-byte header
+/// plus body) 4 MiB is about 19,000 queued frames, i.e. thousands of frames on
+/// each of several routes, enough to ride out a pause of seconds. It is also the
+/// most a stuck client can make the daemon hold for it: 4 MiB per connection,
+/// so even 128 stuck connections stay near 512 MiB rather than growing without
+/// bound. A single frame larger than the whole budget is still admitted into an
+/// empty queue so it can be sent at all.
+pub const CONNECTION_EGRESS_BYTE_BUDGET: usize = 4 * 1024 * 1024;
+/// Frame-count backstop for the same queue (the tokio channel's capacity).
+/// The byte budget is the real bound; this one only matters for floods of tiny
+/// or empty frames, which cost bookkeeping per frame rather than bytes. 32,768
+/// frames times 128 bytes is exactly the 4 MiB budget, so for any mean frame of
+/// 128 bytes or more the byte budget binds first; below that (for example
+/// 21-byte empty frames, of which 4 MiB would be almost 200,000) the count
+/// does. The channel allocates slots lazily, so a large capacity costs nothing
+/// until it is used.
+pub const CONNECTION_EGRESS_FRAME_CAP: usize = 32 * 1024;
+/// A pending `route.open` holds one reserved slot in the connection's egress
+/// queue until its module answers, and its response is sent outside the byte
+/// budget. Eight concurrent opens per connection keep a reconnect burst
+/// parallel while bounding both the reserved slots and the bytes that bypass
+/// the budget.
+pub const MAX_PENDING_ROUTE_OPENS_PER_CONNECTION: usize = 8;
 /// A reconnect herd may spread one target's opens over many client connections.
 /// Two safe per-connection bursts retain useful parallelism without restoring
 /// the hundreds-of-binds fanout that serial dispatch used to suppress.
@@ -348,10 +369,9 @@ where
     // retains a partial frame read across completed route.open tasks; dropping the read
     // happens only when a frame finishes or the connection ends.
     let mut read_half = BufReader::new(read_half);
-    let (tx, rx) = mpsc::channel::<crate::router::OutboundFrame>(CONNECTION_EGRESS_BUFFER);
+    let (egress, rx) = connection_egress();
     let mut writer = tokio::spawn(drain_writer(write_half, rx));
 
-    let egress = FrameSink::new(tx);
     let ctx = RouteCtx {
         connection_id,
         egress: egress.clone(),
@@ -644,6 +664,17 @@ fn close_reason(
     })
 }
 
+/// The outbound queue for one daemon connection: a sink bounded by
+/// [`CONNECTION_EGRESS_BYTE_BUDGET`] and [`CONNECTION_EGRESS_FRAME_CAP`], and
+/// the receiver its writer drains.
+pub(crate) fn connection_egress() -> (FrameSink, mpsc::Receiver<crate::router::OutboundFrame>) {
+    let (tx, rx) = mpsc::channel::<crate::router::OutboundFrame>(CONNECTION_EGRESS_FRAME_CAP);
+    (
+        FrameSink::with_byte_budget(tx, CONNECTION_EGRESS_BYTE_BUDGET),
+        rx,
+    )
+}
+
 async fn drain_writer<W>(
     write_half: W,
     mut rx: mpsc::Receiver<crate::router::OutboundFrame>,
@@ -678,6 +709,9 @@ where
 {
     const SLOW_REPLY_QUEUE: Duration = Duration::from_millis(1000);
     let queued = outbound.enqueued_at.elapsed();
+    // Held until this frame has been written, then dropped at the end of this
+    // function, which gives its bytes back to the connection's egress budget.
+    let _charge = outbound.charge;
     let frame = outbound.frame;
     if frame.header.channel == 0 && queued >= SLOW_REPLY_QUEUE {
         let write_started = std::time::Instant::now();
@@ -851,6 +885,7 @@ mod tests {
             frame: reply,
             enqueued_at: std::time::Instant::now() - Duration::from_millis(1500),
             flushed: None,
+            charge: None,
         })
         .await
         .expect("queued");
@@ -903,6 +938,7 @@ mod tests {
             frame: control,
             enqueued_at: std::time::Instant::now(),
             flushed: None,
+            charge: None,
         })
         .await
         .expect("queued");
@@ -925,6 +961,7 @@ mod tests {
             frame: data,
             enqueued_at: std::time::Instant::now() - Duration::from_millis(5000),
             flushed: None,
+            charge: None,
         })
         .await
         .expect("queued");

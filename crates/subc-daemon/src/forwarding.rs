@@ -12,7 +12,7 @@ use subc_protocol::{
     session::{LiveRoot, ModuleControlResponse, ModuleControlResponseToModule},
     ErrorBody, Flags, FrameType, Principal, Priority,
 };
-use tokio::sync::{mpsc, oneshot, Semaphore};
+use tokio::sync::{oneshot, Semaphore};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
@@ -132,9 +132,46 @@ pub(crate) struct GoodbyeTarget {
     pub channel: u16,
     pub epoch: u32,
     pub kind: GoodbyeTargetKind,
-    /// The receiving module when this is a module-targeted relay. Client targets
-    /// have no module owner, while this identifier attributes a dropped relay.
+    /// The module on the other end of the route: for a module-targeted relay
+    /// the receiving module (attributing a dropped relay), for a client target
+    /// the module whose route is going away (naming it when an undeliverable
+    /// relay closes the client).
     pub module_id: Option<String>,
+}
+
+/// The frame a client connection's egress queue refused, for the diagnosis
+/// logged when that refusal closes the connection.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct UndeliveredFrame<'a> {
+    /// The module on the other end of the route the frame belonged to, when known.
+    pub module_id: Option<&'a str>,
+    /// The refusing connection's sink, read for what its queue held.
+    pub sink: &'a FrameSink,
+}
+
+/// How a route's principal appears in logs: `direct`, or `reserved:<module>`.
+fn principal_label(principal: &Principal) -> String {
+    match principal {
+        Principal::Reserved { module_id } => format!("reserved:{module_id}"),
+        Principal::Direct => "direct".to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// The distinct principals of the routes bound on one client connection,
+/// sorted and comma-joined, or `none` when it has no bound route.
+fn connection_principals_locked(inner: &ForwardingInner, connection_id: ConnectionId) -> String {
+    let labels = inner
+        .client_to_module
+        .iter()
+        .filter(|(key, _)| key.connection_id == connection_id)
+        .map(|(_, route)| principal_label(&route.principal))
+        .collect::<std::collections::BTreeSet<_>>();
+    if labels.is_empty() {
+        "none".to_string()
+    } else {
+        labels.into_iter().collect::<Vec<_>>().join(",")
+    }
 }
 
 impl GoodbyeTarget {
@@ -266,7 +303,7 @@ struct PendingRouteBindRelayEntry {
     reservation: RouteReservation,
     client_sink: FrameSink,
     client_negotiated_ver: u8,
-    client_permit: mpsc::OwnedPermit<crate::router::OutboundFrame>,
+    client_permit: crate::router::EgressPermit,
     route_open_frame: Frame,
     principal: Principal,
     deadline: Instant,
@@ -430,11 +467,14 @@ impl ForwardingTable {
         count
     }
 
+    /// Ask a registered connection to close. Returns true only for the request
+    /// that actually reached it; later requests for the same connection, and
+    /// requests for a connection that is not registered, return false.
     pub(crate) fn request_connection_close(
         &self,
         connection_id: ConnectionId,
         reason: CloseReason,
-    ) {
+    ) -> bool {
         let sender = self.lock_close_registry().remove(&connection_id);
         if let Some(sender) = sender {
             debug!(
@@ -443,12 +483,14 @@ impl ForwardingTable {
                 "requesting connection close"
             );
             let _ = sender.send(reason);
+            true
         } else {
             debug!(
                 connection_id = connection_id.get(),
                 close_reason = %reason,
                 "connection close request ignored for inactive connection"
             );
+            false
         }
     }
 
@@ -865,7 +907,7 @@ impl ForwardingTable {
         principal: Principal,
         project_root: Option<ProjectRootId>,
         deadline: Instant,
-        client_permit: mpsc::OwnedPermit<crate::router::OutboundFrame>,
+        client_permit: crate::router::EgressPermit,
     ) -> Result<PendingRouteBindRelay, ForwardingError> {
         let mut inner = self.write_inner()?;
         if inner.closing_connections.contains(&client_connection_id) {
@@ -2079,30 +2121,57 @@ impl ForwardingTable {
         released
     }
 
+    /// Close a client connection whose egress queue refused a frame for the
+    /// route `(connection_id, channel)` at `expected_epoch`. The whole
+    /// connection closes because its queue is shared by every route on it.
+    ///
+    /// The first request that actually closes the connection logs one WARN with
+    /// the diagnosis: which principals the connection's routes belonged to,
+    /// which module's frame did not fit and on which client channel, and what
+    /// the queue held at that moment.
     pub(crate) fn escalate_client_delivery_failure(
         &self,
         connection_id: ConnectionId,
         channel: u16,
         expected_epoch: u32,
         reason: CloseReason,
+        undelivered: UndeliveredFrame<'_>,
     ) -> Result<bool, ForwardingError> {
-        let should_close = {
+        let principals = {
             let mut inner = self.write_inner()?;
             let key = ClientRouteKey {
                 connection_id,
                 channel,
             };
             if inner.last_published_epoch.get(&key).copied() != Some(expected_epoch) {
-                false
+                None
             } else {
                 inner.closing_connections.insert(connection_id);
-                true
+                Some(connection_principals_locked(&inner, connection_id))
             }
         };
-        if should_close {
-            self.request_connection_close(connection_id, reason);
+        let Some(principals) = principals else {
+            return Ok(false);
+        };
+        let backlog = undelivered.sink.backlog();
+        let close_reason = reason.to_string();
+        if self.request_connection_close(connection_id, reason) {
+            warn!(
+                connection_id = connection_id.get(),
+                principals = %principals,
+                module_id = undelivered.module_id.unwrap_or("unknown"),
+                client_channel = channel,
+                queued_bytes = backlog.queued_bytes,
+                queued_frames = backlog.queued_frames,
+                oldest_queued_ms = backlog
+                    .oldest_age
+                    .map(|age| age.as_millis() as u64)
+                    .unwrap_or(0),
+                close_reason = %close_reason,
+                "closing client connection: its egress queue could not take a frame"
+            );
         }
-        Ok(should_close)
+        Ok(true)
     }
 
     fn record_route_release(&self, release: &RouteRelease) {
@@ -2251,7 +2320,7 @@ fn endpoint_routes_locked(
                 channel: route.client_channel,
                 epoch: route.client_epoch,
                 kind: GoodbyeTargetKind::Client,
-                module_id: None,
+                module_id: Some(route.module_id.clone()),
             },
             principal: route.principal.clone(),
             bound_at: route.bound_at,
@@ -2344,7 +2413,7 @@ fn release_module_route_locked(
         channel: route.client_channel,
         epoch: route.client_epoch,
         kind: GoodbyeTargetKind::Client,
-        module_id: None,
+        module_id: Some(route.module_id.clone()),
     })
 }
 
@@ -2413,16 +2482,12 @@ fn commit_route_locked(
         .last_published_epoch
         .insert(reservation.client_key, reservation.client_epoch);
 
-    // OwnedPermit::send cannot fail, but its returned sender reveals a receiver
+    // Sending through the reserved slot cannot fail, but it reports a receiver
     // that closed after reservation and before this locked publication point.
-    // Stamp at publication: the permit was reserved earlier, but queue residency
-    // for the reply-write diagnosis starts when the frame actually enters the queue.
-    let client_sender = pending.client_permit.send(crate::router::OutboundFrame {
-        frame: pending.route_open_frame,
-        enqueued_at: std::time::Instant::now(),
-        flushed: None,
-    });
-    if client_sender.is_closed() {
+    // The frame is stamped and charged to the queued-byte count here, when it
+    // actually enters the queue, not when the slot was reserved.
+    let client_writer_closed = pending.client_permit.send(pending.route_open_frame);
+    if client_writer_closed {
         let abandoned = pending
             .relay_enqueued
             .then(|| abandoned_route_target(inner, &reservation))
@@ -3191,6 +3256,80 @@ mod tests {
             .unwrap()
     }
 
+    /// A pending route.open reserves its queue slot with `reserve_owned` and
+    /// sends its prebuilt response through that slot when the module accepts.
+    /// A queue already holding many data frames (far more than the old 64-frame
+    /// queue) must not stop the open from reserving or completing, and the
+    /// response must be charged to the queue's byte count when it is sent.
+    #[tokio::test]
+    async fn pending_route_open_completes_behind_queued_data_frames() {
+        assert_eq!(
+            crate::server::MAX_PENDING_ROUTE_OPENS_PER_CONNECTION,
+            8,
+            "the per-connection pending route.open limit is its own constant"
+        );
+        let (forwarding, module_connection, _endpoint, client, _unused_sink, _unused_rx) =
+            route_fixture("open-behind-data");
+        let (sink, mut client_rx) = crate::server::connection_egress();
+        const DATA_FRAMES: usize = 1_000;
+        let data = |corr: u64| {
+            Frame::build(
+                FrameType::StreamData,
+                Flags::new(false, Priority::Interactive, false),
+                9,
+                1,
+                corr,
+                vec![b'x'; 200],
+            )
+            .unwrap()
+        };
+        for corr in 0..DATA_FRAMES as u64 {
+            sink.try_send(data(corr)).unwrap();
+        }
+        let data_bytes = DATA_FRAMES * (subc_protocol::HEADER_LEN + 200);
+        assert_eq!(sink.backlog().queued_bytes, data_bytes);
+
+        let pending = tokio::time::timeout(
+            Duration::from_secs(5),
+            forwarding.begin_route_bind_relay_for(
+                client,
+                sink.clone(),
+                subc_protocol::PROTOCOL_VERSION,
+                4_242,
+                "open-behind-data",
+                Principal::Direct,
+                None,
+                Instant::now() + Duration::from_secs(60),
+            ),
+        )
+        .await
+        .expect("reserving the route.open slot must not wait behind data frames")
+        .unwrap();
+        forwarding
+            .complete_pending_relay(
+                module_connection,
+                pending.corr,
+                RouteBindRelayOutcome::Accepted,
+            )
+            .unwrap();
+
+        let backlog = sink.backlog();
+        assert_eq!(backlog.queued_frames, DATA_FRAMES + 1);
+        assert!(
+            backlog.queued_bytes > data_bytes,
+            "the route.open response must be counted in queued bytes: {backlog:?}"
+        );
+        for corr in 0..DATA_FRAMES as u64 {
+            assert_eq!(client_rx.recv().await.unwrap().header.corr, corr);
+        }
+        let open = client_rx.recv().await.unwrap();
+        assert_eq!(open.header.corr, 4_242);
+        assert_eq!(open.header.ty, FrameType::Response);
+        drop(open);
+        assert_eq!(sink.backlog().queued_bytes, 0);
+        assert_eq!(sink.backlog().queued_frames, 0);
+    }
+
     /// The drain-timeout line reports these numbers, so they must count the
     /// requests the drain is waiting on and no others: a route with nothing in
     /// flight is not a holdout, and a flagged subscription is excluded from the
@@ -3535,6 +3674,7 @@ mod tests {
             (forwarding, client, first.client_channel, first.client_epoch)
         }
 
+        let probe_sink = FrameSink::new(mpsc::channel(1).0);
         let (no_successor, client, channel, epoch) = setup_successor(None);
         let mut close = no_successor.register_connection_close(client);
         assert!(no_successor
@@ -3543,6 +3683,10 @@ mod tests {
                 channel,
                 epoch,
                 CloseReason::new("delivery", "failed"),
+                UndeliveredFrame {
+                    module_id: None,
+                    sink: &probe_sink,
+                },
             )
             .unwrap());
         assert!(close.try_recv().is_ok());
@@ -3555,6 +3699,10 @@ mod tests {
                 channel,
                 epoch,
                 CloseReason::new("delivery", "failed"),
+                UndeliveredFrame {
+                    module_id: None,
+                    sink: &probe_sink,
+                },
             )
             .unwrap());
         assert!(close.try_recv().is_ok());
@@ -3567,6 +3715,10 @@ mod tests {
                 channel,
                 epoch,
                 CloseReason::new("delivery", "stale failure"),
+                UndeliveredFrame {
+                    module_id: None,
+                    sink: &probe_sink,
+                },
             )
             .unwrap());
         assert!(close.try_recv().is_err());
@@ -3738,6 +3890,10 @@ mod tests {
                     "module_to_client_delivery_failed",
                     "client egress refused a module frame",
                 ),
+                UndeliveredFrame {
+                    module_id: None,
+                    sink: &sink,
+                },
             )
             .unwrap());
         assert!(!sink.is_closed());
@@ -3923,6 +4079,10 @@ mod tests {
                     "module_to_client_delivery_failed",
                     "client egress refused a module frame",
                 ),
+                UndeliveredFrame {
+                    module_id: None,
+                    sink: &sink,
+                },
             )
             .unwrap());
         assert_eq!(forwarding.closing_connection_count().unwrap(), 1);

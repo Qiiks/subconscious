@@ -1481,6 +1481,10 @@ impl ControlHandler {
                                     released.channel
                                 ),
                             ),
+                            crate::forwarding::UndeliveredFrame {
+                                module_id: released.module_id.as_deref(),
+                                sink: &released.sink,
+                            },
                         )
                         .unwrap_or(false)
                     {
@@ -5345,6 +5349,10 @@ pub(crate) fn send_route_control_pushes(
                             target.channel
                         ),
                     ),
+                    crate::forwarding::UndeliveredFrame {
+                        module_id: target.module_id.as_deref(),
+                        sink: &target.sink,
+                    },
                 );
             }
         }
@@ -6936,6 +6944,10 @@ mod tests {
                     "module_to_client_delivery_failed",
                     "client egress refused a module frame",
                 ),
+                crate::forwarding::UndeliveredFrame {
+                    module_id: None,
+                    sink: &dying_ctx.egress,
+                },
             )
             .unwrap());
         assert!(!dying_ctx.egress.is_closed());

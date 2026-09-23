@@ -14,7 +14,7 @@ use subc_control::{
     SupervisorHealthStatus,
 };
 use subc_daemon::{
-    read_frame, server::CONNECTION_EGRESS_BUFFER, stderr_tail::TailEntry,
+    read_frame, server::MAX_PENDING_ROUTE_OPENS_PER_CONNECTION, stderr_tail::TailEntry,
     test_support::TestTempDir, write_frame, ExitKind, ForwardingTable, Frame, HealthAction,
     HealthConfig, ModuleOverlap, ModuleSpec, ModuleState, ModuleStatus, Registry, RestartPolicy,
     SuperviseError, SupervisedModule, Supervisor, SupervisorHandle, SupervisorProcessLiveness,
@@ -4234,7 +4234,7 @@ async fn route_open_connection_ceiling_refuses_without_queueing() {
     let mut client = connect_authed_client(&server.connection_file_path)
         .await
         .unwrap();
-    let limit = CONNECTION_EGRESS_BUFFER / 8;
+    let limit = MAX_PENDING_ROUTE_OPENS_PER_CONNECTION;
     let first_corr = 700u64;
 
     for offset in 0..=limit {
@@ -4287,7 +4287,7 @@ async fn route_open_target_ceiling_spans_client_connections() {
     )
     .await;
     let project = TestProject::new();
-    let limit = (CONNECTION_EGRESS_BUFFER / 8) * 2;
+    let limit = MAX_PENDING_ROUTE_OPENS_PER_CONNECTION * 2;
     let mut admitted_clients = Vec::with_capacity(limit);
 
     for offset in 0..limit {

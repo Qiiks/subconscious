@@ -5822,6 +5822,10 @@ fn send_route_goodbyes(forwarding: &ForwardingTable, released_routes: Vec<Goodby
                             released.channel
                         ),
                     ),
+                    crate::forwarding::UndeliveredFrame {
+                        module_id: released.module_id.as_deref(),
+                        sink: &released.sink,
+                    },
                 );
             } else {
                 warn!(

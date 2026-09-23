@@ -1,23 +1,23 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     error::Error,
     fmt,
     sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use subc_protocol::{ErrorBody, Flags, FrameType, Priority};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tracing::debug;
 
 use crate::{
     control::ControlHandler,
     forwarding::{
         CloseReason, ConnectionCloseReceiver, DataRoute, DataRouteState, ForwardingError,
-        ForwardingTable, RouteBinding, RouteRelease,
+        ForwardingTable, RouteBinding, RouteRelease, UndeliveredFrame,
     },
     registry::ConnectionId,
     DaemonCounters, Frame, FrameBuildError,
@@ -36,15 +36,180 @@ pub struct OutboundFrame {
     pub frame: Frame,
     pub enqueued_at: std::time::Instant,
     pub(crate) flushed: Option<tokio::sync::oneshot::Sender<()>>,
+    /// This frame's share of the connection's queued-byte count. Dropping the
+    /// frame (after the writer has written it, or when the queue itself is
+    /// dropped with the frame still in it) gives the bytes back. `None` only for
+    /// frames built outside a [`FrameSink`], which exist in tests alone.
+    pub(crate) charge: Option<EgressCharge>,
 }
 
 impl OutboundFrame {
-    fn now(frame: Frame) -> Self {
+    fn charged(frame: Frame, charge: EgressCharge) -> Self {
         Self {
             frame,
-            enqueued_at: std::time::Instant::now(),
+            enqueued_at: charge.enqueued_at,
             flushed: None,
+            charge: Some(charge),
         }
+    }
+}
+
+/// Bytes a frame occupies in the connection's egress queue for budget
+/// purposes: the fixed envelope header plus the body.
+fn queued_frame_bytes(frame: &Frame) -> usize {
+    subc_protocol::HEADER_LEN + frame.body.len()
+}
+
+/// A point-in-time view of one connection's egress queue, for diagnosing why a
+/// frame did not fit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EgressBacklog {
+    pub queued_bytes: usize,
+    pub queued_frames: usize,
+    /// How long the oldest frame still held by the queue (including one the
+    /// writer is in the middle of writing) has been waiting.
+    pub oldest_age: Option<Duration>,
+}
+
+#[derive(Debug, Default)]
+struct EgressQueueTimes {
+    next_seq: u64,
+    /// Admission sequence and instant of every frame still charged, oldest first.
+    queued: VecDeque<(u64, Instant)>,
+}
+
+/// Queued-byte accounting shared by every clone of one connection's
+/// [`FrameSink`] and by every frame that sink has admitted.
+#[derive(Debug)]
+struct EgressAccounting {
+    byte_budget: usize,
+    queued_bytes: AtomicUsize,
+    times: Mutex<EgressQueueTimes>,
+    /// Woken whenever a charged frame releases its bytes, so an awaited send
+    /// that is waiting for room can re-check.
+    freed: Notify,
+}
+
+impl EgressAccounting {
+    fn new(byte_budget: usize) -> Self {
+        Self {
+            byte_budget,
+            queued_bytes: AtomicUsize::new(0),
+            times: Mutex::new(EgressQueueTimes::default()),
+            freed: Notify::new(),
+        }
+    }
+
+    fn lock_times(&self) -> std::sync::MutexGuard<'_, EgressQueueTimes> {
+        self.times
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Charge `bytes` if they fit in the budget. A frame larger than the whole
+    /// budget (bodies may be up to 64 MiB) is still admitted into an EMPTY
+    /// queue, since it could otherwise never be sent at all; it simply has the
+    /// queue to itself until it is written.
+    fn try_charge(self: &Arc<Self>, bytes: usize) -> Option<EgressCharge> {
+        let mut current = self.queued_bytes.load(Ordering::Acquire);
+        loop {
+            if current != 0 && current.saturating_add(bytes) > self.byte_budget {
+                return None;
+            }
+            match self.queued_bytes.compare_exchange_weak(
+                current,
+                current + bytes,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(self.record(bytes)),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Charge `bytes` regardless of the budget. Used only for a frame whose
+    /// queue slot was reserved in advance, which must be sendable.
+    fn charge_unconditionally(self: &Arc<Self>, bytes: usize) -> EgressCharge {
+        self.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
+        self.record(bytes)
+    }
+
+    fn record(self: &Arc<Self>, bytes: usize) -> EgressCharge {
+        let mut times = self.lock_times();
+        let seq = times.next_seq;
+        times.next_seq += 1;
+        let enqueued_at = Instant::now();
+        times.queued.push_back((seq, enqueued_at));
+        EgressCharge {
+            accounting: Arc::clone(self),
+            bytes,
+            seq,
+            enqueued_at,
+        }
+    }
+
+    fn release(&self, bytes: usize, seq: u64) {
+        self.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+        {
+            let mut times = self.lock_times();
+            // Frames almost always leave in admission order, so this is the
+            // front entry; the search covers a frame dropped out of order.
+            if times.queued.front().map(|(front, _)| *front) == Some(seq) {
+                times.queued.pop_front();
+            } else if let Some(index) = times.queued.iter().position(|(s, _)| *s == seq) {
+                times.queued.remove(index);
+            }
+        }
+        self.freed.notify_waiters();
+    }
+
+    fn backlog(&self) -> EgressBacklog {
+        let times = self.lock_times();
+        EgressBacklog {
+            queued_bytes: self.queued_bytes.load(Ordering::Acquire),
+            queued_frames: times.queued.len(),
+            oldest_age: times.queued.front().map(|(_, at)| at.elapsed()),
+        }
+    }
+}
+
+/// One admitted frame's claim on its connection's egress byte budget,
+/// returned when the frame is dropped.
+#[derive(Debug)]
+pub(crate) struct EgressCharge {
+    accounting: Arc<EgressAccounting>,
+    bytes: usize,
+    seq: u64,
+    enqueued_at: Instant,
+}
+
+impl Drop for EgressCharge {
+    fn drop(&mut self) {
+        self.accounting.release(self.bytes, self.seq);
+    }
+}
+
+/// A queue slot reserved ahead of time (a pending `route.open` holds one until
+/// its module answers). Sending through it never waits and never fails for
+/// lack of room: the slot is already held, and its frame is charged to the
+/// byte count outside the budget check. At most
+/// `MAX_PENDING_ROUTE_OPENS_PER_CONNECTION` such frames exist per connection.
+#[derive(Debug)]
+pub(crate) struct EgressPermit {
+    permit: mpsc::OwnedPermit<OutboundFrame>,
+    accounting: Arc<EgressAccounting>,
+}
+
+impl EgressPermit {
+    /// Enqueue `frame` in the reserved slot. Returns true when the connection's
+    /// writer had already gone away, meaning the frame will never be written.
+    pub(crate) fn send(self, frame: Frame) -> bool {
+        let charge = self
+            .accounting
+            .charge_unconditionally(queued_frame_bytes(&frame));
+        let sender = self.permit.send(OutboundFrame::charged(frame, charge));
+        sender.is_closed()
     }
 }
 
@@ -114,25 +279,68 @@ pub(crate) mod test_log {
 /// Cheaply cloneable handle to one connection's bounded outbound frame queue.
 ///
 /// Backends emit responses, streaming frames, and future PUSH frames through this
-/// single path. The bounded `mpsc` sender is the connection-level backpressure
-/// substrate; the socket layer owns the sole receiver/writer.
+/// single path. The queue is bounded twice: by queued BYTES (the budget that
+/// matters for memory and for how long a slow reader may pause), and by the
+/// `mpsc` channel's frame count (a backstop). The socket layer owns the sole
+/// receiver/writer.
 #[derive(Debug, Clone)]
 pub struct FrameSink {
     tx: mpsc::Sender<OutboundFrame>,
+    accounting: Arc<EgressAccounting>,
 }
 
 impl FrameSink {
+    /// A sink with the standard per-connection byte budget
+    /// ([`crate::server::CONNECTION_EGRESS_BYTE_BUDGET`]); the frame-count bound
+    /// is whatever capacity `tx`'s channel was created with.
     pub fn new(tx: mpsc::Sender<OutboundFrame>) -> Self {
-        Self { tx }
+        Self::with_byte_budget(tx, crate::server::CONNECTION_EGRESS_BYTE_BUDGET)
+    }
+
+    pub(crate) fn with_byte_budget(tx: mpsc::Sender<OutboundFrame>, byte_budget: usize) -> Self {
+        Self {
+            tx,
+            accounting: Arc::new(EgressAccounting::new(byte_budget)),
+        }
+    }
+
+    /// Wait until the frame's bytes fit the budget, then charge them. Awaited
+    /// senders (control replies, error replies, shutdown notices) are never
+    /// refused by the byte budget: they wait for the writer to free bytes, just
+    /// as they wait for a free slot, which is the same backpressure they had
+    /// when the queue was bounded by frame count alone. Returns `None` if the
+    /// writer goes away while waiting.
+    async fn charge_waiting(&self, bytes: usize) -> Option<EgressCharge> {
+        loop {
+            let freed = self.accounting.freed.notified();
+            tokio::pin!(freed);
+            // Register interest before checking, so a release that happens
+            // between the check and the await still wakes this sender.
+            freed.as_mut().enable();
+            if let Some(charge) = self.accounting.try_charge(bytes) {
+                return Some(charge);
+            }
+            tokio::select! {
+                _ = &mut freed => {}
+                _ = self.tx.closed() => return None,
+            }
+        }
     }
 
     pub async fn send(&self, frame: Frame) -> Result<(), RouterError> {
         let channel = frame.header.channel;
         let epoch = frame.header.epoch;
         let corr = frame.header.corr;
-        self.tx.send(OutboundFrame::now(frame)).await.map_err(|_| {
-            RouterError::backend_with_epoch(channel, epoch, corr, "connection writer closed")
-        })
+        let closed =
+            || RouterError::backend_with_epoch(channel, epoch, corr, "connection writer closed");
+        let charge = self
+            .charge_waiting(queued_frame_bytes(&frame))
+            .await
+            .ok_or_else(closed)?;
+        self.tx
+            .send(OutboundFrame::charged(frame, charge))
+            .await
+            .map_err(|_| closed())
     }
 
     /// Shutdown notices must leave the socket writer before an idle daemon exits.
@@ -140,7 +348,11 @@ impl FrameSink {
     #[cfg(unix)]
     pub(crate) async fn send_flushed(&self, frame: Frame) -> Result<(), RouterError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let mut outbound = OutboundFrame::now(frame);
+        let charge = self
+            .charge_waiting(queued_frame_bytes(&frame))
+            .await
+            .ok_or_else(|| RouterError::backend(0, 0, "connection writer closed"))?;
+        let mut outbound = OutboundFrame::charged(frame, charge);
         outbound.flushed = Some(tx);
         self.tx
             .send(outbound)
@@ -150,42 +362,71 @@ impl FrameSink {
             .map_err(|_| RouterError::backend(0, 0, "connection flush failed"))
     }
 
-    pub(crate) async fn reserve_owned(
-        &self,
-    ) -> Result<mpsc::OwnedPermit<OutboundFrame>, RouterError> {
-        self.tx
+    pub(crate) async fn reserve_owned(&self) -> Result<EgressPermit, RouterError> {
+        let permit = self
+            .tx
             .clone()
             .reserve_owned()
             .await
-            .map_err(|_| RouterError::backend(0, 0, "connection writer closed"))
+            .map_err(|_| RouterError::backend(0, 0, "connection writer closed"))?;
+        Ok(EgressPermit {
+            permit,
+            accounting: Arc::clone(&self.accounting),
+        })
     }
 
     #[cfg(test)]
-    pub(crate) fn try_reserve_owned(
-        &self,
-    ) -> Result<mpsc::OwnedPermit<OutboundFrame>, RouterError> {
-        self.tx
+    pub(crate) fn try_reserve_owned(&self) -> Result<EgressPermit, RouterError> {
+        let permit = self
+            .tx
             .clone()
             .try_reserve_owned()
-            .map_err(|err| RouterError::backend(0, 0, err.to_string()))
+            .map_err(|err| RouterError::backend(0, 0, err.to_string()))?;
+        Ok(EgressPermit {
+            permit,
+            accounting: Arc::clone(&self.accounting),
+        })
     }
 
     pub(crate) fn is_closed(&self) -> bool {
         self.tx.is_closed()
     }
 
+    /// What the connection's egress queue holds right now.
+    pub(crate) fn backlog(&self) -> EgressBacklog {
+        self.accounting.backlog()
+    }
+
+    /// Enqueue without waiting. Fails when the frame's bytes would take the
+    /// queue past its byte budget, when the channel's frame-count backstop is
+    /// full, or when the writer is gone.
     pub(crate) fn try_send(&self, frame: Frame) -> Result<(), RouterError> {
         let channel = frame.header.channel;
         let epoch = frame.header.epoch;
         let corr = frame.header.corr;
-        self.tx.try_send(OutboundFrame::now(frame)).map_err(|err| {
+        let unavailable = |why: String| {
             RouterError::backend_with_epoch(
                 channel,
                 epoch,
                 corr,
-                format!("connection writer unavailable: {err}"),
+                format!("connection writer unavailable: {why}"),
             )
-        })
+        };
+        let bytes = queued_frame_bytes(&frame);
+        let Some(charge) = self.accounting.try_charge(bytes) else {
+            if self.tx.is_closed() {
+                return Err(unavailable("channel closed".to_string()));
+            }
+            return Err(unavailable(format!(
+                "egress byte budget exhausted ({} queued bytes, frame of {bytes} bytes, budget {})",
+                self.accounting.queued_bytes.load(Ordering::Acquire),
+                self.accounting.byte_budget
+            )));
+        };
+        // A refused frame is dropped inside the error, which returns its charge.
+        self.tx
+            .try_send(OutboundFrame::charged(frame, charge))
+            .map_err(|err| unavailable(err.to_string()))
     }
 }
 
@@ -479,6 +720,10 @@ impl Router {
                                                 target.channel
                                             ),
                                         ),
+                                        UndeliveredFrame {
+                                            module_id: Some(&route.module_id),
+                                            sink: &target.sink,
+                                        },
                                     )
                                     .map_err(RouterError::Forwarding)?
                             {
@@ -515,6 +760,10 @@ impl Router {
                                     route.client_channel
                                 ),
                             ),
+                            UndeliveredFrame {
+                                module_id: Some(&route.module_id),
+                                sink: &route.client_sink,
+                            },
                         )
                         .map_err(RouterError::Forwarding)?
                     {
@@ -1412,6 +1661,258 @@ mod tests {
         assert!(client_rx.try_recv().is_err());
         assert_eq!(router.counters.snapshot()["goodbye_relay_client_failed"], 1);
         assert_eq!(router.counters.snapshot()["route_released_epoch_fenced"], 1);
+    }
+
+    /// One module and one client connection with `routes` routes bound between
+    /// them. The client uses a real connection egress queue (the same byte
+    /// budget and frame-count backstop as a live connection), and its route.open
+    /// responses are drained so the queue starts empty.
+    async fn multi_route_client(
+        module_id: &str,
+        module_connection: ConnectionId,
+        client_connection: ConnectionId,
+        routes: usize,
+    ) -> (
+        Router,
+        FrameSink,
+        mpsc::Receiver<OutboundFrame>,
+        RouteCtx,
+        Vec<crate::forwarding::PendingRouteBindRelay>,
+        ConnectionCloseReceiver,
+    ) {
+        let forwarding = Arc::new(ForwardingTable::default());
+        let control = Arc::new(ControlHandler::with_forwarding(
+            Arc::new(crate::Registry::default()),
+            Arc::clone(&forwarding),
+        ));
+        let router = Router::with_control_handler(control);
+        let close_receiver = forwarding.register_connection_close(client_connection);
+        let (module_tx, _module_rx) = mpsc::channel(8);
+        forwarding
+            .register_module_connection(
+                module_connection,
+                module_id.to_string(),
+                1,
+                Concurrency::ModuleManaged,
+                FrameSink::new(module_tx),
+            )
+            .unwrap();
+        let (client_sink, mut client_rx) = crate::server::connection_egress();
+        let mut bound = Vec::with_capacity(routes);
+        for index in 0..routes {
+            let pending = forwarding
+                .begin_route_bind_relay_for_test(
+                    client_connection,
+                    client_sink.clone(),
+                    900 + index as u64,
+                    module_id,
+                )
+                .unwrap();
+            forwarding
+                .complete_pending_relay(
+                    module_connection,
+                    pending.corr,
+                    RouteBindRelayOutcome::Accepted,
+                )
+                .unwrap();
+            assert_eq!(
+                client_rx.recv().await.unwrap().header.corr,
+                900 + index as u64
+            );
+            bound.push(pending);
+        }
+        let (module_egress_tx, _module_egress_rx) = mpsc::channel(8);
+        let module_ctx = RouteCtx {
+            connection_id: module_connection,
+            egress: FrameSink::new(module_egress_tx),
+        };
+        (
+            router,
+            client_sink,
+            client_rx,
+            module_ctx,
+            bound,
+            close_receiver,
+        )
+    }
+
+    fn stream_frame(channel: u16, epoch: u32, corr: u64, body: Vec<u8>) -> Frame {
+        Frame::build(
+            FrameType::StreamData,
+            Flags::new(false, Priority::Interactive, false),
+            channel,
+            epoch,
+            corr,
+            body,
+        )
+        .unwrap()
+    }
+
+    /// A client multiplexing several token streams pauses its reader while the
+    /// module keeps producing small frames. Far more frames than the old
+    /// 64-frame queue allowed, but far fewer bytes than the budget, must all be
+    /// held without closing the connection and delivered in order afterwards.
+    #[tokio::test]
+    async fn paused_client_reader_keeps_connection_through_small_frame_burst() {
+        const ROUTES: usize = 4;
+        const FRAMES_PER_ROUTE: usize = 250;
+        let (router, client_sink, mut client_rx, module_ctx, routes, mut close_receiver) =
+            multi_route_client(
+                "burst-provider",
+                ConnectionId::new(60),
+                ConnectionId::new(61),
+                ROUTES,
+            )
+            .await;
+
+        // The reader is paused: nothing is received until every frame is sent.
+        for seq in 0..FRAMES_PER_ROUTE as u64 {
+            for (index, route) in routes.iter().enumerate() {
+                let body = format!("route-{index}-token-{seq:05}-{}", "t".repeat(170));
+                router
+                    .route_for_connection(
+                        &module_ctx,
+                        stream_frame(
+                            route.module_channel,
+                            route.module_epoch,
+                            seq,
+                            body.into_bytes(),
+                        ),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let backlog = client_sink.backlog();
+        assert_eq!(backlog.queued_frames, ROUTES * FRAMES_PER_ROUTE);
+        assert!(backlog.queued_bytes < crate::server::CONNECTION_EGRESS_BYTE_BUDGET);
+        assert!(
+            close_receiver.try_recv().is_err(),
+            "a paused reader under the byte budget must not be closed"
+        );
+        assert_eq!(
+            router.counters.snapshot()["client_egress_close_delivery_failed"],
+            0
+        );
+
+        // The reader resumes: every frame arrives, in order within each route.
+        let mut next_seq = vec![0u64; ROUTES];
+        for _ in 0..ROUTES * FRAMES_PER_ROUTE {
+            let frame = client_rx.try_recv().expect("every queued frame arrives");
+            let index = routes
+                .iter()
+                .position(|route| route.client_channel == frame.header.channel)
+                .expect("frame arrives on one of the bound client channels");
+            assert_eq!(frame.header.corr, next_seq[index], "route {index} order");
+            let expected_prefix = format!("route-{index}-token-{:05}-", next_seq[index]);
+            assert!(frame.body.starts_with(expected_prefix.as_bytes()));
+            next_seq[index] += 1;
+        }
+        assert!(client_rx.try_recv().is_err());
+        assert_eq!(next_seq, vec![FRAMES_PER_ROUTE as u64; ROUTES]);
+        assert_eq!(client_sink.backlog().queued_bytes, 0);
+    }
+
+    /// A client that never reads is closed once the module's frames exceed
+    /// the byte budget, and that close is reported once at WARN with what an
+    /// operator needs to find the stuck reader.
+    #[tokio::test]
+    async fn never_reading_client_is_closed_at_byte_budget_with_warn_diagnosis() {
+        let (logs, _guard) = test_log::log_capture(tracing::Level::WARN);
+        const BODY: usize = 16 * 1024;
+        let (router, client_sink, _client_rx, module_ctx, routes, mut close_receiver) =
+            multi_route_client(
+                "stuck-reader-provider",
+                ConnectionId::new(70),
+                ConnectionId::new(71),
+                2,
+            )
+            .await;
+
+        let mut admitted = 0usize;
+        let mut sent = 0u64;
+        while router.counters.snapshot()["client_egress_close_delivery_failed"] == 0 {
+            assert!(sent < 1_000, "the byte budget never refused a frame");
+            // Other tests running in parallel hit the same WARN call site with
+            // no subscriber installed; if one of them registers that call site
+            // while this test's capture subscriber is being installed, tracing
+            // can cache the call site as disabled. Recomputing the cache just
+            // before each frame that may trigger the WARN keeps the capture
+            // from silently missing it.
+            tracing::callsite::rebuild_interest_cache();
+            let route = &routes[(sent % 2) as usize];
+            router
+                .route_for_connection(
+                    &module_ctx,
+                    stream_frame(
+                        route.module_channel,
+                        route.module_epoch,
+                        sent,
+                        vec![b'z'; BODY],
+                    ),
+                )
+                .await
+                .unwrap();
+            sent += 1;
+            admitted = client_sink.backlog().queued_frames;
+        }
+        // The budget, not the frame-count backstop, did the refusing.
+        let frame_bytes = subc_protocol::HEADER_LEN + BODY;
+        assert_eq!(
+            admitted,
+            crate::server::CONNECTION_EGRESS_BYTE_BUDGET / frame_bytes
+        );
+        let reason = close_receiver
+            .try_recv()
+            .expect("the client connection must be asked to close");
+        assert!(reason
+            .to_string()
+            .contains("module_to_client_delivery_failed"));
+
+        // A second refused frame for the same connection adds no second WARN.
+        router
+            .route_for_connection(
+                &module_ctx,
+                stream_frame(
+                    routes[0].module_channel,
+                    routes[0].module_epoch,
+                    sent,
+                    vec![b'z'; BODY],
+                ),
+            )
+            .await
+            .unwrap();
+
+        let captured = test_log::captured_logs(&logs);
+        let warn_lines = captured
+            .lines()
+            .filter(|line| {
+                line.contains("closing client connection: its egress queue could not take a frame")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(warn_lines.len(), 1, "exactly one WARN, got: {captured}");
+        let line = warn_lines[0];
+        assert!(line.contains("WARN"), "{line}");
+        assert!(line.contains("connection_id=71"), "{line}");
+        assert!(
+            line.contains("module_id=\"stuck-reader-provider\""),
+            "{line}"
+        );
+        assert!(line.contains("client_channel="), "{line}");
+        assert!(line.contains("principals=direct"), "{line}");
+        let queued_bytes: usize = line
+            .split("queued_bytes=")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|value| value.parse().ok())
+            .expect("queued_bytes is logged");
+        assert_eq!(queued_bytes, admitted * frame_bytes);
+        assert!(
+            line.contains(&format!("queued_frames={admitted}")),
+            "{line}"
+        );
+        assert!(line.contains("oldest_queued_ms="), "{line}");
     }
 
     fn route_frame(ty: FrameType, channel: u16, epoch: u32, corr: u64) -> Frame {
