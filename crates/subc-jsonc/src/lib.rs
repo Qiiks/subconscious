@@ -121,6 +121,54 @@ pub struct JsoncObjectSpan {
     pub has_trailing_comma: bool,
 }
 
+/// Finds the byte range to remove an object member at a path of JSON keys.
+/// The range includes one separator comma, leaving other member bytes intact.
+/// A final member with a trailing comma includes both its leading and trailing
+/// commas when another member precedes it.
+pub fn jsonc_member_span(
+    doc: &str,
+    path: &[&str],
+) -> Result<Option<std::ops::Range<usize>>, String> {
+    let Some((key, parents)) = path.split_last() else {
+        return Ok(None);
+    };
+    let tokens = tokenize(doc)?;
+    let mut parser = Parser::new(&tokens);
+    let root = parser.parse_value()?;
+    if parser.next().is_some() {
+        return Err("unexpected content after the root JSON value".to_string());
+    }
+    let Some(mut object) = root.object else {
+        return Ok(None);
+    };
+    for segment in parents {
+        let Some(member) = object.members.iter().find(|member| member.key == *segment) else {
+            return Ok(None);
+        };
+        let Some(child) = &member.object else {
+            return Ok(None);
+        };
+        object = child.clone();
+    }
+    let Some((index, member)) = object
+        .members
+        .iter()
+        .enumerate()
+        .find(|(_, member)| member.key == *key)
+    else {
+        return Ok(None);
+    };
+    let last = index + 1 == object.members.len();
+    Ok(Some(
+        match (member.comma_before, member.comma_after, last) {
+            (Some(start), Some(end), true) => start..end,
+            (Some(start), None, _) => start..member.value_end,
+            (_, Some(end), _) => member.key_start..end,
+            (None, None, _) => member.key_start..member.value_end,
+        },
+    ))
+}
+
 /// Finds an object's closing brace by key path while treating comments and
 /// strings as lexical content rather than syntax. This is useful for editors
 /// that must preserve the original JSONC bytes around an added member.
@@ -283,7 +331,10 @@ struct ParsedObject {
 #[derive(Clone, Debug)]
 struct ParsedMember {
     key: String,
+    key_start: usize,
     value_end: usize,
+    comma_before: Option<usize>,
+    comma_after: Option<usize>,
     object: Option<ParsedObject>,
 }
 
@@ -325,6 +376,7 @@ impl<'a> Parser<'a> {
     fn parse_object(&mut self) -> Result<ParsedValue, String> {
         let mut members = Vec::new();
         let mut has_trailing_comma = false;
+        let mut previous_comma = None;
         if matches!(
             self.peek().map(|token| &token.kind),
             Some(TokenKind::RightBrace)
@@ -340,11 +392,12 @@ impl<'a> Parser<'a> {
             });
         }
         loop {
-            let key = match self.next() {
+            let (key, key_start) = match self.next() {
                 Some(Token {
                     kind: TokenKind::String(key),
+                    start,
                     ..
-                }) => key.clone(),
+                }) => (key.clone(), *start),
                 Some(token) => {
                     return Err(format!("expected an object key at byte {}", token.start))
                 }
@@ -359,7 +412,10 @@ impl<'a> Parser<'a> {
             let value = self.parse_value()?;
             members.push(ParsedMember {
                 key,
+                key_start,
                 value_end: value.end,
+                comma_before: previous_comma,
+                comma_after: None,
                 object: value.object,
             });
             match self.next() {
@@ -379,8 +435,14 @@ impl<'a> Parser<'a> {
                 }
                 Some(Token {
                     kind: TokenKind::Comma,
-                    ..
+                    start,
+                    end,
                 }) => {
+                    members
+                        .last_mut()
+                        .expect("member was just appended")
+                        .comma_after = Some(*end);
+                    previous_comma = Some(*start);
                     if matches!(
                         self.peek().map(|token| &token.kind),
                         Some(TokenKind::RightBrace)
@@ -466,6 +528,66 @@ impl<'a> Parser<'a> {
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+
+    fn remove_member(doc: &str, path: &[&str]) -> String {
+        let span = jsonc_member_span(doc, path)
+            .unwrap()
+            .expect("member exists");
+        let mut updated = doc.to_string();
+        updated.replace_range(span, "");
+        jsonc_to_json(&updated)
+            .and_then(|json| {
+                serde_json::from_str::<Value>(&json).map_err(|error| error.to_string())
+            })
+            .expect("removal keeps document valid");
+        updated
+    }
+
+    #[test]
+    fn member_span_removes_first_middle_and_last_with_the_correct_comma() {
+        let doc = r#"{"first": 1, "middle": 2, "last": 3}"#;
+        assert_eq!(
+            remove_member(doc, &["first"]),
+            r#"{ "middle": 2, "last": 3}"#
+        );
+        assert_eq!(
+            remove_member(doc, &["middle"]),
+            r#"{"first": 1,  "last": 3}"#
+        );
+        assert_eq!(
+            remove_member(doc, &["last"]),
+            r#"{"first": 1, "middle": 2}"#
+        );
+    }
+
+    #[test]
+    fn member_span_handles_trailing_comment_and_nested_object() {
+        let doc = "{\n  // retain root note\n  \"modules\": {\n    \"aft\": {\"program\": \"old\"} // belongs to aft\n    , \"mc\": {\"program\": \"keep\"}\n  }\n}";
+        let updated = remove_member(doc, &["modules", "aft"]);
+        assert!(updated.contains("// retain root note"));
+        assert!(!updated.contains("// belongs to aft"));
+        let parsed: Value = serde_json::from_str(&jsonc_to_json(&updated).unwrap()).unwrap();
+        assert!(parsed.pointer("/modules/aft").is_none());
+        assert_eq!(parsed.pointer("/modules/mc/program"), Some(&json!("keep")));
+        assert!(jsonc_member_span(doc, &["modules", "missing"])
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn member_span_ignores_punctuation_and_comments_inside_string_values() {
+        let doc = r#"{"first": "// /* , } \"escaped\"", "second": 2}"#;
+        let updated = remove_member(doc, &["first"]);
+        assert_eq!(updated, r#"{ "second": 2}"#);
+        let updated = remove_member(doc, &["second"]);
+        assert!(updated.contains(r#"// /* , }"#));
+    }
+
+    #[test]
+    fn member_span_removes_final_trailing_comma_without_leaving_two_separators() {
+        assert_eq!(remove_member(r#"{"a": 1, "b": 2,}"#, &["b"]), r#"{"a": 1}"#);
+        assert_eq!(remove_member(r#"{"only": 1,}"#, &["only"]), "{}");
+    }
 
     #[test]
     fn object_span_skips_comments_and_string_literals() {

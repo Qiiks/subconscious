@@ -5,7 +5,7 @@ use std::{
 };
 
 use serde_json::{Map, Value};
-use subc_jsonc::{jsonc_object_span, jsonc_to_json};
+use subc_jsonc::{jsonc_member_span, jsonc_object_span, jsonc_to_json};
 
 use super::model::Component;
 
@@ -357,7 +357,10 @@ pub fn rollback_change(change: &ConfigChange) -> Result<bool, String> {
         )
         .map_err(|error| format!("could not parse {}: {error}", change.path.display()))?;
         if existing_value(&parsed, &key) == Some(&desired) {
-            removed |= remove_textual_value(&mut updated, &key)?;
+            if let Some(span) = jsonc_member_span(&updated, &key.split('.').collect::<Vec<_>>())? {
+                updated.replace_range(span, "");
+                removed = true;
+            }
         }
     }
     if removed {
@@ -386,7 +389,11 @@ pub fn rollback_change(change: &ConfigChange) -> Result<bool, String> {
                 .and_then(Value::as_object)
                 .is_some_and(Map::is_empty)
             {
-                remove_textual_value(&mut updated, &path)?;
+                if let Some(span) =
+                    jsonc_member_span(&updated, &path.split('.').collect::<Vec<_>>())?
+                {
+                    updated.replace_range(span, "");
+                }
             }
         }
     }
@@ -702,142 +709,6 @@ fn insert_value(document: &mut Value, dotted_key: &str, desired: Value) -> Resul
         current = value.as_object_mut().ok_or_else(|| key.to_string())?;
     }
     unreachable!("a desired configuration key always has a segment")
-}
-
-// Token offsets come from the original JSONC, not the normalized JSON value.
-// Skipping comments here lets rollback remove a member without rebuilding the file.
-fn member_tokens(document: &str) -> Result<Vec<(String, usize, usize)>, String> {
-    let bytes = document.as_bytes();
-    let mut tokens = Vec::new();
-    let mut at = 0;
-    while at < bytes.len() {
-        if bytes[at].is_ascii_whitespace() {
-            at += 1;
-            continue;
-        }
-        if bytes[at..].starts_with(b"//") {
-            at += 2;
-            while at < bytes.len() && bytes[at] != b'\n' {
-                at += 1;
-            }
-            continue;
-        }
-        if bytes[at..].starts_with(b"/*") {
-            at += 2;
-            while at + 1 < bytes.len() && !bytes[at..].starts_with(b"*/") {
-                at += 1;
-            }
-            if at + 1 >= bytes.len() {
-                return Err("unterminated comment".to_string());
-            }
-            at += 2;
-            continue;
-        }
-        let start = at;
-        if bytes[at] == b'"' {
-            at += 1;
-            while at < bytes.len() {
-                if bytes[at] == b'\\' {
-                    at += 2;
-                } else if bytes[at] == b'"' {
-                    at += 1;
-                    break;
-                } else {
-                    at += 1;
-                }
-            }
-            if at > bytes.len() || bytes[at - 1] != b'"' {
-                return Err("unterminated string".to_string());
-            }
-            tokens.push((
-                serde_json::from_str::<String>(&document[start..at])
-                    .map_err(|error| error.to_string())?,
-                start,
-                at,
-            ));
-        } else if b"{}[],:".contains(&bytes[at]) {
-            at += 1;
-            tokens.push((document[start..at].to_string(), start, at));
-        } else {
-            while at < bytes.len()
-                && !bytes[at].is_ascii_whitespace()
-                && !b"{}[],:/".contains(&bytes[at])
-            {
-                at += 1;
-            }
-            if at == start {
-                return Err("invalid JSONC token".to_string());
-            }
-            tokens.push((document[start..at].to_string(), start, at));
-        }
-    }
-    Ok(tokens)
-}
-
-fn remove_textual_value(document: &mut String, dotted_key: &str) -> Result<bool, String> {
-    let tokens = member_tokens(document)?;
-    let mut open = 0;
-    let segments = dotted_key.split('.').collect::<Vec<_>>();
-    for (depth_index, segment) in segments.iter().enumerate() {
-        if tokens.get(open).map(|token| token.0.as_str()) != Some("{") {
-            return Ok(false);
-        }
-        let mut depth = 0_i32;
-        let mut found = None;
-        let mut index = open + 1;
-        while index < tokens.len() {
-            match tokens[index].0.as_str() {
-                "{" | "[" => depth += 1,
-                "}" | "]" if depth == 0 => break,
-                "}" | "]" => depth -= 1,
-                _ => {}
-            }
-            if depth == 0
-                && tokens.get(index + 1).map(|token| token.0.as_str()) == Some(":")
-                && tokens[index].0 == *segment
-            {
-                found = Some(index);
-                break;
-            }
-            index += 1;
-        }
-        let Some(key) = found else {
-            return Ok(false);
-        };
-        let value = key + 2;
-        if depth_index + 1 != segments.len() {
-            open = value;
-            continue;
-        }
-        let mut end = value;
-        let mut nested = 0_i32;
-        while end < tokens.len() {
-            match tokens[end].0.as_str() {
-                "{" | "[" => nested += 1,
-                "}" | "]" if nested == 0 => break,
-                "}" | "]" => nested -= 1,
-                "," if nested == 0 => break,
-                _ => {}
-            }
-            end += 1;
-        }
-        let start = tokens[key].1;
-        let stop = if tokens.get(end).map(|token| token.0.as_str()) == Some(",") {
-            tokens[end].2
-        } else {
-            tokens[end - 1].2
-        };
-        let previous_comma = (open + 1..key).rev().find(|&i| tokens[i].0 == ",");
-        if tokens.get(end).map(|token| token.0.as_str()) == Some(",") {
-            document.replace_range(start..stop, "");
-        } else if let Some(comma) = previous_comma {
-            document.replace_range(tokens[comma].1..stop, "");
-        } else {
-            document.replace_range(start..stop, "");
-        }
-        return Ok(true);
-    }
-    Ok(false)
 }
 
 #[cfg(test)]
