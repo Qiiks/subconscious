@@ -1652,7 +1652,7 @@ async fn run_shim(args: ShimArgs) -> Result<()> {
 async fn run_module(args: ModuleArgs) -> Result<()> {
     let subc_stream = connect_authenticated(&args.subc_connection_file).await?;
     let subc = SubcClient::start(subc_stream);
-    let _supervision_task =
+    let mut supervision_task =
         start_supervision_connection_if_configured(&args.subc_connection_file, subc.relay())
             .await?;
 
@@ -1672,17 +1672,40 @@ async fn run_module(args: ModuleArgs) -> Result<()> {
     publish_module_connection_file(&connection_file_path, key.clone(), daemon_id, port)?;
 
     loop {
-        let (stream, _peer) = listener
-            .accept()
-            .await
-            .map_err(|source| other_error(format!("failed to accept shim connection: {source}")))?;
-        let subc = subc.clone();
-        let key = key.clone();
-        tokio::spawn(async move {
-            if let Err(error) = handle_shim_connection(stream, subc, key, daemon_id).await {
-                tracing::error!(target: "shim", "shim connection failed: {error}");
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _peer) = accepted.map_err(|source| {
+                    other_error(format!("failed to accept shim connection: {source}"))
+                })?;
+                let subc = subc.clone();
+                let key = key.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = handle_shim_connection(stream, subc, key, daemon_id).await {
+                        tracing::error!(target: "shim", "shim connection failed: {error}");
+                    }
+                });
             }
-        });
+            // The supervision connection is how the daemon stops this module:
+            // it ends that connection (GOODBYE or EOF) and then waits for the
+            // process to exit, killing it after its child-exit budget. The accept
+            // loop alone never ends, so without this arm every stop or restart
+            // ran to that budget and ended in SIGKILL. An unsupervised run has no
+            // supervision connection and keeps serving until killed.
+            _ = supervision_ended(&mut supervision_task) => {
+                tracing::info!("supervision connection ended; exiting");
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Resolves when the supervision task finishes, or never when there is none.
+async fn supervision_ended(task: &mut Option<JoinHandle<()>>) {
+    match task.as_mut() {
+        Some(task) => {
+            let _ = task.await;
+        }
+        None => std::future::pending::<()>().await,
     }
 }
 

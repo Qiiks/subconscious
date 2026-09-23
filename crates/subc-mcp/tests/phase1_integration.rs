@@ -3405,6 +3405,64 @@ async fn mcp_catalog_reconciliation_failure_preserves_previous_snapshot_and_clea
     harness.shutdown().await;
 }
 
+/// Stopping the module must let it exit on its own. The daemon ends the
+/// supervision connection and then waits for the process, killing it only when
+/// the child-exit budget runs out; a module that never notices exits by SIGKILL
+/// after the whole budget on every stop, restart and daemon shutdown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervised_mcp_module_exits_on_its_own_when_stopped() {
+    let server = TestServer::start().await;
+    let xdg_config_home = server.daemon.temp_dir.join("exit-mcp-xdg-config");
+    fs::create_dir_all(&xdg_config_home).unwrap();
+    let module_connection_file = server.daemon.temp_dir.join("exit-mcp-module.json");
+    let mcp = supervisor(&server)
+        .spawn(mcp_module_spec(
+            "mcp",
+            &module_connection_file,
+            &xdg_config_home,
+        ))
+        .unwrap();
+    wait_for_supervisor_entry(
+        &server.daemon.connection_file_path,
+        "mcp",
+        |entry| entry.state == "running" && entry.enabled && entry.live,
+        SETUP_TIMEOUT,
+    )
+    .await;
+
+    // Stop through the daemon, as `ck module stop` does: that path drains, ends
+    // the supervision connection and waits for the child. The in-process
+    // `stop()` kills at once, so it cannot tell the two outcomes apart.
+    let mut client =
+        wait_for_control_client(&server.daemon.connection_file_path, SETUP_TIMEOUT).await;
+    let started = std::time::Instant::now();
+    let response = control_rpc_on_stream(
+        &mut client,
+        2_101,
+        ClientControlRequest::SupervisorSetEnabled {
+            module_id: "mcp".to_string(),
+            enabled: false,
+        },
+    )
+    .await;
+    assert!(
+        matches!(response, ClientControlResponse::SupervisorAck { .. }),
+        "unexpected supervisor.set_enabled response: {response:?}"
+    );
+    let elapsed = started.elapsed();
+
+    let exit = mcp.status().unwrap().last_exit;
+    let signal = exit.as_ref().and_then(|exit| exit.signal);
+    assert_eq!(
+        signal, None,
+        "the module was killed by signal {signal:?} after {elapsed:?} instead of exiting: {exit:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "stop took {elapsed:?}; a module that exits on its own stops in well under a second"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supervised_mcp_module_reports_live_non_routable_and_preserves_provider_route() {
     let server = TestServer::start().await;
