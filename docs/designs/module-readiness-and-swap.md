@@ -285,6 +285,16 @@ and swap is refused outright when the incumbent is not registered.
 
 ### Who can use rung 3
 
+**The test for declaring `overlap: safe`:** a second instance of the module can
+run for a few seconds without touching any single-writer store, meaning every
+database, WAL, index, projector and scheduled job it owns. A lease on part of
+that state does not qualify it. broca holds a session lease on WAL appends,
+yet its run index, store projector and archive fold timer (which unlinks live
+WAL files) are single-writer, so broca is exclusive. aft is exclusive because
+two processes would contend for its per-root writer lease, and the loser would
+warm in read-only mode, which it never serves in. The swap refusal fires only
+after this has been decided, so the declaration is the check that matters.
+
 **Two processes on one module's state is a data hazard, not a scheduling
 one.** Broca seals a WAL on stop; engram holds captures; cerebellum holds
 browser sessions; aft holds a resident index behind a writer barrier. Most

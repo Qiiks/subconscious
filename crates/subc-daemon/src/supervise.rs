@@ -242,6 +242,15 @@ pub enum ModuleOverlap {
     Exclusive,
     /// The module has said a second process of itself is harmless for the
     /// length of a swap.
+    ///
+    /// Declare it only if a second instance can run for a few seconds without
+    /// touching ANY single-writer store: every database, WAL, index, projector
+    /// and scheduled job the module owns. A lease on part of that state is not
+    /// enough. broca's session lease guards WAL appends while its run index, its
+    /// store projector and its archive fold timer (which unlinks live WAL files)
+    /// stay single-writer, so broca is exclusive despite holding a lease. The
+    /// refusal only fires after this has been decided, so the decision is the
+    /// check.
     Safe,
 }
 
