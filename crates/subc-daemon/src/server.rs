@@ -112,12 +112,47 @@ pub async fn serve_listener(
     router: Arc<Router>,
     auth: ServerAuth,
 ) -> Result<(), ServerError> {
-    let local_addr = listener.local_addr().ok();
+    serve_listener_with_accept(listener.local_addr().ok(), router, auth, || {
+        listener.accept()
+    })
+    .await
+}
+
+async fn serve_listener_with_accept<A, F>(
+    local_addr: Option<SocketAddr>,
+    router: Arc<Router>,
+    auth: ServerAuth,
+    mut accept: A,
+) -> Result<(), ServerError>
+where
+    A: FnMut() -> F,
+    F: std::future::Future<Output = io::Result<(tokio::net::TcpStream, SocketAddr)>>,
+{
     loop {
-        let (stream, peer_addr) = listener
-            .accept()
-            .await
-            .map_err(|source| ServerError::Accept { local_addr, source })?;
+        let (stream, peer_addr) = match accept().await {
+            Ok(accepted) => accepted,
+            Err(source) => {
+                let kind = source.kind();
+                // Aborted/reset connections and interrupted syscalls affect one accept only.
+                // File-descriptor or socket-buffer exhaustion needs a short backoff to avoid spinning;
+                // other errors may mean the listener itself is unusable.
+                let exhausted = accept_resource_exhausted(&source);
+                if matches!(
+                    kind,
+                    io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::Interrupted
+                ) || exhausted
+                {
+                    warn!(?local_addr, error = %source, "temporary TCP accept failure");
+                    if exhausted {
+                        tokio::time::sleep(Duration::from_millis(75)).await;
+                    }
+                    continue;
+                }
+                return Err(ServerError::Accept { local_addr, source });
+            }
+        };
         // Every route frame is a discrete message whose reply the peer is waiting
         // for, so there is never a later write for Nagle to coalesce with -- it can
         // only hold a frame back until an ACK arrives.
@@ -148,6 +183,23 @@ pub async fn serve_listener(
                 }
             }
         });
+    }
+}
+
+fn accept_resource_exhausted(error: &io::Error) -> bool {
+    // Unix ENFILE/EMFILE and macOS/Linux ENOBUFS; Winsock WSAEMFILE/WSAENOBUFS.
+    #[cfg(unix)]
+    {
+        matches!(error.raw_os_error(), Some(23 | 24 | 55 | 105))
+    }
+    #[cfg(windows)]
+    {
+        matches!(error.raw_os_error(), Some(10024 | 10055))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = error;
+        false
     }
 }
 
@@ -285,9 +337,9 @@ where
     );
 
     let (read_half, write_half) = tokio::io::split(stream);
-    // Authentication is complete before this buffer can read ahead. The only cancellation
-    // of an in-progress frame read terminates the connection, so buffered bytes are never
-    // stranded before a later read.
+    // Authentication is complete before this buffer can read ahead. The connection loop
+    // retains a partial frame read across completed route.open tasks; dropping the read
+    // happens only when a frame finishes or the connection ends.
     let mut read_half = BufReader::new(read_half);
     let (tx, rx) = mpsc::channel::<crate::router::OutboundFrame>(CONNECTION_EGRESS_BUFFER);
     let mut writer = tokio::spawn(drain_writer(write_half, rx));
@@ -427,20 +479,24 @@ where
             finish_route_open_task(result)?;
         }
 
-        let frame = tokio::select! {
-            close = &mut close_receiver => {
-                return Ok(ConnectionLoopExit::CloseRequested(close_reason(close)));
-            }
-            result = route_open_tasks.join_next(), if !route_open_tasks.is_empty() => {
-                finish_route_open_task(
-                    result.expect("a non-empty route.open JoinSet has a next task")
-                )?;
-                continue;
-            }
-            read = read_frame(read_half) => {
-                match read.map_err(ConnectionError::FrameIo)? {
-                    Some(frame) => frame,
-                    None => return Ok(ConnectionLoopExit::PeerClosed),
+        // Keep the same read future when a route.open completes: read_frame owns
+        // partial header/body buffers that would be lost if that future were dropped.
+        let mut read = Box::pin(read_frame(&mut *read_half));
+        let frame = loop {
+            tokio::select! {
+                close = &mut close_receiver => {
+                    return Ok(ConnectionLoopExit::CloseRequested(close_reason(close)));
+                }
+                result = route_open_tasks.join_next(), if !route_open_tasks.is_empty() => {
+                    finish_route_open_task(
+                        result.expect("a non-empty route.open JoinSet has a next task")
+                    )?;
+                }
+                result = &mut read => {
+                    break match result.map_err(ConnectionError::FrameIo)? {
+                        Some(frame) => frame,
+                        None => return Ok(ConnectionLoopExit::PeerClosed),
+                    };
                 }
             }
         };
@@ -1222,6 +1278,231 @@ mod tests {
 
         drop(authed_client);
         authed_server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn bind_ack_during_partial_frame_preserves_next_request() {
+        use subc_control::ClientControlRequest;
+        use subc_protocol::{
+            manifest::{
+                Concurrency, ExecutionMode, IdentityScope, ModuleManifest, ProviderRole, Tool,
+            },
+            session::{ModuleControlRequest, ModuleControlResponse},
+            BindIdentity, ModuleHelloBody, RouteTarget,
+        };
+
+        let mut configured_router = Router::with_default_self_handler();
+        configured_router.register_backend(7, EchoBackend).unwrap();
+        let router = Arc::new(configured_router);
+        let (auth, conn) = test_auth();
+        let (mut module, module_stream) = duplex(4096);
+        let module_server = tokio::spawn(handle_connection(
+            module_stream,
+            Arc::clone(&router),
+            auth.clone(),
+        ));
+        authenticate(&mut module, &conn).await;
+        let manifest = ModuleManifest::builder("frame-test", "0.1.0")
+            .protocol_ver(PROTOCOL_VERSION)
+            .provides(vec![ProviderRole::ToolProvider {
+                tools: vec![Tool {
+                    name: "read".into(),
+                    description: None,
+                    execution_mode: ExecutionMode::Pure,
+                    schema: serde_json::json!({"type": "object"}),
+                }],
+                identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
+                concurrency: Concurrency::ModuleManaged,
+                emits_push: true,
+                sub_supervises: true,
+            }])
+            .build();
+        let hello = Frame::build(
+            FrameType::Hello,
+            Flags::new(false, Priority::Passive, false),
+            0,
+            0,
+            1,
+            serde_json::to_vec(&ModuleHelloBody {
+                manifest,
+                protocol_ver: PROTOCOL_VERSION,
+                control_ops: None,
+                launch_nonce: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        crate::write_frame(&mut module, &hello).await.unwrap();
+        assert_eq!(
+            read_frame(&mut module).await.unwrap().unwrap().header.ty,
+            FrameType::HelloAck
+        );
+
+        let (mut client, client_stream) = duplex(4096);
+        let client_server = tokio::spawn(handle_connection(client_stream, router, auth));
+        authenticate(&mut client, &conn).await;
+        let open = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Passive, false),
+            0,
+            0,
+            2,
+            serde_json::to_vec(&ClientControlRequest::RouteOpen {
+                target: RouteTarget::ToolProvider {
+                    module_id: "frame-test".into(),
+                },
+                identity: BindIdentity::new(std::env::current_dir().unwrap(), "unit", "session"),
+                consumer_identity: None,
+                consumer_capabilities: None,
+                admission_facts: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        crate::write_frame(&mut client, &open).await.unwrap();
+        let bind = timeout(TEST_DEADLINE, read_frame(&mut module))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<ModuleControlRequest>(&bind.body).unwrap(),
+            ModuleControlRequest::RouteBind { .. }
+        ));
+
+        let ping = request(7, 3, b"partial-frame-body");
+        client.write_all(&ping.header.encode()).await.unwrap();
+        // Give the connection reader time to consume the header while the bind is pending.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let ack = Frame::build(
+            FrameType::Response,
+            Flags::new(false, Priority::Passive, false),
+            0,
+            0,
+            bind.header.corr,
+            serde_json::to_vec(&ModuleControlResponse::RouteBindAck {}).unwrap(),
+        )
+        .unwrap();
+        crate::write_frame(&mut module, &ack).await.unwrap();
+        let opened = timeout(TEST_DEADLINE, read_frame(&mut client))
+            .await
+            .unwrap()
+            .unwrap();
+        if opened.is_none() {
+            panic!("client closed: {:?}", client_server.await);
+        }
+        let opened = opened.unwrap();
+        assert_eq!(opened.header.corr, 2);
+        client.write_all(&ping.body).await.unwrap();
+        let pong = timeout(TEST_DEADLINE, read_frame(&mut client))
+            .await
+            .expect("partial frame must reach the router after the bind ack")
+            .expect("frame must decode")
+            .expect("connection must remain open");
+        assert_eq!(pong.header.ty, FrameType::Response);
+        assert_eq!(pong.header.corr, 3);
+        assert_eq!(pong.body, ping.body);
+        drop(client);
+        drop(module);
+        client_server.await.unwrap().unwrap();
+        let _ = module_server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn aborted_accept_does_not_end_listener() {
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+        let addr = listener.local_addr().unwrap();
+        let (auth, conn) = test_auth();
+        let mut attempts = 0;
+        let server = tokio::spawn(serve_listener_with_accept(
+            Some(addr),
+            echo_router(),
+            auth,
+            move || {
+                attempts += 1;
+                let result = if attempts == 1 {
+                    Some(io::Error::from(io::ErrorKind::ConnectionAborted))
+                } else {
+                    None
+                };
+                let listener = Arc::clone(&listener);
+                async move {
+                    match result {
+                        Some(err) => Err(err),
+                        None => listener.accept().await,
+                    }
+                }
+            },
+        ));
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        authenticate(&mut client, &conn).await;
+        let ping = Frame::build(
+            FrameType::Ping,
+            Flags::new(false, Priority::Passive, false),
+            0,
+            0,
+            77,
+            Vec::new(),
+        )
+        .unwrap();
+        crate::write_frame(&mut client, &ping).await.unwrap();
+        let pong = timeout(TEST_DEADLINE, read_frame(&mut client))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(pong.header.ty, FrameType::Pong);
+        assert!(
+            !server.is_finished(),
+            "a temporary accept failure must not stop the listener"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn exhausted_accept_backs_off_then_serves_connection() {
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+        let addr = listener.local_addr().unwrap();
+        let (auth, conn) = test_auth();
+        let mut attempts = 0;
+        let server = tokio::spawn(serve_listener_with_accept(
+            Some(addr),
+            echo_router(),
+            auth,
+            move || {
+                attempts += 1;
+                let error = (attempts == 1).then(|| io::Error::from_raw_os_error(24));
+                let listener = Arc::clone(&listener);
+                async move {
+                    match error {
+                        Some(err) => Err(err),
+                        None => listener.accept().await,
+                    }
+                }
+            },
+        ));
+        let started = Instant::now();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        authenticate(&mut client, &conn).await;
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "fd exhaustion must back off before retrying"
+        );
+        assert!(!server.is_finished());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn fatal_accept_error_still_stops_listener() {
+        let (auth, _) = test_auth();
+        let err = serve_listener_with_accept(None, echo_router(), auth, || async {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, ServerError::Accept { source, .. } if source.kind() == io::ErrorKind::PermissionDenied)
+        );
     }
 
     #[tokio::test]
