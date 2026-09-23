@@ -2769,7 +2769,9 @@ async fn policy_resolver_releases_expired_subjects_entries_routes_and_tasks() {
     let replies = (0..SUBJECTS + 2).map(|_| PolicyScript::Reply {
         verdict: "allow",
         revision: 1,
-        ttl_ms: 50,
+        // Long enough that no entry expires while the subjects are still being
+        // resolved one round trip at a time on a loaded runner.
+        ttl_ms: 3_000,
     });
     let harness = start_policy_harness(replies).await;
     let consumer = SubcConsumer::connect(&harness.daemon.connection_file, fast_consumer_options())
@@ -2804,7 +2806,7 @@ async fn policy_resolver_releases_expired_subjects_entries_routes_and_tasks() {
     );
 
     // Every entry so far expires; the next resolve (a new subject) sweeps them.
-    sleep(Duration::from_millis(200)).await;
+    sleep(Duration::from_millis(3_500)).await;
     assert_eq!(
         resolve("agent-fresh".into()).await,
         Ok(PolicyVerdict::Allow)
