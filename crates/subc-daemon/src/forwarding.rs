@@ -1106,6 +1106,11 @@ impl ForwardingTable {
         Ok(self.read_inner()?.health_probe_tombstones.len())
     }
 
+    #[cfg(test)]
+    pub(crate) fn closing_connection_count(&self) -> Result<usize, ForwardingError> {
+        Ok(self.read_inner()?.closing_connections.len())
+    }
+
     pub(crate) fn module_endpoint_for_connection(
         &self,
         connection_id: ConnectionId,
@@ -1603,10 +1608,27 @@ impl ForwardingTable {
     ) -> Result<Vec<GoodbyeTarget>, ForwardingError> {
         let mut inner = self.write_inner()?;
         inner.closing_connections.insert(connection_id);
-        if let Some(endpoint) = inner.endpoint_by_connection.remove(&connection_id) {
-            return Ok(remove_module_connection_locked(&mut inner, endpoint));
-        }
+        let released = if let Some(endpoint) = inner.endpoint_by_connection.remove(&connection_id) {
+            remove_module_connection_locked(&mut inner, endpoint)
+        } else {
+            Self::cleanup_client_connection_locked(&mut inner, connection_id)
+        };
+        // The closing mark refuses new work for a connection whose teardown is
+        // still pending. This is the latest point at which lifting it is safe:
+        // teardown has just removed every per-connection entry above, under
+        // this same write lock, so no lookup can still find live state for the
+        // id; and ids come from a monotonic counter that never reissues one,
+        // so the id can never name a future connection either. Keeping the
+        // mark past this point only grew the set by one entry per connection
+        // for the life of the daemon.
+        inner.closing_connections.remove(&connection_id);
+        Ok(released)
+    }
 
+    fn cleanup_client_connection_locked(
+        inner: &mut ForwardingInner,
+        connection_id: ConnectionId,
+    ) -> Vec<GoodbyeTarget> {
         let routes = inner
             .client_to_module
             .iter()
@@ -1616,7 +1638,7 @@ impl ForwardingTable {
         let mut released = Vec::with_capacity(routes.len());
         for (client_key, epoch) in routes {
             if let RouteRelease::Removed(target) =
-                release_client_route_locked(&mut inner, client_key, epoch)
+                release_client_route_locked(inner, client_key, epoch)
             {
                 released.push(target);
             }
@@ -1633,12 +1655,12 @@ impl ForwardingTable {
                 continue;
             };
             release_reserved_route_locked(
-                &mut inner,
+                inner,
                 pending.reservation.client_key,
                 pending.reservation.module_key,
             );
             if pending.relay_enqueued {
-                if let Some(target) = abandoned_route_target(&inner, &pending.reservation) {
+                if let Some(target) = abandoned_route_target(inner, &pending.reservation) {
                     released.push(target);
                 }
             }
@@ -1654,7 +1676,7 @@ impl ForwardingTable {
             .map(|(client, module)| (*client, *module))
             .collect::<Vec<_>>();
         for (client_key, module_key) in orphaned {
-            release_reserved_route_locked(&mut inner, client_key, module_key);
+            release_reserved_route_locked(inner, client_key, module_key);
         }
         inner.next_client_channel.remove(&connection_id);
         inner
@@ -1667,7 +1689,7 @@ impl ForwardingTable {
             .status
             .retain(|(key, _), _| key.connection_id != connection_id);
 
-        Ok(released)
+        released
     }
 
     pub(crate) fn escalate_client_delivery_failure(
@@ -3327,5 +3349,105 @@ mod tests {
             .unwrap();
         assert!(completion.abandoned.is_some());
         assert_eq!(forwarding.active_binding_count().unwrap(), 0);
+    }
+
+    /// Every connection teardown passes through `cleanup_connection`, and
+    /// connection ids come from a monotonic counter that never hands an id out
+    /// twice. If the closing mark survives teardown, the set grows by one entry
+    /// per connection for the life of the daemon -- the self-watchdog alone
+    /// reconnects once a minute.
+    #[test]
+    fn cleaned_up_connections_do_not_stay_in_the_closing_set() {
+        let (forwarding, module_connection, _endpoint, _fixture_client, _sink, _rx) =
+            route_fixture("closing-set-leak");
+
+        const CONNECTIONS: u64 = 32;
+        for index in 0..CONNECTIONS {
+            let client = ConnectionId::new(1000 + index);
+            let (client_tx, _client_rx) = mpsc::channel(8);
+            let route = begin_test_route(
+                &forwarding,
+                client,
+                FrameSink::new(client_tx),
+                index + 1,
+                "closing-set-leak",
+            );
+            forwarding
+                .complete_pending_relay(
+                    module_connection,
+                    route.corr,
+                    RouteBindRelayOutcome::Accepted,
+                )
+                .unwrap();
+            forwarding.cleanup_connection(client).unwrap();
+        }
+        forwarding.cleanup_connection(module_connection).unwrap();
+
+        assert_eq!(forwarding.closing_connection_count().unwrap(), 0);
+    }
+
+    /// The closing mark exists to refuse new work for a connection that is on
+    /// its way out but whose teardown has not run yet: the daemon asks the
+    /// connection loop to end, and only when the loop reacts does
+    /// `cleanup_connection` strip the connection's state. Inside that window an
+    /// operation for the dying connection must still be refused; only after
+    /// cleanup completes may the mark go.
+    #[test]
+    fn closing_connection_is_refused_new_work_until_cleanup_completes() {
+        let (forwarding, module_connection, _endpoint, client, sink, mut client_rx) =
+            route_fixture("closing-gate");
+
+        // A published route: escalate_client_delivery_failure only marks a
+        // connection closing for a route it has already published.
+        let live = begin_test_route(&forwarding, client, sink.clone(), 80, "closing-gate");
+        forwarding
+            .complete_pending_relay(
+                module_connection,
+                live.corr,
+                RouteBindRelayOutcome::Accepted,
+            )
+            .unwrap();
+        client_rx.try_recv().unwrap();
+
+        // Mark the connection closing through the production path without
+        // running teardown, pinning the window open.
+        assert!(forwarding
+            .escalate_client_delivery_failure(
+                client,
+                live.client_channel,
+                live.client_epoch,
+                CloseReason::new(
+                    "module_to_client_delivery_failed",
+                    "client egress refused a module frame",
+                ),
+            )
+            .unwrap());
+        assert_eq!(forwarding.closing_connection_count().unwrap(), 1);
+
+        // A late route.open for the closing client is refused ...
+        assert!(matches!(
+            forwarding.begin_route_bind_relay_for_test(client, sink, 81, "closing-gate"),
+            Err(ForwardingError::ConnectionClosing { connection_id })
+                if connection_id == client
+        ));
+        // ... and so is a late attempt to register the connection as a module.
+        let (late_tx, _late_rx) = mpsc::channel(1);
+        assert!(matches!(
+            forwarding.register_module_connection(
+                client,
+                "late-module".into(),
+                2,
+                Concurrency::ModuleManaged,
+                FrameSink::new(late_tx),
+            ),
+            Err(ForwardingError::ConnectionClosing { connection_id })
+                if connection_id == client
+        ));
+
+        // Teardown is the point that lifts the mark: it has just removed every
+        // per-connection entry under the same lock, so the gate has nothing
+        // left to protect for this id.
+        forwarding.cleanup_connection(client).unwrap();
+        assert_eq!(forwarding.closing_connection_count().unwrap(), 0);
     }
 }
