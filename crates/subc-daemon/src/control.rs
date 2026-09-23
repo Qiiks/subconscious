@@ -5064,10 +5064,9 @@ fn control_response_body_frame<T: Serialize>(
 
 /// Map a forwarding failure to the wire code a client sees.
 ///
-/// The code is not a label: clients BRANCH on it. `is_retryable_route_open_code`
-/// in both SDKs treats `target_unavailable`, `module_reloading`, `unknown_module`
-/// and `module_timeout` as "retry in place", so a code chosen here decides
-/// whether a caller retries or gives up.
+/// The code is not a label: clients BRANCH on it. Both SDKs decide "retry in
+/// place" with `subc_protocol::error_codes::is_retryable_route_open`, so a code
+/// chosen here decides whether a caller retries or gives up.
 ///
 /// That makes attribution the load-bearing property, not merely having a code. A
 /// permanent fault published as a retryable one produces a fleet-wide retry storm
@@ -5294,14 +5293,13 @@ mod tests {
         path
     }
 
-    /// The retryable set both SDKs branch on, kept byte-identical to
-    /// `is_retryable_route_open_code` in subc-client-rs and subc-client.
-    const CLIENT_RETRYABLE: &[&str] = &[
-        "unknown_module",
-        "module_reloading",
-        "target_unavailable",
-        "module_timeout",
-    ];
+    /// Whether clients retry `code` in place: the predicate itself, never a copy
+    /// of its set. A copied list breaks silently when a code is added to or
+    /// removed from the real one, and a stale copy here would let exactly the
+    /// failure this test exists to catch pass.
+    fn client_retries(code: &str) -> bool {
+        subc_protocol::error_codes::is_retryable_route_open(code)
+    }
 
     /// A code is not a label — clients branch on it, so publishing the wrong KIND
     /// of failure is worse than publishing none. A permanent fault dressed as
@@ -5337,7 +5335,7 @@ mod tests {
         for err in transient {
             let code = forwarding_error_code(&err);
             assert!(
-                CLIENT_RETRYABLE.contains(&code),
+                client_retries(code),
                 "{err:?} is transient but publishes {code:?}, which clients treat as permanent"
             );
         }
@@ -5363,7 +5361,7 @@ mod tests {
         for err in permanent {
             let code = forwarding_error_code(&err);
             assert!(
-                !CLIENT_RETRYABLE.contains(&code),
+                !client_retries(code),
                 "{err:?} cannot be fixed by retrying but publishes {code:?}, which clients retry"
             );
         }
