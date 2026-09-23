@@ -732,6 +732,10 @@ impl SubcConsumer {
     /// Admitted routes are never cached or reopened after a connection drop. If
     /// this call fails or the route later closes, the caller must perform admission
     /// again and call this method with fresh facts.
+    ///
+    /// The route declares no reverse-request capabilities, so the provider cannot
+    /// send it requests. Use [`Self::open_route_with_admission_facts_and_options`]
+    /// when the provider asks the consumer questions on the route (elicitation).
     pub async fn open_route_with_admission_facts(
         &self,
         target: RouteTarget,
@@ -739,17 +743,81 @@ impl SubcConsumer {
         facts: serde_json::Value,
     ) -> Result<RouteHandle, CallError> {
         let deadline = Instant::now() + self.shared.opts.call_timeout;
-        let opts = CallOptions::default();
+        self.open_admitted_route(
+            target,
+            identity,
+            facts,
+            &CallOptions::default(),
+            None,
+            deadline,
+        )
+        .await
+    }
+
+    /// Open one admitted route, with the reverse-request handlers and timeout in
+    /// `opts`.
+    ///
+    /// The route declares the capabilities of the handlers registered on
+    /// `opts.reverse_requests`, and requests the provider sends back on it
+    /// (elicitation, sampling) reach those handlers, exactly as on a managed
+    /// route. The handlers must be registered before this call: the registry is
+    /// sealed when the route opens, because the capabilities it declares are what
+    /// the provider was told.
+    ///
+    /// Like [`Self::open_route_with_admission_facts`], the route is never cached
+    /// or reopened; after a failure or a close the caller performs admission again.
+    pub async fn open_route_with_admission_facts_and_options(
+        &self,
+        target: RouteTarget,
+        identity: BindIdentity,
+        facts: serde_json::Value,
+        opts: CallOptions,
+    ) -> Result<RouteHandle, CallError> {
+        let deadline = Instant::now() + opts.timeout;
+        let reverse_requests = opts.reverse_requests.clone();
+        self.open_admitted_route(
+            target,
+            identity,
+            facts,
+            &opts,
+            Some(reverse_requests),
+            deadline,
+        )
+        .await
+    }
+
+    /// One admitted route.open. With `reverse_requests`, the route is opened the
+    /// way the managed path opens one: the capabilities are declared, the socket
+    /// reader installs the handle before the open resolves (so a request the
+    /// provider sends right after binding is not lost), and the handle carries
+    /// the registry. Without it, the route has no reverse-request handling.
+    async fn open_admitted_route(
+        &self,
+        target: RouteTarget,
+        identity: BindIdentity,
+        facts: serde_json::Value,
+        opts: &CallOptions,
+        reverse_requests: Option<ReverseRequestRegistry>,
+        deadline: Instant,
+    ) -> Result<RouteHandle, CallError> {
+        let consumer_capabilities = if reverse_requests.is_some() {
+            route_open_consumer_capabilities(opts)
+        } else {
+            None
+        };
         let body = serde_json::to_vec(&ClientControlRequest::RouteOpen {
             target,
             identity,
-            consumer_identity: route_open_consumer_identity(&opts),
-            consumer_capabilities: None,
+            consumer_identity: route_open_consumer_identity(opts),
+            consumer_capabilities,
             admission_facts: Some(facts),
         })
         .map_err(|err| CallError::not_sent(format!("failed to encode route.open: {err}")))?;
 
-        let terminal = self.shared.control_call(body, deadline, true, None).await?;
+        let terminal = self
+            .shared
+            .control_call(body, deadline, true, reverse_requests.clone())
+            .await?;
         let TerminalFrame::Response {
             generation, body, ..
         } = terminal
@@ -769,8 +837,23 @@ impl SubcConsumer {
                 "route.open returned an unexpected control response",
             ));
         };
+        // Adopt the handle the socket reader installed for this response, which
+        // carries the registry passed to control_call; build one only if the
+        // reader did not (the connection moved on before the response landed).
+        let handle = self
+            .shared
+            .ingress_handle(generation, route_channel, route_epoch)
+            .unwrap_or_else(|| match reverse_requests {
+                Some(reverse_requests) => RouteHandle::new_consumer(
+                    route_channel,
+                    route_epoch,
+                    generation,
+                    reverse_requests,
+                ),
+                None => RouteHandle::new(route_channel, route_epoch, generation),
+            });
         let route = RouteState {
-            handle: RouteHandle::new(route_channel, route_epoch, generation),
+            handle,
             sem: Arc::new(Semaphore::new(DEFAULT_ROUTE_WINDOW)),
         };
         self.shared.install_one_shot_route(route.clone())?;
@@ -2032,7 +2115,16 @@ impl Shared {
         if inner.closed || inner.generation != handle.connection_token() || inner.writer.is_none() {
             return Err(CallError::StaleRouteHandle(handle));
         }
-        if inner.route_epochs.contains_key(&handle.channel) {
+        // The socket reader installs the handle for a route.open response before
+        // the waiter resolves (so a request the provider sends right after the
+        // bind is routed), so this route's own channel is normally present
+        // already, holding exactly this handle. Only a different handle on the
+        // channel is a collision.
+        if inner
+            .route_epochs
+            .get(&handle.channel)
+            .is_some_and(|existing| *existing != handle)
+        {
             return Err(CallError::not_sent(
                 "daemon returned a route channel already in use",
             ));
@@ -5843,6 +5935,165 @@ mod tests {
         let result = task.await.unwrap();
         assert!(matches!(result, Err(CallError::NotSent(_))));
         assert!(rx.try_recv().is_err(), "one-shot route.open must not retry");
+    }
+
+    /// Drive one admitted route.open to success on a test writer and return the
+    /// route.open request that was sent, the resolved handle, and the writer.
+    async fn open_admitted_route_for_test(
+        opts: Option<CallOptions>,
+    ) -> (
+        Arc<Shared>,
+        SubcConsumer,
+        ClientControlRequest,
+        Result<RouteHandle, CallError>,
+        mpsc::Receiver<WriteCommand>,
+    ) {
+        let shared = writer_test_shared();
+        let (writer, mut rx) = mpsc::channel(8);
+        let generation = {
+            let mut inner = shared.lock_inner();
+            inner.writer = Some(writer);
+            inner.generation
+        };
+        let consumer = SubcConsumer {
+            shared: Arc::clone(&shared),
+        };
+        let target = RouteTarget::ToolProvider {
+            module_id: "cerebellum".to_string(),
+        };
+        let identity = BindIdentity::new(
+            PathBuf::from("/tmp/project"),
+            "test".to_string(),
+            "admitted".to_string(),
+        );
+        let facts = serde_json::json!({"schema": 1, "verified_class": "member"});
+        // The consumer is returned from the task and kept alive by the caller:
+        // dropping it closes the connection, after which no frame is dispatched.
+        let task = tokio::spawn(async move {
+            let result = match opts {
+                Some(opts) => {
+                    consumer
+                        .open_route_with_admission_facts_and_options(target, identity, facts, opts)
+                        .await
+                }
+                None => {
+                    consumer
+                        .open_route_with_admission_facts(target, identity, facts)
+                        .await
+                }
+            };
+            (consumer, result)
+        });
+        let command = rx.recv().await.expect("one route.open must be queued");
+        let request: ClientControlRequest = serde_json::from_slice(&command.frame.body).unwrap();
+        let response = serde_json::to_vec(&ClientControlResponse::RouteOpen {
+            route_channel: 21,
+            route_epoch: 4,
+        })
+        .unwrap();
+        assert!(
+            dispatch_frame(
+                &shared,
+                generation,
+                Frame::build(
+                    FrameType::Response,
+                    Flags::new(false, Priority::Interactive, false),
+                    0,
+                    0,
+                    command.frame.header.corr,
+                    response,
+                )
+                .unwrap(),
+            )
+            .await
+        );
+        let (consumer, result) = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("admitted route.open resolves")
+            .unwrap();
+        (shared, consumer, request, result, rx)
+    }
+
+    #[tokio::test]
+    async fn admitted_route_without_options_opens_and_declares_no_reverse_capabilities() {
+        let (_shared, _consumer, request, result, _rx) = open_admitted_route_for_test(None).await;
+        let ClientControlRequest::RouteOpen {
+            consumer_capabilities,
+            admission_facts,
+            ..
+        } = request
+        else {
+            panic!("expected route.open")
+        };
+        assert_eq!(consumer_capabilities, None);
+        assert!(admission_facts.is_some());
+        let handle = result.expect("admitted route opens");
+        assert_eq!((handle.channel, handle.epoch), (21, 4));
+    }
+
+    // An admitted route opened with handlers declares their capabilities and
+    // delivers the provider's reverse requests to them, replying under the
+    // provider's own correlation id: the browser plane's consent prompts arrive
+    // as elicitation on exactly this kind of route.
+    #[tokio::test]
+    async fn admitted_route_with_options_delivers_elicitation_to_its_handler() {
+        let opts = CallOptions::default();
+        let seen = Arc::new(Mutex::new(None));
+        let seen_by_handler = Arc::clone(&seen);
+        let reply_body = br#"{"jsonrpc":"2.0","id":3,"result":{"action":"accept"}}"#.to_vec();
+        let expected_reply = reply_body.clone();
+        opts.reverse_requests
+            .on_request("elicitation", move |body, ctx| {
+                *seen_by_handler
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((body, ctx.corr));
+                let reply_body = reply_body.clone();
+                async move { reply_body }
+            })
+            .unwrap();
+
+        let (shared, _consumer, request, result, mut rx) =
+            open_admitted_route_for_test(Some(opts)).await;
+        let ClientControlRequest::RouteOpen {
+            consumer_capabilities,
+            admission_facts,
+            ..
+        } = request
+        else {
+            panic!("expected route.open")
+        };
+        assert_eq!(consumer_capabilities, Some(vec!["elicitation".to_string()]));
+        assert_eq!(
+            admission_facts,
+            Some(serde_json::json!({"schema": 1, "verified_class": "member"}))
+        );
+        let handle = result.expect("admitted route opens");
+
+        let request_body =
+            br#"{"jsonrpc":"2.0","id":3,"method":"elicitation/create","params":{}}"#.to_vec();
+        assert!(
+            dispatch_frame(
+                &shared,
+                handle.connection_token(),
+                reverse_request_frame(handle, 900, request_body.clone()),
+            )
+            .await
+        );
+        let reply = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("the handler replies")
+            .unwrap()
+            .frame;
+        assert_eq!(reply.header.ty, FrameType::Response);
+        assert_eq!(reply.header.corr, 900);
+        assert_eq!(reply.header.channel, 21);
+        assert_eq!(reply.body, expected_reply);
+        assert_eq!(
+            seen.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            Some((request_body, 900))
+        );
     }
 
     #[tokio::test]
