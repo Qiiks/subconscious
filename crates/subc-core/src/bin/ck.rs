@@ -1469,18 +1469,7 @@ async fn module_logs(
 
     let sources = discover_log_sources(module_id, true)?;
     let (mut entries, counts) = collect_log_entries(module_id, &sources, options)?;
-    // Undated lines (the stderr capture is raw child bytes and need not carry a
-    // fleet timestamp) sort AFTER every dated line: `Option`'s natural order
-    // puts `None` first, which would render a module's crash stderr above
-    // yesterday's daemon lines. Within the undated tail, source order holds.
-    entries.sort_by(|left, right| {
-        left.timestamp
-            .is_none()
-            .cmp(&right.timestamp.is_none())
-            .then_with(|| left.timestamp.cmp(&right.timestamp))
-            .then_with(|| left.lane.cmp(&right.lane))
-            .then_with(|| left.source_order.cmp(&right.source_order))
-    });
+    sort_log_entries(&mut entries);
     if entries.is_empty() && counts.total == 0 {
         println!("no log yet for {module_id}");
         return Ok(());
@@ -1495,6 +1484,21 @@ async fn module_logs(
         follow_module_logs(module_id, options, sources, json_output).await?;
     }
     Ok(())
+}
+
+/// Undated lines (the stderr capture is raw child bytes and need not carry a
+/// fleet timestamp) sort AFTER every dated line: `Option`'s natural order puts
+/// `None` first, which would render a module's crash stderr above yesterday's
+/// daemon lines. Within the undated tail, source order holds.
+fn sort_log_entries(entries: &mut [LogEntry]) {
+    entries.sort_by(|left, right| {
+        left.timestamp
+            .is_none()
+            .cmp(&right.timestamp.is_none())
+            .then_with(|| left.timestamp.cmp(&right.timestamp))
+            .then_with(|| left.lane.cmp(&right.lane))
+            .then_with(|| left.source_order.cmp(&right.source_order))
+    });
 }
 
 fn module_log_census(modules: &[Value], json_output: bool) -> Result<(), CkError> {
@@ -1541,10 +1545,10 @@ fn last_log_timestamp(path: &Path) -> String {
         .ok()
         .and_then(|contents| {
             contents.lines().rev().find_map(|line| {
-                parse_log_line(line).ok().map(|parsed| {
+                line_facts(line).map(|facts| {
                     line.split_once(' ')
                         .map(|(timestamp, _)| timestamp.to_string())
-                        .unwrap_or_else(|| format_system_time(parsed.timestamp))
+                        .unwrap_or_else(|| format_system_time(facts.timestamp))
                 })
             })
         })
@@ -1692,7 +1696,7 @@ fn collect_log_text(
         .and_then(|duration| SystemTime::now().checked_sub(duration));
     for line in contents.lines() {
         counts.total += 1;
-        let parsed = parse_log_line(line).ok();
+        let parsed = line_facts(line);
         if source.daemon
             && parsed
                 .as_ref()
@@ -1724,7 +1728,7 @@ fn collect_log_text(
             if options
                 .tag
                 .as_deref()
-                .is_some_and(|tag| !logger_component_matches(parsed.logger, tag))
+                .is_some_and(|tag| !component_matches(parsed.component, tag))
             {
                 counts.wrong_tag += 1;
                 continue;
@@ -1741,11 +1745,98 @@ fn collect_log_text(
             line: line.to_string(),
             timestamp: parsed.as_ref().map(|parsed| parsed.timestamp),
             level: parsed.as_ref().map(|parsed| parsed.level),
-            tag: parsed.and_then(|parsed| logger_component(parsed.logger).map(str::to_string)),
+            tag: parsed.and_then(|parsed| parsed.component.map(str::to_string)),
             source_order: *source_order,
         });
         *source_order += 1;
     }
+}
+
+/// What merging and filtering need from one log line, read from either grammar.
+///
+/// r1 and r2 lines sit side by side on disk for the whole adoption window: a
+/// module that adopted r2 keeps its pre-adoption `<id>.log` files, and the
+/// daemon's own history spans both. A reader that knows only r2 leaves every r1
+/// line undated, and undated lines sort after all dated ones, so the tail of
+/// the merged view shows the oldest history instead of the newest lines.
+struct LineFacts<'a> {
+    timestamp: SystemTime,
+    level: ParsedLevel,
+    /// The r2 logger component (`synapse.perf` -> `perf`) or the r1 `tag=` value:
+    /// the same intent under each grammar, so `--tag perf` matches both.
+    component: Option<&'a str>,
+    body: &'a str,
+}
+
+fn line_facts(line: &str) -> Option<LineFacts<'_>> {
+    if let Ok(parsed) = parse_log_line(line) {
+        return Some(LineFacts {
+            timestamp: parsed.timestamp,
+            level: parsed.level,
+            component: logger_component(parsed.logger),
+            body: parsed.body,
+        });
+    }
+    parse_r1_line(line)
+}
+
+/// The r1 grammar: `<UTC timestamp> <LEVEL> <module> [tag=<tag>] <message and fields>`.
+///
+/// The module token is what separates the grammars: r2 ends its logger name with
+/// a colon (`synapse.perf:`), r1 does not (`synapse`). A token ending in a colon
+/// is refused here, so an r2 line the r2 parser rejected is never re-read as r1.
+fn parse_r1_line(line: &str) -> Option<LineFacts<'_>> {
+    let (stamp, rest) = line.split_once(' ')?;
+    let timestamp = parse_r1_timestamp(stamp)?;
+    let (level, rest) = rest.trim_start().split_once(' ')?;
+    let level = match level {
+        "TRACE" => ParsedLevel::Trace,
+        "DEBUG" => ParsedLevel::Debug,
+        "INFO" => ParsedLevel::Info,
+        "WARN" => ParsedLevel::Warn,
+        "ERROR" => ParsedLevel::Error,
+        _ => return None,
+    };
+    let rest = rest.trim_start();
+    let (module, rest) = rest.split_once(' ').unwrap_or((rest, ""));
+    if module.is_empty() || module.ends_with(':') {
+        return None;
+    }
+    let (component, body) = match rest.strip_prefix("tag=") {
+        Some(tagged) => {
+            let (tag, body) = tagged.split_once(' ').unwrap_or((tagged, ""));
+            (Some(tag).filter(|tag| !tag.is_empty()), body)
+        }
+        None => (None, rest),
+    };
+    Some(LineFacts {
+        timestamp,
+        level,
+        component,
+        body,
+    })
+}
+
+/// `2026-09-18T19:00:01.008Z`: UTC only, as r1 always wrote it, with optional
+/// fractional seconds kept so lines inside one second still merge in order.
+fn parse_r1_timestamp(stamp: &str) -> Option<SystemTime> {
+    if !stamp.ends_with('Z') {
+        return None;
+    }
+    let seconds = parse_rfc3339_to_utc_secs(stamp)?;
+    let fraction = stamp
+        .get(19..stamp.len() - 1)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .unwrap_or("");
+    if !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let nanos = fraction
+        .bytes()
+        .chain(std::iter::repeat(b'0'))
+        .take(9)
+        .fold(0u32, |total, digit| total * 10 + u32::from(digit - b'0'));
+    UNIX_EPOCH.checked_add(Duration::new(seconds, nanos))
 }
 
 /// The logger name with its module root removed: `synapse.perf` -> `Some("perf")`,
@@ -1755,8 +1846,8 @@ fn logger_component(logger: &str) -> Option<&str> {
     logger.split_once('.').map(|(_, component)| component)
 }
 
-fn logger_component_matches(logger: &str, requested: &str) -> bool {
-    match logger_component(logger) {
+fn component_matches(component: Option<&str>, requested: &str) -> bool {
+    match component {
         Some(component) => {
             component == requested
                 || component
@@ -7036,6 +7127,125 @@ impl From<serde_json::Error> for CkError {
 
 #[cfg(test)]
 mod tests {
+    /// A module keeps its pre-adoption r1 history beside its r2 segments, so the
+    /// merged view reads one directory holding both grammars. The r1 lines must
+    /// be dated and interleave by time: left undated, they sort after every r2
+    /// line and the tail shows the OLDEST history (synapse's view ended three
+    /// days before its newest segment, over 358,974 unparsed r1 lines).
+    #[test]
+    fn r1_and_r2_lines_from_one_module_merge_by_time_and_filter_by_the_same_tag() {
+        let r1 = LogSource {
+            lane: "mod".to_string(),
+            path: PathBuf::from("synapse.log"),
+            daemon: false,
+        };
+        let r2 = LogSource {
+            lane: "mod".to_string(),
+            path: PathBuf::from("synapse.2026-09-22.log"),
+            daemon: false,
+        };
+        let r1_text = "2026-09-18T19:00:01.008Z INFO  synapse tag=admission job admitted job_id=a\n\
+                       2026-09-18T19:00:18.670Z INFO  synapse tag=perf job done job_id=a wall_ms=21693\n\
+                       2026-09-23T00:00:00.500Z WARN  synapse late r1 line after the r2 one\n";
+        let r2_text =
+            "2026-09-22T23:33:11.399Z WARN  synapse.admission: lease held module=synapse\n";
+        let options = ModuleLogsOptions {
+            lines: 100,
+            follow: false,
+            since: None,
+            tag: None,
+            level: None,
+            lane: None,
+        };
+        let mut counts = LogFilterCounts::default();
+        let mut entries = Vec::new();
+        let mut order = 0;
+        // The r2 segment is read FIRST, as a directory listing may yield it, so
+        // only the timestamps can put the lines in order.
+        collect_log_text(
+            "synapse",
+            &r2,
+            r2_text,
+            &options,
+            &mut counts,
+            &mut entries,
+            &mut order,
+        );
+        collect_log_text(
+            "synapse",
+            &r1,
+            r1_text,
+            &options,
+            &mut counts,
+            &mut entries,
+            &mut order,
+        );
+        sort_log_entries(&mut entries);
+
+        assert_eq!(counts.unparsed, 0, "every r1 line must parse");
+        let order: Vec<&str> = entries
+            .iter()
+            .map(|entry| entry.line.split_whitespace().last().unwrap())
+            .collect();
+        assert_eq!(
+            order,
+            vec!["job_id=a", "wall_ms=21693", "module=synapse", "one"],
+            "merged by time across grammars"
+        );
+        assert_eq!(entries.last().unwrap().level, Some(ParsedLevel::Warn));
+
+        // `--tag admission` names the r1 `tag=admission` and the r2 logger
+        // `synapse.admission` alike.
+        let tagged = ModuleLogsOptions {
+            tag: Some("admission".to_string()),
+            ..options
+        };
+        let mut counts = LogFilterCounts::default();
+        let mut entries = Vec::new();
+        let mut order = 0;
+        collect_log_text(
+            "synapse",
+            &r2,
+            r2_text,
+            &tagged,
+            &mut counts,
+            &mut entries,
+            &mut order,
+        );
+        collect_log_text(
+            "synapse",
+            &r1,
+            r1_text,
+            &tagged,
+            &mut counts,
+            &mut entries,
+            &mut order,
+        );
+        assert_eq!(entries.len(), 2, "one admission line from each grammar");
+        assert!(entries
+            .iter()
+            .all(|entry| entry.tag.as_deref() == Some("admission")));
+    }
+
+    /// An r2 line the r2 parser refused (here: an ANSI escape, which r2
+    /// forbids) must not be rescued by the r1 arm. The colon after the logger
+    /// name is what keeps the grammars apart.
+    #[test]
+    fn r1_arm_refuses_lines_in_r2_shape() {
+        assert!(
+            line_facts("2026-09-22T23:33:11.399Z WARN  synapse.admission: lease \u{1b}[1m")
+                .is_none()
+        );
+        assert!(
+            line_facts("2026-09-22T23:33:11.399Z WARN  synapse.admission: lease held").is_some()
+        );
+        assert!(
+            parse_r1_line("2026-09-22T23:33:11.399Z WARN  synapse.admission: lease held").is_none()
+        );
+        assert!(parse_r1_line("2026-09-22T23:33:11.399+02:00 WARN  synapse held").is_none());
+        assert!(parse_r1_line("not a log line").is_none());
+    }
+
     /// A module whose detail string is just its status again (synapse sends
     /// `detail: "ok"`) rendered `ok  ok` on the health overview; a real detail
     /// still shows, and an absent one stays absent.
