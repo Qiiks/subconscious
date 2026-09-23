@@ -49,15 +49,36 @@ absent). Also on `server.describe` and in `ck daemon`. A module built against an
 older daemon sees nothing and must treat that as "daemon predates the machine
 id", never as "no machine".
 
-**Restore.** Restoring a machine means restoring this file. Two paths:
+**The file is the authority, readable without the daemon.** A tool that runs
+while the daemon is down (callosum's `trust import`, which runs with the callosum
+module stopped) reads `<data home>/cortexkit/machine-id` directly, never the
+daemon's control API. The running daemon's copy equals the file except between
+an `adopt` and the next daemon start.
 
-- the file is part of whatever backs up the data home;
-- callosum's trust export records the machine id as data. On import, if the
-  recorded id differs from the daemon's, callosum refuses and names the fix:
-  `ck machine adopt <id>`, then a daemon restart. `adopt` is an operator
-  command, not a module operation, because it changes the identity every module
-  on the machine reports; it rewrites the file and takes effect at the next
-  daemon start, never under running modules.
+**Restore, and the order that makes it safe.** Restoring a machine means
+restoring its id before anything keys state on it:
+
+1. `ck machine adopt <id>` with the daemon stopped (or before its first start on
+   a rebuilt machine). `adopt` is an operator command, not a module operation,
+   because it changes the identity every module on the machine reports. It
+   writes the file and never touches a running daemon.
+2. `ck callosum trust import`. Callosum's trust export records the id as data.
+   The import compares it with the file: equal, proceed; different, refuse and
+   name step 1; no file, refuse and name step 1 (never skip the comparison,
+   which would let a restore onto the wrong machine through silently); the
+   recorded id absent (an export older than this change), proceed without
+   comparing and keep nothing to compare later.
+3. Start the daemon.
+
+**The wrong order, and what it costs.** A rebuilt machine whose daemon starts
+before step 1 mints a fresh id, and modules may create state keyed on it (a
+ck-bus account's streams, prefrontal's local machine binding). A later `adopt`
+changes the id at the next daemon start. So a module that keys durable state on
+the id must handle registration with an id different from the one it last saw,
+and must say in its own design what it does: ck-bus starts a new account and
+treats the old one's streams as orphans to collect; prefrontal's rule is ALF's
+to write. `ck setup` on a fresh machine asks whether it is a new machine or a
+restore before the daemon's first start, so the safe order is the default path.
 
 **Clone detection stays callosum's.** Two machines restored from one backup
 carry one machine id with two different transport keys. Only callosum sees both
