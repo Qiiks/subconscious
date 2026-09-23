@@ -4717,8 +4717,15 @@ async fn bind_relay_breaker_opens_at_the_threshold_and_refuses_before_relaying()
 /// often it happens.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_module_that_rejects_binds_quickly_never_trips_the_breaker() {
+    // The budget is deliberately generous. This test is about what a REFUSAL
+    // does to the breaker, and a refusal that outlasts the budget is reported
+    // as `module_timeout` instead, so a short budget made the subject depend on
+    // how fast a loaded runner delivered the stub's refusal (300 ms lost that
+    // race on Windows CI). Whether refusals count is still decided by the
+    // threshold of 3: if they counted, opens 4 to 6 would read
+    // `module_timeout_breaker_open`, whatever the budget.
     let server = TestServer::start_with_bind_timeout_and_breaker(
-        Duration::from_millis(300),
+        Duration::from_secs(10),
         3,
         Duration::from_secs(30),
     )
