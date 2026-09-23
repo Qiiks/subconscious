@@ -26,7 +26,7 @@ use tokio::{
     process::{Child, Command},
     sync::{mpsc, oneshot, watch, Mutex as AsyncMutex},
     task::JoinHandle,
-    time::{sleep, timeout, timeout_at, Instant},
+    time::{sleep, sleep_until, timeout, timeout_at, Instant},
 };
 use tracing::{debug, error, info, warn};
 
@@ -3215,6 +3215,13 @@ async fn health_restart_child(
     )
     .await?;
     sleep(schedule.delay).await;
+    // The backoff may have outlasted the restart it was counting down to: an
+    // operator disable or drain in between moves the snapshot out of
+    // `Restarting`, and that stop must win over this respawn.
+    if !respawn_still_pending(snapshot) {
+        process_liveness.untrack_if_current(&spec.module_id, snapshot);
+        return Ok(());
+    }
     process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
     match spawn_and_mark_running(spec, runtime, snapshot) {
         Ok(next_child) => {
@@ -3526,6 +3533,10 @@ async fn supervise_loop(
     mut commands: mpsc::Receiver<SupervisorCommand>,
 ) {
     let mut health_probe = HealthProbeRuntime::default();
+    // Deadline of the crash respawn whose backoff is currently elapsing. While
+    // it is set the loop serves commands instead of sleeping inside the exit
+    // arm, so a disable or drain lands immediately and cancels the respawn.
+    let mut pending_respawn: Option<Instant> = None;
     loop {
         if child.is_some() {
             health_probe.refresh_registration(&spec, &runtime, &registry, &snapshot);
@@ -3593,30 +3604,15 @@ async fn supervise_loop(
                             if let Some(schedule) = schedule {
                                 log_crash_respawn(&spec.module_id, schedule);
                             }
-                            sleep(delay).await;
-                            if let Err(err) = wait_for_registration_release(
-                                &registry,
-                                &spec.module_id,
-                                REGISTRY_RELEASE_TIMEOUT,
-                            ).await {
-                                fail_snapshot(&snapshot, Some(&spec.module_id), None);
-                                error!(module_id = %spec.module_id, error = %err, "registration did not release before restart");
-                                child = None;
-                                continue;
-                            }
-
-                            match spawn_and_mark_running(&spec, &runtime, &snapshot) {
-                                Ok(next_child) => {
-                                    child = Some(next_child);
-                                    debug!(module_id = %spec.module_id, "supervised module restarted after crash");
-                                }
-                                Err(err) => {
-                                    fail_snapshot(&snapshot, Some(&spec.module_id), None);
-                                    process_liveness.untrack_if_current(&spec.module_id, &snapshot);
-                                    error!(module_id = %spec.module_id, error = %err, "failed to restart supervised module");
-                                    child = None;
-                                }
-                            }
+                            // The exited child is fully recorded at this point,
+                            // so release it and count the backoff down in the
+                            // command-serving branch below rather than sleeping
+                            // here: commands cannot be received from inside this
+                            // select arm, and an operator disable or drain that
+                            // arrives during the backoff must cancel the pending
+                            // respawn instead of waiting for it to spawn first.
+                            child = None;
+                            pending_respawn = Some(Instant::now() + delay);
                         }
                     }
                 }
@@ -3652,6 +3648,62 @@ async fn supervise_loop(
                     }
                 }
             }
+        } else if let Some(deadline) = pending_respawn {
+            tokio::select! {
+                _ = sleep_until(deadline) => {
+                    pending_respawn = None;
+                    // A command handled below while the backoff elapsed may
+                    // have stopped the module; never respawn past an operator's
+                    // disable or drain.
+                    if !respawn_still_pending(&snapshot) {
+                        continue;
+                    }
+                    if let Err(err) = wait_for_registration_release(
+                        &registry,
+                        &spec.module_id,
+                        REGISTRY_RELEASE_TIMEOUT,
+                    ).await {
+                        fail_snapshot(&snapshot, Some(&spec.module_id), None);
+                        error!(module_id = %spec.module_id, error = %err, "registration did not release before restart");
+                        continue;
+                    }
+
+                    match spawn_and_mark_running(&spec, &runtime, &snapshot) {
+                        Ok(next_child) => {
+                            child = Some(next_child);
+                            debug!(module_id = %spec.module_id, "supervised module restarted after crash");
+                        }
+                        Err(err) => {
+                            fail_snapshot(&snapshot, Some(&spec.module_id), None);
+                            process_liveness.untrack_if_current(&spec.module_id, &snapshot);
+                            error!(module_id = %spec.module_id, error = %err, "failed to restart supervised module");
+                        }
+                    }
+                }
+                command = commands.recv() => {
+                    let Some(command) = command else {
+                        return;
+                    };
+                    if !handle_supervisor_command(
+                        command,
+                        &mut spec,
+                        &mut runtime,
+                        &registry,
+                        &process_liveness,
+                        &snapshot,
+                        &mut child,
+                    ).await {
+                        return;
+                    }
+                    // Reconcile the pending respawn with what the command did:
+                    // a restart or reload has already spawned a fresh child,
+                    // while a disable or drain moved the snapshot out of the
+                    // state the respawn was counting down from.
+                    if child.is_some() || !respawn_still_pending(&snapshot) {
+                        pending_respawn = None;
+                    }
+                }
+            }
         } else {
             let Some(command) = commands.recv().await else {
                 return;
@@ -3680,6 +3732,18 @@ fn log_crash_respawn(module_id: &str, schedule: CrashRestartSchedule) {
         delay_ms = schedule.delay.as_millis() as u64,
         "respawning after crash"
     );
+}
+
+/// Whether the respawn a backoff was counting down to is still wanted. A
+/// disable or drain handled while the backoff elapsed moves the snapshot out
+/// of `Restarting`, and the operator's stop must win over the pending respawn,
+/// so every sleep-then-spawn path re-validates against the live snapshot
+/// instead of assuming the state it left behind still holds.
+fn respawn_still_pending(snapshot: &SharedSnapshot) -> bool {
+    matches!(
+        lock_snapshot(snapshot),
+        Ok(state) if state.enabled && state.state == ModuleState::Restarting
+    )
 }
 
 enum NextAction {
@@ -3904,6 +3968,12 @@ async fn restart_child(
 
     reset_restart_count(snapshot, &spec.module_id)?;
     sleep(runtime.restart_policy.backoff).await;
+    // A disable or drain that landed during the backoff cancels this respawn:
+    // the operator's stop must win over the restart the sleep counted down to.
+    if !respawn_still_pending(snapshot) {
+        process_liveness.untrack_if_current(&spec.module_id, snapshot);
+        return Ok(());
+    }
     process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
     // Mirror health_restart_child's spawn-failure handling: of the four
     // spawn-failure sites this was the only one that propagated with the
@@ -3974,6 +4044,12 @@ async fn reload_child(
 
     reset_restart_count(snapshot, &spec.module_id)?;
     sleep(runtime.restart_policy.backoff).await;
+    // A disable or drain that landed during the backoff cancels this respawn:
+    // the operator's stop must win over the restart the sleep counted down to.
+    if !respawn_still_pending(snapshot) {
+        process_liveness.untrack_if_current(&spec.module_id, snapshot);
+        return Ok(());
+    }
     process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
     let next_child = match spawn_and_mark_running(spec, runtime, snapshot) {
         Ok(next_child) => next_child,
@@ -5327,31 +5403,39 @@ async fn handle_reload_child_registration_failure(
                 log_crash_respawn(&spec.module_id, schedule);
             }
             sleep(delay).await;
-            if let Err(err) =
-                wait_for_registration_release(registry, &spec.module_id, REGISTRY_RELEASE_TIMEOUT)
-                    .await
-            {
-                fail_snapshot(snapshot, Some(&spec.module_id), None);
-                process_liveness.untrack_if_current(&spec.module_id, snapshot);
-                return Err(SuperviseError::ReloadFailed {
-                    module_id: spec.module_id.clone(),
-                    reason: format!(
-                        "{reason}; registration did not release before policy retry: {err}"
-                    ),
-                });
-            }
-            process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
-            match spawn_and_mark_running(spec, runtime, snapshot) {
-                Ok(next_child) => {
-                    *child = Some(next_child);
-                }
-                Err(err) => {
+            // A disable or drain that landed during the backoff cancels this
+            // policy retry: the operator's stop must win over the respawn the
+            // sleep counted down to.
+            if respawn_still_pending(snapshot) {
+                if let Err(err) = wait_for_registration_release(
+                    registry,
+                    &spec.module_id,
+                    REGISTRY_RELEASE_TIMEOUT,
+                )
+                .await
+                {
                     fail_snapshot(snapshot, Some(&spec.module_id), None);
                     process_liveness.untrack_if_current(&spec.module_id, snapshot);
                     return Err(SuperviseError::ReloadFailed {
                         module_id: spec.module_id.clone(),
-                        reason: format!("{reason}; policy retry spawn failed: {err}"),
+                        reason: format!(
+                            "{reason}; registration did not release before policy retry: {err}"
+                        ),
                     });
+                }
+                process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
+                match spawn_and_mark_running(spec, runtime, snapshot) {
+                    Ok(next_child) => {
+                        *child = Some(next_child);
+                    }
+                    Err(err) => {
+                        fail_snapshot(snapshot, Some(&spec.module_id), None);
+                        process_liveness.untrack_if_current(&spec.module_id, snapshot);
+                        return Err(SuperviseError::ReloadFailed {
+                            module_id: spec.module_id.clone(),
+                            reason: format!("{reason}; policy retry spawn failed: {err}"),
+                        });
+                    }
                 }
             }
         }
@@ -5388,18 +5472,23 @@ async fn handle_reload_spawn_failure(
 
     if should_retry {
         sleep(runtime.restart_policy.backoff).await;
-        process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
-        match spawn_and_mark_running(spec, runtime, snapshot) {
-            Ok(next_child) => {
-                *child = Some(next_child);
-            }
-            Err(err) => {
-                fail_snapshot(snapshot, Some(&spec.module_id), None);
-                process_liveness.untrack_if_current(&spec.module_id, snapshot);
-                return Err(SuperviseError::ReloadFailed {
-                    module_id: spec.module_id.clone(),
-                    reason: format!("{reason}; policy retry spawn failed: {err}"),
-                });
+        // A disable or drain that landed during the backoff cancels this
+        // policy retry: the operator's stop must win over the respawn the
+        // sleep counted down to.
+        if respawn_still_pending(snapshot) {
+            process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
+            match spawn_and_mark_running(spec, runtime, snapshot) {
+                Ok(next_child) => {
+                    *child = Some(next_child);
+                }
+                Err(err) => {
+                    fail_snapshot(snapshot, Some(&spec.module_id), None);
+                    process_liveness.untrack_if_current(&spec.module_id, snapshot);
+                    return Err(SuperviseError::ReloadFailed {
+                        module_id: spec.module_id.clone(),
+                        reason: format!("{reason}; policy retry spawn failed: {err}"),
+                    });
+                }
             }
         }
     } else {
@@ -6229,6 +6318,61 @@ mod terminal_history_tests {
             );
             sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// A disable issued while a crash respawn is still backing off must preempt
+    /// that respawn: the operator's stop wins, the disable must not queue behind
+    /// the backoff, and the module must never come back up afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disable_during_crash_backoff_cancels_pending_respawn() {
+        let backoff = Duration::from_secs(2);
+        let supervisor = Supervisor::new(
+            Arc::new(Registry::default()),
+            RestartPolicy::new(10, backoff),
+        );
+        let module = supervisor
+            .spawn(ModuleSpec {
+                module_id: "disable-during-backoff".to_string(),
+                program: fake_aft_stub_path(),
+                args: Vec::new(),
+                env: vec![("FAKE_AFT_EXIT_CODE".to_string(), "23".to_string())],
+                reserved: false,
+                reserved_prefixes: Vec::new(),
+                protocol: ModuleProtocol::Subc,
+            })
+            .unwrap();
+
+        // Wait for the first crash to put the module into its backoff window.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if module.status().unwrap().state == ModuleState::Restarting {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "module never entered the crash backoff"
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        let started = Instant::now();
+        module.set_enabled(false).await.unwrap();
+        let waited = started.elapsed();
+
+        assert!(
+            waited < backoff / 2,
+            "disable waited {waited:?} behind the {backoff:?} crash backoff; the operator command must preempt the pending respawn"
+        );
+        assert_eq!(module.status().unwrap().state, ModuleState::Disabled);
+
+        // Outlast the backoff: the respawn it was counting down to must never run.
+        sleep(backoff + Duration::from_millis(500)).await;
+        let status = module.status().unwrap();
+        assert_eq!(status.state, ModuleState::Disabled);
+        assert_eq!(
+            status.spawn_generation, 1,
+            "module respawned after the operator disabled it"
+        );
     }
 
     /// Each restart-producing arm has its own state transition. Keeping their
