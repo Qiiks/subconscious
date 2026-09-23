@@ -195,10 +195,16 @@ What does inherit the pairing is the Noise IK session. So:
   connection; the callosum tombstone does not do that on its own, so the ceremony
   has to wire it. A cooperative hub can purge the removed machine's inbox; a
   hostile one cannot be forced to.
-- **This machine's own generation is carried in the trust document** too (CALLO).
-  A restored box that reset its counter would publish fresh keys at a low
-  generation, every peer would keep the stale record, and those are exactly the
-  keys lost with the old box.
+- **This machine's own generation comes from its vault, never from the trust
+  document** (CKCRED, CALLO). A restored box that reset its counter would publish
+  fresh keys at a low generation, every peer would keep the stale record, and
+  those are exactly the keys lost with the old box. The vault and callosum's
+  store are restored independently, so a counter carried in the trust document
+  could put a newer number on older keys. The generation therefore lives in the
+  vault's credential ids and callosum reads it. The restore case is caught by an
+  echo: each side tells the other the generation it holds for it, and a box that
+  learns a peer holds a higher generation than it can open withholds its record
+  and asks to rotate above that number.
 - **Rotation needs the two machines to meet** (CKCRED). A new key record reaches
   A only in A's next session with B, direct or relayed through callosum; the hub
   cannot carry it, because nothing it relays is signed by anything A trusts.
@@ -413,8 +419,8 @@ What shape 3 commits us to (CKCRED):
 - Callosum mints the stable box id (operator ruling); the rooms question widens
   into a prefrontal-across-machines design pass.
 - Rotation needs the machines to meet; the old key stays openable until every
-  peer acknowledges the new generation; the machine's own generation rides the
-  trust document (CKCRED, CALLO).
+  peer acknowledges the new generation; the machine's own generation comes from
+  its vault and a peer echo catches a restored box (CKCRED, CALLO).
 - Shape 3 leaf signing: its own vault identity, a named signer in connect
   errors, and the rebuild commitment (CKCRED).
 - From Athena: a separate federation account so local plaintext can never cross
