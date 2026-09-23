@@ -172,6 +172,25 @@ rung 2 they see fast `module_warming` from the first call, retry inside
 their deadline, and land on a module that is actually ready. The window is
 the same length; every call inside it is cheap and honest.
 
+**How long a not-ready window callers will actually wait.** Rust consumers
+retry a retryable refusal until `route_retry_deadline` (30 s) or the call's own
+deadline, whichever is sooner; that path has no attempt cap. Node consumers on
+`@cortexkit/subc-client` 0.11.0 and later do the same. Node consumers on an
+older client give up after about 3.1 s: a six-attempt cap (0/100/300/700/1500/
+3100 ms) sat beside the deadline until 388536cb made the deadline the only
+binder. A 0.x caret pins the minor (`^0.8.1` never resolves 0.11), so those
+pins stay on the old behaviour until the range is edited; five repos carried
+one when this was measured (2026-09-23). A module declaring `ready: false` for
+longer than ~3 s will fail those consumers' opens outright.
+
+**Whether warming is worth it at all is the module's measurement.** aft
+measured it against a burst of 144-170 first calls over 24 real roots and
+found warm-then-flip slower at both p50 (1234 to 2855 ms) and p99 (2485 to
+4178 ms): none of its first calls waits on a decoded artifact, so the refusal
+window was pure added latency. aft flips ready at once. The comparison that
+decides it is first-answered-call latency across every reopening client, at
+p50 and p99, not one call timed either way.
+
 ### Rung 3 — blue/green swap
 
 `supervisor.swap { module_id }` (and `ck module restart --swap <id>`):
