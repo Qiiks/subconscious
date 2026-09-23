@@ -5,11 +5,12 @@ use serde_json::Value;
 use subc_control::{
     CatalogEntry, ClientControlPush, ClientControlRequest, ClientControlResponse, ConsumerIdentity,
     DaemonBuildProvenance, DaemonObservedProcess, LiveSpawn, ModuleDeclaredProvenance,
-    ModuleProtocol, PollKind, RouteCloseReason, RunningImageAgreement, RunningImageEvidence,
-    SpawnCursor, SpawnEvent, SpawnEventKind, SpawnSnapshot, StderrCaptureState, StderrTail,
-    StderrTailEntry, SupervisorDaemonProvenance, SupervisorEntry, SupervisorHealthEntry,
-    SupervisorHealthStatus, SupervisorModuleProvenance, SupervisorObservedProcess,
-    SupervisorRescanResult, SupervisorRoute, SupervisorRouteConsumer, SupervisorRouteModule,
+    ModuleProtocol, NotReadyReason, PollKind, RouteCloseReason, RunningImageAgreement,
+    RunningImageEvidence, SpawnCursor, SpawnEvent, SpawnEventKind, SpawnSnapshot,
+    StderrCaptureState, StderrTail, StderrTailEntry, SupervisorDaemonProvenance, SupervisorEntry,
+    SupervisorHealthEntry, SupervisorHealthStatus, SupervisorModuleProvenance,
+    SupervisorObservedProcess, SupervisorRescanResult, SupervisorRoute, SupervisorRouteConsumer,
+    SupervisorRouteModule,
 };
 use subc_protocol::{
     manifest::{
@@ -44,6 +45,17 @@ fn control_wire_shapes_match_golden_json_and_round_trip() {
     assert_golden(
         "catalog_entry_without_operation_description",
         &catalog_entry_without_operation_description(),
+    );
+    assert_golden(
+        "catalog_entry_required_capability_unprovided",
+        &CatalogEntry {
+            ready: false,
+            not_ready: Some(NotReadyReason {
+                reason: NotReadyReason::REQUIRED_CAPABILITY_UNPROVIDED.to_string(),
+                capability: Some("project-identity/v1".to_string()),
+            }),
+            ..catalog_entry_without_capabilities()
+        },
     );
     assert_golden(
         "client_control_response_catalog_list_without_capabilities",
@@ -774,6 +786,7 @@ fn catalog_entry() -> CatalogEntry {
     CatalogEntry {
         module_id: "aft-tools".to_string(),
         ready: true,
+        not_ready: None,
         module_version: Some("0.9.3".to_string()),
         roles: provider_roles(),
         control_ops: vec!["route.bind".to_string(), "route.status".to_string()],
@@ -793,6 +806,7 @@ fn catalog_entry_with_self_signals() -> CatalogEntry {
     CatalogEntry {
         module_id: "signal-tools".to_string(),
         ready: true,
+        not_ready: None,
         module_version: Some("0.10.0".to_string()),
         roles: Vec::new(),
         control_ops: vec!["route.bind".to_string(), "route.status".to_string()],
@@ -830,6 +844,7 @@ fn catalog_entry_without_capabilities() -> CatalogEntry {
     CatalogEntry {
         module_id: "legacy-tools".to_string(),
         ready: true,
+        not_ready: None,
         module_version: Some("0.8.0".to_string()),
         roles: Vec::new(),
         control_ops: vec!["route.bind".to_string(), "route.status".to_string()],
@@ -842,6 +857,7 @@ fn catalog_entry_without_operation_description() -> CatalogEntry {
     CatalogEntry {
         module_id: "legacy-management".to_string(),
         ready: true,
+        not_ready: None,
         module_version: Some("0.7.0".to_string()),
         roles: vec![ProviderRole::ManagementSurface {
             operations: vec![ManagementOperation {

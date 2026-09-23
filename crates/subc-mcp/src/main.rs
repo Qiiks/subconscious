@@ -5563,6 +5563,7 @@ mod tests {
             CatalogEntry {
                 module_id: module_id.to_string(),
                 ready: true,
+                not_ready: None,
                 module_version: None,
                 roles: vec![ProviderRole::ToolProvider {
                     tools: tool_names

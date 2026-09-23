@@ -14,9 +14,9 @@ use subc_daemon::{
 };
 use subc_protocol::{
     manifest::{
-        Concurrency, ExecutionMode, IdentityScope, ManifestProvenance, ModuleManifest,
-        ProviderRole, SelfSignalDeclaration, SelfSignalEffect, SelfSignalKind, SignalAnchor,
-        SignalCadence, Tool,
+        CapabilityDeclarations, CapabilityNeed, CapabilityRequirement, Concurrency, ExecutionMode,
+        IdentityScope, ManifestProvenance, ModuleManifest, ProviderRole, SelfSignalDeclaration,
+        SelfSignalEffect, SelfSignalKind, SignalAnchor, SignalCadence, Tool,
     },
     session::{
         ModuleControlRequest, ModuleControlRequestFromModule, ModuleControlResponse,
@@ -662,6 +662,397 @@ async fn a_new_daemon_registers_a_pre_diet_manifest_with_its_fields_present() {
     let (_generation, modules) = catalog_list(&server, Some(module_id), 211).await;
     assert_eq!(modules.len(), 1);
     assert_tool_names(&modules[0], &["legacy_tool"]);
+}
+
+// A module that declares a capability `need: required` is held not-ready, and
+// refused `module_warming` at route.open, while no registered module provides
+// that capability. The hold lifts as soon as a provider registers, with no
+// restart of either module.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn required_capability_unprovided_refuses_until_a_provider_registers() {
+    let server = TestServer::start().await;
+    let consumer_id = "reqcap-consumer";
+    let mut consumer = connect_endpoint(&server, "reqcap-consumer").await;
+    register_module(
+        &server,
+        &mut consumer,
+        capability_manifest(
+            consumer_id,
+            &[],
+            &[
+                ("reqcap-zeta/v1", CapabilityNeed::Required),
+                ("reqcap-identity/v1", CapabilityNeed::Required),
+            ],
+        ),
+        101,
+    )
+    .await;
+
+    // Lexicographically first unprovided capability, not declaration order.
+    let expected_detail = serde_json::json!({
+        "reason": "required_capability_unprovided",
+        "capability": "reqcap-identity/v1",
+    });
+    let (_, catalog) = catalog_list(&server, Some(consumer_id), 102).await;
+    assert!(
+        !catalog[0].ready,
+        "catalog must report the effective readiness"
+    );
+    assert_eq!(
+        serde_json::to_value(&catalog[0].not_ready).unwrap(),
+        expected_detail
+    );
+
+    let project = TestProject::new("reqcap-unprovided");
+    let mut client = connect_endpoint(&server, "reqcap-client").await;
+    let refused =
+        route_open_expect_refused(&mut client, &mut consumer, &project, consumer_id, 103).await;
+    assert_eq!(refused.code, "module_warming");
+    assert_eq!(refused.detail, Some(expected_detail));
+
+    let counters = server_describe_counters(&server, 104).await;
+    assert_eq!(
+        counters["route_open_refused_by_code"]["module_warming_required_capability_unprovided"],
+        1
+    );
+    let events = event_capture().events();
+    let log = refusal_event(&events, consumer_id);
+    assert_eq!(
+        log.fields.get("reason"),
+        Some(&"\"required_capability_unprovided\"".to_string())
+    );
+    assert_eq!(
+        log.fields.get("capability"),
+        Some(&"reqcap-identity/v1".to_string())
+    );
+
+    // One provider registering both capabilities lifts the hold; the consumer
+    // is not restarted or re-registered.
+    let mut provider = connect_endpoint(&server, "reqcap-provider").await;
+    register_module(
+        &server,
+        &mut provider,
+        capability_manifest(
+            "reqcap-provider",
+            &["reqcap-identity/v1", "reqcap-zeta/v1"],
+            &[],
+        ),
+        105,
+    )
+    .await;
+    let (_, catalog) = catalog_list(&server, Some(consumer_id), 106).await;
+    assert!(catalog[0].ready);
+    assert_eq!(catalog[0].not_ready, None);
+    route_open_expect_bound(&mut client, &mut consumer, &project, consumer_id, 107).await;
+}
+
+// A provider going away holds NEW opens to its consumer, and leaves routes
+// already bound to the consumer alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn required_capability_provider_leaving_refuses_new_opens_but_keeps_bound_routes() {
+    let server = TestServer::start().await;
+    let consumer_id = "reqcap-leave-consumer";
+    let provider_id = "reqcap-leave-provider";
+    let mut provider = connect_endpoint(&server, "reqcap-leave-provider").await;
+    register_module(
+        &server,
+        &mut provider,
+        capability_manifest(provider_id, &["reqcap-leave/v1"], &[]),
+        201,
+    )
+    .await;
+    let mut consumer = connect_endpoint(&server, "reqcap-leave-consumer").await;
+    register_module(
+        &server,
+        &mut consumer,
+        capability_manifest(
+            consumer_id,
+            &[],
+            &[("reqcap-leave/v1", CapabilityNeed::Required)],
+        ),
+        202,
+    )
+    .await;
+
+    let project = TestProject::new("reqcap-leave");
+    let mut client = connect_endpoint(&server, "reqcap-leave-client").await;
+    let route =
+        route_open_expect_bound(&mut client, &mut consumer, &project, consumer_id, 203).await;
+
+    drop(provider);
+    // The catalog reads the same verdicts route.open does, so once it reports
+    // the consumer not ready the next open must be refused.
+    let deadline = Instant::now() + SETUP_TIMEOUT;
+    loop {
+        let (_, catalog) = catalog_list(&server, Some(consumer_id), 204).await;
+        if !catalog[0].ready {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "consumer stayed ready after its required provider disconnected"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+    let refused =
+        route_open_expect_refused(&mut client, &mut consumer, &project, consumer_id, 205).await;
+    assert_eq!(refused.code, "module_warming");
+    assert_eq!(
+        refused.detail,
+        Some(serde_json::json!({
+            "reason": "required_capability_unprovided",
+            "capability": "reqcap-leave/v1",
+        }))
+    );
+
+    let request = br#"{"jsonrpc":"2.0","id":"after-leave","method":"a"}"#;
+    client
+        .send(&data_frame(
+            FrameType::Request,
+            route.client_channel,
+            route.client_epoch,
+            206,
+            request,
+        ))
+        .await;
+    let forwarded = consumer
+        .inbox
+        .wait_for(
+            SETUP_TIMEOUT,
+            "request on the already bound route",
+            |frame| {
+                frame.header.ty == FrameType::Request
+                    && frame.header.channel == route.module_channel
+                    && frame.header.corr == 206
+            },
+        )
+        .await;
+    assert_eq!(forwarded.body, request);
+    let response = br#"{"jsonrpc":"2.0","id":"after-leave","result":"ok"}"#;
+    consumer
+        .send(&data_frame(
+            FrameType::Response,
+            route.module_channel,
+            route.module_epoch,
+            206,
+            response,
+        ))
+        .await;
+    let delivered = client
+        .inbox
+        .wait_for(
+            SETUP_TIMEOUT,
+            "response on the already bound route",
+            |frame| {
+                frame.header.ty == FrameType::Response
+                    && frame.header.channel == route.client_channel
+                    && frame.header.corr == 206
+            },
+        )
+        .await;
+    assert_eq!(delivered.body, response);
+}
+
+// Two modules that require each other's capabilities are both routable once
+// both have registered. "Provided" means the claimant has registered; if it
+// meant the claimant is ready, each would wait on the other forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn required_capability_mutual_requirement_is_routable_once_both_register() {
+    let server = TestServer::start().await;
+    let alpha_id = "reqcap-mutual-alpha";
+    let beta_id = "reqcap-mutual-beta";
+    let mut alpha = connect_endpoint(&server, "reqcap-mutual-alpha").await;
+    register_module(
+        &server,
+        &mut alpha,
+        capability_manifest(
+            alpha_id,
+            &["reqcap-alpha/v1"],
+            &[("reqcap-beta/v1", CapabilityNeed::Required)],
+        ),
+        301,
+    )
+    .await;
+    let (_, catalog) = catalog_list(&server, Some(alpha_id), 302).await;
+    assert!(!catalog[0].ready, "alpha alone must wait for beta");
+
+    let mut beta = connect_endpoint(&server, "reqcap-mutual-beta").await;
+    register_module(
+        &server,
+        &mut beta,
+        capability_manifest(
+            beta_id,
+            &["reqcap-beta/v1"],
+            &[("reqcap-alpha/v1", CapabilityNeed::Required)],
+        ),
+        303,
+    )
+    .await;
+
+    let project = TestProject::new("reqcap-mutual");
+    let mut client = connect_endpoint(&server, "reqcap-mutual-client").await;
+    route_open_expect_bound(&mut client, &mut alpha, &project, alpha_id, 304).await;
+    route_open_expect_bound(&mut client, &mut beta, &project, beta_id, 305).await;
+    let (_, catalog) = catalog_list(&server, None, 306).await;
+    for id in [alpha_id, beta_id] {
+        let entry = catalog.iter().find(|entry| entry.module_id == id).unwrap();
+        assert!(entry.ready, "{id} must be routable: {:?}", entry.not_ready);
+    }
+}
+
+// An optional need with no provider holds nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn optional_capability_without_a_provider_does_not_hold_the_module() {
+    let server = TestServer::start().await;
+    let module_id = "reqcap-optional-consumer";
+    let mut module = connect_endpoint(&server, "reqcap-optional").await;
+    register_module(
+        &server,
+        &mut module,
+        capability_manifest(
+            module_id,
+            &[],
+            &[("reqcap-nobody/v1", CapabilityNeed::Optional)],
+        ),
+        401,
+    )
+    .await;
+    let (_, catalog) = catalog_list(&server, Some(module_id), 402).await;
+    assert!(catalog[0].ready);
+    assert_eq!(catalog[0].not_ready, None);
+    let project = TestProject::new("reqcap-optional");
+    let mut client = connect_endpoint(&server, "reqcap-optional-client").await;
+    route_open_expect_bound(&mut client, &mut module, &project, module_id, 403).await;
+}
+
+/// A routable tool provider carrying the given capability declarations.
+fn capability_manifest(
+    module_id: &str,
+    provides: &[&str],
+    requires: &[(&str, CapabilityNeed)],
+) -> ModuleManifest {
+    let mut manifest = tool_provider_manifest(module_id, &["a"], Concurrency::ModuleManaged);
+    manifest.capabilities = Some(CapabilityDeclarations {
+        provides: provides.iter().map(|id| (*id).to_string()).collect(),
+        requires: requires
+            .iter()
+            .map(|(capability, need)| CapabilityRequirement {
+                capability: (*capability).to_string(),
+                need: *need,
+            })
+            .collect(),
+        must_never_reach: Vec::new(),
+    });
+    manifest
+}
+
+fn route_open_frame(project: &TestProject, module_id: &str, corr: u64) -> Frame {
+    control_request_frame(
+        corr,
+        ClientControlRequest::RouteOpen {
+            target: RouteTarget::ToolProvider {
+                module_id: module_id.to_string(),
+            },
+            identity: BindIdentity::new(
+                project.path().to_path_buf(),
+                "opencode".to_string(),
+                format!("reqcap-{corr}"),
+            ),
+            consumer_identity: None,
+            consumer_capabilities: None,
+            admission_facts: None,
+        },
+    )
+}
+
+/// Send a route.open that must be refused. Watches the target module as well
+/// as the client, so an open that wrongly reaches the module fails here by
+/// name instead of as a timeout on a bind nobody acknowledges.
+async fn route_open_expect_refused(
+    client: &mut Endpoint,
+    module: &mut Endpoint,
+    project: &TestProject,
+    module_id: &str,
+    corr: u64,
+) -> ErrorBody {
+    client
+        .send(&route_open_frame(project, module_id, corr))
+        .await;
+    tokio::select! {
+        frame = client.inbox.wait_for(SETUP_TIMEOUT, "route.open terminal", |frame| {
+            frame.header.channel == 0
+                && frame.header.corr == corr
+                && matches!(frame.header.ty, FrameType::Response | FrameType::Error)
+        }) => {
+            assert_eq!(
+                frame.header.ty,
+                FrameType::Error,
+                "route.open to {module_id} must be refused: {}",
+                String::from_utf8_lossy(&frame.body)
+            );
+            serde_json::from_slice(&frame.body).unwrap()
+        }
+        bind = module.inbox.wait_for(SETUP_TIMEOUT, "route.bind", |frame| {
+            frame.header.ty == FrameType::Request && frame.header.channel == 0
+        }) => panic!(
+            "route.open reached {module_id} although a capability it requires has no provider: {bind:?}"
+        ),
+    }
+}
+
+/// Send a route.open that must bind, acknowledging the bind as the module.
+async fn route_open_expect_bound(
+    client: &mut Endpoint,
+    module: &mut Endpoint,
+    project: &TestProject,
+    module_id: &str,
+    corr: u64,
+) -> RoutePair {
+    client
+        .send(&route_open_frame(project, module_id, corr))
+        .await;
+    let bind_frame = tokio::select! {
+        bind = module.inbox.wait_for(SETUP_TIMEOUT, "route.bind request", |frame| {
+            frame.header.ty == FrameType::Request && frame.header.channel == 0
+        }) => bind,
+        refused = client.inbox.wait_for(SETUP_TIMEOUT, "route.open error", |frame| {
+            frame.header.channel == 0
+                && frame.header.corr == corr
+                && frame.header.ty == FrameType::Error
+        }) => panic!(
+            "route.open to {module_id} was refused: {}",
+            String::from_utf8_lossy(&refused.body)
+        ),
+    };
+    let ModuleControlRequest::RouteBind {
+        route_channel,
+        epoch: module_epoch,
+        ..
+    } = serde_json::from_slice(&bind_frame.body).unwrap()
+    else {
+        panic!("unexpected module control request: {bind_frame:?}");
+    };
+    module.send(&route_bind_ack(&bind_frame)).await;
+    let ack_frame = client
+        .inbox
+        .wait_for(SETUP_TIMEOUT, "route.open ack", |frame| {
+            frame.header.ty == FrameType::Response
+                && frame.header.channel == 0
+                && frame.header.corr == corr
+        })
+        .await;
+    match serde_json::from_slice(&ack_frame.body).unwrap() {
+        ClientControlResponse::RouteOpen {
+            route_channel: client_channel,
+            route_epoch: client_epoch,
+        } => RoutePair {
+            client_channel,
+            client_epoch,
+            module_channel: route_channel,
+            module_epoch,
+        },
+        other => panic!("unexpected route.open response: {other:?}"),
+    }
 }
 
 async fn register_module(

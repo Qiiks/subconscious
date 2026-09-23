@@ -1513,9 +1513,21 @@ pub struct CatalogEntry {
     pub module_id: String,
     /// Whether the registered module currently accepts new route binds.
     ///
-    /// Older daemons omit this field and are interpreted as ready.
+    /// This is the module's EFFECTIVE readiness: its own declared readiness
+    /// AND every one of its `need: required` capabilities having a registered
+    /// provider. It is exactly the condition `route.open` checks, so a caller
+    /// reading `false` here will be refused with `module_warming`; `not_ready`
+    /// says why.
+    ///
+    /// Older daemons omit this field and are interpreted as ready. Daemons that
+    /// predate `not_ready` report declared readiness only.
     #[serde(default = "default_true")]
     pub ready: bool,
+    /// Why `ready` is false, in the same shape `route.open` puts in the
+    /// `detail` of its `module_warming` refusal. Absent when the module is
+    /// ready, and absent from daemons that predate the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_ready: Option<NotReadyReason>,
     /// The registered module's self-declared build version, projected from its
     /// manifest so a consumer can tell WHICH BUILD of a module it is talking
     /// to at connect time.
@@ -1550,6 +1562,25 @@ pub struct CatalogEntry {
     /// manifest. The daemon relays these declarations without interpreting them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_signals: Option<Vec<SelfSignalDeclaration>>,
+}
+
+/// Why a registered module is not accepting new route binds.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotReadyReason {
+    /// `declared_not_ready` when the module itself said it is not ready, or
+    /// `required_capability_unprovided` when a capability it declares
+    /// `need: required` has no registered provider. Open vocabulary: a newer
+    /// daemon may add reasons.
+    pub reason: String,
+    /// For `required_capability_unprovided`, the lexicographically first
+    /// required capability that has no registered provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability: Option<String>,
+}
+
+impl NotReadyReason {
+    pub const DECLARED_NOT_READY: &'static str = "declared_not_ready";
+    pub const REQUIRED_CAPABILITY_UNPROVIDED: &'static str = "required_capability_unprovided";
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

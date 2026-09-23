@@ -1,0 +1,14 @@
+{
+  "control_ops": [
+    "route.bind",
+    "route.status"
+  ],
+  "module_id": "legacy-tools",
+  "module_version": "0.8.0",
+  "not_ready": {
+    "capability": "project-identity/v1",
+    "reason": "required_capability_unprovided"
+  },
+  "ready": false,
+  "roles": []
+}

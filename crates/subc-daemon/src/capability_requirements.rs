@@ -466,6 +466,21 @@ impl CapabilityRequirementEvaluator {
             .collect()
     }
 
+    /// The evaluator's last verdict for one consumer's requirement, or `None`
+    /// when no evaluation has recorded that pair yet (for example a module
+    /// whose HELLO landed after the most recent recompute).
+    pub(crate) fn verdict(&self, consumer: &str, capability: &str) -> Option<CapabilityVerdict> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .statuses
+            .get(&RequirementKey {
+                consumer: consumer.to_string(),
+                capability: capability.to_string(),
+            })
+            .map(|status| status.verdict)
+    }
+
     pub(crate) fn required_problem_detail(&self, module_id: &str) -> Option<String> {
         let problems = self
             .statuses()

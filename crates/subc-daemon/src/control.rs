@@ -10,16 +10,17 @@ use serde::{Deserialize, Serialize};
 use subc_control::{
     ops, CapabilityRequirementStatus, CatalogEntry, ClientControlPush, ClientControlRequest,
     ClientControlResponse, ConsumerIdentity, DaemonBuildProvenance, DaemonObservedProcess,
-    ModuleDeclaredProvenance, ModuleProtocol, PollKind, RouteCloseReason, SpawnCursor,
-    StderrCaptureState, StderrTail, StderrTailEntry, SupervisorDaemonProvenance, SupervisorEntry,
-    SupervisorHealthEntry, SupervisorModuleProvenance, SupervisorObservedProcess,
+    ModuleDeclaredProvenance, ModuleProtocol, NotReadyReason, PollKind, RouteCloseReason,
+    SpawnCursor, StderrCaptureState, StderrTail, StderrTailEntry, SupervisorDaemonProvenance,
+    SupervisorEntry, SupervisorHealthEntry, SupervisorModuleProvenance, SupervisorObservedProcess,
     SupervisorRescanResult, SupervisorRoute, SupervisorRouteConsumer, SupervisorRouteModule,
 };
 use subc_protocol::{
     error_codes,
     manifest::{
         validate_hello_capability_grammar, validate_hello_self_signal_declarations,
-        CapabilityDeclarations, Concurrency, ManifestProvenance, ModuleManifest, ProviderRole,
+        CapabilityDeclarations, CapabilityNeed, Concurrency, ManifestProvenance, ModuleManifest,
+        ProviderRole,
     },
     session::{
         HealthReport, ModuleControlPush, ModuleControlRequest, ModuleControlRequestFromModule,
@@ -35,7 +36,8 @@ use tracing::{debug, info, warn};
 use crate::{
     capability_requirements::{
         log_duplicate_claim_events, log_requirement_events, CapabilityRequirementEvaluator,
-        DuplicateClaimSource, RegisteredModule, RequirementStatus, RuntimeModule,
+        CapabilityVerdict, DuplicateClaimSource, RegisteredModule, RequirementStatus,
+        RuntimeModule,
     },
     daemon_config::RestartRequiredSection,
     forwarding::{
@@ -43,7 +45,9 @@ use crate::{
         ModuleControlRpcCompletion, ModuleControlRpcOutcome, ModuleEndpointId,
         PendingModuleControlRpc, RouteBindRelayOutcome, RoutePollSnapshot, RouteRelease,
     },
-    observability::ROUTE_OPEN_REFUSED_DECLARED_NOT_READY,
+    observability::{
+        ROUTE_OPEN_REFUSED_DECLARED_NOT_READY, ROUTE_OPEN_REFUSED_REQUIRED_CAPABILITY_UNPROVIDED,
+    },
     provenance::{
         process_start_time, spawned_file_identity, ExecutableIdentityProbe, SpawnedFileIdentity,
     },
@@ -1045,6 +1049,74 @@ impl ControlHandler {
             );
             self.emit_route_goodbyes(module_goodbyes);
         }
+    }
+
+    /// Why a registered module is not accepting new route binds, or `None` when
+    /// it is. This is the module's effective readiness: its declared readiness
+    /// first, then every `need: required` capability it declares evaluating to
+    /// `provided`. `route.open` and `catalog.list` both read it here so the
+    /// catalog never reports a module routable that `route.open` would refuse.
+    fn not_ready_reason(
+        &self,
+        registration: &crate::registry::ModuleRegistration,
+    ) -> Option<NotReadyReason> {
+        if !registration.ready {
+            return Some(NotReadyReason {
+                reason: NotReadyReason::DECLARED_NOT_READY.to_string(),
+                capability: None,
+            });
+        }
+        self.first_unprovided_required_capability(registration)
+            .map(|capability| NotReadyReason {
+                reason: NotReadyReason::REQUIRED_CAPABILITY_UNPROVIDED.to_string(),
+                capability: Some(capability),
+            })
+    }
+
+    /// The lexicographically first capability this registration declares
+    /// `need: required` whose evaluator verdict is not `provided`.
+    ///
+    /// The verdicts are the capability evaluator's own; nothing here decides
+    /// what "provided" means. The evaluator counts a capability provided as
+    /// soon as a module claiming it has REGISTERED, not once that module is
+    /// ready. That distinction is what keeps two modules that require each
+    /// other's capabilities from deadlocking: if "provided" meant "the claimant
+    /// is ready", each would wait for the other to become ready first and
+    /// neither ever would. Do not tighten it to readiness.
+    ///
+    /// A required capability with no verdict at all means this registration's
+    /// HELLO or catalog.update landed after the last recompute; recompute once
+    /// rather than let a missing verdict read as either answer. If it is still
+    /// missing (the recompute itself failed) the capability counts as
+    /// unprovided: the refusal is retryable, and routing a module whose
+    /// required provider is unknown is the outcome this check exists to stop.
+    fn first_unprovided_required_capability(
+        &self,
+        registration: &crate::registry::ModuleRegistration,
+    ) -> Option<String> {
+        let required = registration
+            .manifest
+            .capabilities
+            .iter()
+            .flat_map(|declarations| declarations.requires.iter())
+            .filter(|requirement| requirement.need == CapabilityNeed::Required)
+            .map(|requirement| requirement.capability.as_str())
+            .collect::<BTreeSet<_>>();
+        if required.is_empty() {
+            return None;
+        }
+        let module_id = registration.manifest.module_id.as_str();
+        let verdict = |capability: &str| self.capability_evaluator.verdict(module_id, capability);
+        if required
+            .iter()
+            .any(|capability| verdict(capability).is_none())
+        {
+            self.refresh_capability_requirements();
+        }
+        required
+            .into_iter()
+            .find(|capability| verdict(capability) != Some(CapabilityVerdict::Provided))
+            .map(str::to_string)
     }
 
     fn capability_requirement_statuses(&self) -> Vec<CapabilityRequirementStatus> {
@@ -2145,10 +2217,12 @@ impl ControlHandler {
                     .unwrap_or(true)
             })
             .map(|registration| {
+                let not_ready = self.not_ready_reason(&registration);
                 let roles = registration.manifest.provides;
                 CatalogEntry {
                     module_id: registration.manifest.module_id,
-                    ready: registration.ready,
+                    ready: not_ready.is_none(),
+                    not_ready,
                     module_version: Some(registration.manifest.module_version),
                     roles,
                     control_ops: registration.control_ops,
@@ -2507,6 +2581,52 @@ impl ControlHandler {
                     ),
                     detail: Some(serde_json::json!({
                         "reason": "declared_not_ready"
+                    })),
+                },
+            )?]);
+        }
+
+        // Effective readiness, second half: a module that declares a capability
+        // `need: required` is not routable while that capability has no
+        // registered provider. It is enforced HERE, as a retryable routing
+        // refusal, and deliberately not as spawn ordering or a boot block. The
+        // module is still started and registered and can make its own calls;
+        // spawn ordering is a promise that cannot be kept once a provider
+        // crashes at runtime, and refusing to boot would stop the whole
+        // machine, including the tools needed to fix its configuration.
+        //
+        // "Provided" is the evaluator's verdict, which counts a provider as
+        // soon as it has REGISTERED, not once it is ready. Two modules that
+        // require each other's capabilities are therefore both routable once
+        // both register; counting readiness instead would deadlock them.
+        //
+        // Only new opens are refused. Routes already bound when a provider
+        // goes away stay bound: nothing here tears them down, and the module
+        // answers them as it can. Like the readiness read above this is
+        // best-effort against a provider registering or leaving concurrently.
+        if let Some(capability) = self.first_unprovided_required_capability(&registration) {
+            self.counters
+                .increment_route_open_refused(ROUTE_OPEN_REFUSED_REQUIRED_CAPABILITY_UNPROVIDED);
+            info!(
+                target: "control",
+                code = error_codes::MODULE_WARMING,
+                module_id = ?target_module_id,
+                connection_id = ctx.connection_id.get(),
+                reason = NotReadyReason::REQUIRED_CAPABILITY_UNPROVIDED,
+                capability = %capability,
+                "route.open refused"
+            );
+            return Ok(vec![control_error_body_frame(
+                &frame,
+                ErrorBody {
+                    code: error_codes::MODULE_WARMING.to_string(),
+                    message: format!(
+                        "module_id '{target_module_id}' requires capability '{capability}', \
+                         which no registered module provides; retry"
+                    ),
+                    detail: Some(serde_json::json!({
+                        "reason": NotReadyReason::REQUIRED_CAPABILITY_UNPROVIDED,
+                        "capability": capability,
                     })),
                 },
             )?]);

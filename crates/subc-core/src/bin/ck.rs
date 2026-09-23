@@ -27,7 +27,7 @@ use cortexkit_log::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse};
+use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse, NotReadyReason};
 use subc_daemon::{fleet_lint, machine_id, read_frame, write_frame, Frame, DEFAULT_DRAIN_TIMEOUT};
 use subc_protocol::{BindIdentity, Flags, FrameType, Priority, RouteTarget};
 use subc_transport::{
@@ -2134,9 +2134,22 @@ async fn module_status(
         .await?;
     let frame_drops = module_frame_drop_count(&describe, module_id);
     let undeclared_gauge_drains = drains_with_undeclared_gauge_count(&describe);
+    // The supervisor knows whether the process runs; only the catalog knows
+    // whether the daemon will route to it. A running, healthy module can still
+    // be refused `module_warming` because a capability it requires has no
+    // provider, and this is where an operator looks first.
+    let catalog_entry = client
+        .catalog_list()
+        .await?
+        .into_iter()
+        .find(|entry| entry.module_id == module_id);
 
     if json_output {
-        print_json(&json!({ "module": module, "health": health_entry }))?;
+        print_json(&json!({
+            "module": module,
+            "health": health_entry,
+            "catalog": catalog_entry,
+        }))?;
     } else {
         let provenance = client
             .rpc_value(ClientControlRequest::SupervisorProvenance {
@@ -2154,6 +2167,9 @@ async fn module_status(
             observed,
             verbose,
         );
+        if let Some(entry) = catalog_entry.as_ref().filter(|entry| !entry.ready) {
+            println!("  routing: {}", catalog_readiness_text(entry));
+        }
     }
     Ok(())
 }
@@ -2764,7 +2780,7 @@ async fn catalog_report(
                     .module_version
                     .clone()
                     .unwrap_or_else(|| "-".to_string()),
-                if entry.ready { "ready" } else { "not ready" }.to_string(),
+                catalog_readiness_text(entry),
                 entry.roles.len().to_string(),
             ]);
         }
@@ -2778,6 +2794,27 @@ async fn catalog_report(
         return Err(CkError::RenderedExit { exit_code: 1 });
     }
     Ok(())
+}
+
+/// The catalog's readiness cell, with the reason when a module is not
+/// routable so an operator does not have to guess why `route.open` is refused.
+fn catalog_readiness_text(entry: &CatalogEntry) -> String {
+    if entry.ready {
+        return "ready".to_string();
+    }
+    match &entry.not_ready {
+        Some(reason) if reason.reason == NotReadyReason::REQUIRED_CAPABILITY_UNPROVIDED => {
+            match &reason.capability {
+                Some(capability) => format!("not ready (requires {capability}: no provider)"),
+                None => "not ready (a required capability has no provider)".to_string(),
+            }
+        }
+        Some(reason) if reason.reason == NotReadyReason::DECLARED_NOT_READY => {
+            "not ready (declared by module)".to_string()
+        }
+        Some(reason) => format!("not ready ({})", humanize_identifier(&reason.reason)),
+        None => "not ready".to_string(),
+    }
 }
 
 async fn supervisor_routes(

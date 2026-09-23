@@ -22,6 +22,7 @@ use crate::registry::ConnectionId;
 const ROUTE_OPEN_REFUSAL_COUNTER_CODES: &[&str] = &[
     "module_warming",
     ROUTE_OPEN_REFUSED_DECLARED_NOT_READY,
+    ROUTE_OPEN_REFUSED_REQUIRED_CAPABILITY_UNPROVIDED,
     "target_unavailable",
     "module_removed",
     "module_no_protocol",
@@ -58,6 +59,15 @@ pub(crate) const ROUTE_OPEN_REFUSED_BREAKER_OPEN: &str = "module_timeout_breaker
 /// distinguish declared readiness from a supervised process that has not
 /// registered yet.
 pub(crate) const ROUTE_OPEN_REFUSED_DECLARED_NOT_READY: &str = "module_warming_declared_not_ready";
+
+/// Counter key for a registered, declared-ready module held not-ready because
+/// a capability it declares `need: required` has no registered provider.
+///
+/// The caller still receives `module_warming`; a separate key lets an operator
+/// tell "the module says it is warming" from "the module is waiting on a
+/// provider that is not running", which point at different fixes.
+pub(crate) const ROUTE_OPEN_REFUSED_REQUIRED_CAPABILITY_UNPROVIDED: &str =
+    "module_warming_required_capability_unprovided";
 
 /// Shared count of authenticated socket connections accepted by the daemon.
 #[derive(Debug, Clone, Default)]
