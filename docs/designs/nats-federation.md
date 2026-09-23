@@ -363,8 +363,11 @@ What shape 3 commits us to (CKCRED):
      which is a foundation change, and board state needs a merge rule.
    - **(b) Cross-machine rooms need the owner online to read.** Posts still arrive
      late but safe; reading the room waits for the owner. No foundation change.
-2. **Who mints the stable box id. DECIDED 2026-09-23: callosum**, as the
-   cross-machine module that owns machine identity. It must survive re-keys and
+2. **Who mints the stable box id. DECIDED 2026-09-23, revised the same day:
+   the daemon mints it as the machine id** (`docs/designs/machine-id-and-required-capabilities.md`),
+   so nothing on a single machine depends on callosum. Callosum announces it to
+   peers and keeps clone detection. The first ruling (callosum mints it) is
+   superseded; the text below is kept for the constraints, which still apply. It must survive re-keys and
    trust export/import, be opaque, and exist before any stream is created.
    CALLO's case for it: it can mint the id at store creation, a
    re-key leaves a separate id column in place, the trust export already carries
