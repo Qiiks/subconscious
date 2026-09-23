@@ -1,11 +1,13 @@
 # NATS across a user's machines: hub topology and end-to-end sealing
 
-Status: r2. r1 (c9f403c8) was reviewed by CALLO (callosum), CKCRED (key custody)
-and ALF (ck-bus and the foundation spec); their answers are folded in below and
-the changes from r1 are listed at the end. An Athena feasibility and
-threat-model pass is running on r1. Two decisions remain with the operator (see
-"Decisions needed"). The ck-bus spec's credential slices stay held until this
-settles.
+Status: r3. r1 (c9f403c8) was reviewed by CALLO (callosum), CKCRED (key custody)
+and ALF (ck-bus and the foundation spec), and by an Athena feasibility and
+threat-model panel (four seats). Their findings are folded in below; the changes
+are listed at the end. The panel's headline: no finding makes "the hub cannot
+read contents" unachievable, and the one it ranked blocking on r1 (the seal key
+anchored to a key the pairing never covered) is what r2 fixed. One decision
+remains open (rooms across machines). The ck-bus spec's credential slices stay
+held until this settles.
 
 ## What the operator settled
 
@@ -67,7 +69,8 @@ From Callosum:
   JetStream domains is store and forward). Order is kept per sender.
 - **Hub choices**: one of the user's always-on machines, or our hosted hub. A
   clustered hub across the user's own machines is ruled out: JetStream
-  clustering needs a majority, so two machines cannot form one.
+  clustering needs a majority, so a two-machine cluster stops accepting writes
+  as soon as either machine is unreachable, which is exactly a split.
 - **Hosted hub** = the same design with our server in the roster's hub row.
 
 ### Accounts and routing (ALF, CALLO)
@@ -82,11 +85,24 @@ From Callosum:
   `ck.{b}.peer.…`; the hub routes on subject interest inside the user's account;
   B's local stream binding catches it unchanged. A hosted hub isolates users by
   that one account.
-- **Leaf grant, tighter than the foundation's "`ck.{acct}.>` for the linked
-  accounts":** a box's leaf may subscribe only to its own `ck.{own}.>`, and may
-  publish to another box only on the cross-machine families below. Otherwise A's
-  leaf could subscribe to B's whole namespace (ciphertext, but the whole
-  envelope).
+- **The leaf carries a federation namespace, never the box's local subjects
+  (Athena, critical).** A leaf forwards any message on its bound account that
+  the far side shows interest in. If the leaf were bound to the box account, a
+  hub-side subscription on `ck.{own}.>` would pull the box's LOCAL traffic
+  across: local deliveries are unsealed (id plus plaintext digest, and some
+  slices carry bodies inline). So each box has a separate local **federation
+  account** bound to the leaf remote, holding only sealed cross-machine subjects
+  (an outbox and an inbox family), and **ck-bus is the only component that moves
+  messages between the box account and the federation account**, sealing on the
+  way out and opening on the way in. The restriction lives on the local server,
+  not in the hub-signed grant, because the hub signs that grant. This changes
+  the foundation, which gives ck-bus no workload publish rights: ck-bus gains
+  exactly the move between the two accounts and still holds no workload publish
+  rights in the box account (ALF agreed).
+- **Leaf grant, inside that federation account:** a box's leaf may subscribe
+  only to its own inbox, and may publish only to other boxes' inboxes on the
+  cross-machine families below. Effect subjects never exist in the federation
+  account at all, so EFFECT staying local is structural, not a grant rule.
 - **Which families cross machines: ROOM, WAKE and PEER. EFFECT and EFFECT_DEAD
   never do.** An effect intent means "run this where the session lives"; the
   work-queue claim does not survive a leaf hop. Enforced by the leaf publish
@@ -169,6 +185,16 @@ What does inherit the pairing is the Noise IK session. So:
 - Both removal paths — the tombstone and a local `roster retire` — clear the key
   record, and it joins the trust export/import set so a restored machine keeps
   its peers' keys under the same rules.
+- **Removal is not instantaneous (Athena).** Each sender stops sealing to a
+  removed machine when it learns of the removal, and must then durably fence
+  both sealing to it and accepting from it. A sender that is offline, or shown
+  stale state, keeps sealing to it until it learns. The removed machine can open
+  everything sealed to any key it kept, including copies the hub still holds.
+  Removal must also revoke that machine's leaf credential at the hub (the
+  account's revocation list, pushed as a claims update) and close its
+  connection; the callosum tombstone does not do that on its own, so the ceremony
+  has to wire it. A cooperative hub can purge the removed machine's inbox; a
+  hostile one cannot be forced to.
 - **This machine's own generation is carried in the trust document** too (CALLO).
   A restored box that reset its counter would publish fresh keys at a low
   generation, every peer would keep the stale record, and those are exactly the
@@ -188,11 +214,29 @@ What does inherit the pairing is the Noise IK session. So:
   is key-compromise-impersonable (RFC 9180 §9.1.1): whoever steals B's seal key
   could forge messages to B from any sender. With a signature, a stolen seal key
   lets the thief read B's mail and impersonate nobody.
-- **Both identities are bound into both layers**: the HPKE `info` carries
-  `sender_machine_id | recipient_machine_id`, and the signature covers
-  `version | sender | recipient | enc | ct`. Without the recipient in the signed
-  bytes, a signed body could be re-sealed to someone else; without the sender in
-  `info`, a sealed blob could be re-signed by someone who cannot read it.
+- **Sign inside, then seal, and bind the whole destination (Athena).** Every
+  agent on B shares B's key and the addressing lives in the cleartext subject,
+  so binding only the two machines would let the hub move a valid blob from one
+  agent or session to another on the same machine, or replay it later. The
+  sender signs a purpose-tagged context covering: envelope version, sender
+  machine, recipient machine, the full destination (family, `agent_id`, and
+  `session_id` or `room_id`), message id, a **per-sender sequence number**, and
+  the body. That signed plaintext is then sealed, with
+  `sender_machine_id | recipient_machine_id` also in the HPKE `info`. Signing
+  inside the seal also hides from the hub which key signed. The recipient
+  rejects any mismatch between the opened destination and the subject it
+  arrived on.
+- **Unsigned or unverifiable blobs are refused outright.** Base mode lets anyone
+  with B's public key produce a blob B can open, so a blob without a valid
+  signature by a paired sender's current key is never delivered.
+- **Per-sender sequence detects drop, replay and reorder.** The recipient keeps
+  a durable high-water mark per paired sender, deduplicates on (sender,
+  sequence), and reports gaps. With discard-new and days of max-age a gap means
+  loss or hub misbehaviour, never ordinary expiry, which is what makes "loss is
+  not acceptable" checkable against a hostile hub.
+- **An unopenable blob is quarantined, never acked.** A blob sealed to a retired
+  key generation, or failing verification, is neither `Absent` nor a digest
+  mismatch; it gets its own terminal disposition and is reported.
 - **Vault custody.** The seal private key is a new Claustrum kind (working name
   `KemKey`), refused by `get` and `sign`, usable only by a new in-vault
   `credential.open` that returns plaintext. `open` gets its own grant operation,
@@ -216,6 +260,20 @@ What does inherit the pairing is the Noise IK session. So:
 - **Headers**, if any are set; nothing sensitive may go in one, including the
   digest.
 - **Sizes, timing and the machine graph.**
+- **JetStream bookkeeping (Athena):** stream and durable consumer names, ack and
+  API subjects, delivery and redelivery counts, and ack timing, so the hub learns
+  when a message was read, not only when it was sent; `Nats-Msg-Id` and source
+  headers; and fan-out, since a broadcast sealed once per machine shows how many
+  machines are in the room.
+- **As operator of a hosted hub:** `$SYS` connection events, client IPs and each
+  machine's online windows. The operator can also mint users in the tenant's
+  account, so it can drop, delay or inject; injection is stopped by the
+  signatures, and drop is surfaced by the per-sender sequence.
+- **Never on the hub:** a box's census bucket and `$SYS` stay local; the
+  federation account carries neither.
+- **A hosted hub is never a recipient.** A broadcast to "all my machines" never
+  seals a copy to the hub's own identity. A self-hosted hub that is also one of
+  the user's machines is an ordinary endpoint for messages addressed to it.
 
 Hashing the ids was considered and dropped for now (ALF): the tokens are already
 pseudonyms, so hashing swaps one stable pseudonym for another. It would only help
@@ -319,6 +377,12 @@ What shape 3 commits us to (CKCRED):
 
 ## Remaining checks
 
+- An executable rig arm, not more reading, for the stock `nats-server` behaviour
+  every reviewer asserted from general knowledge: leaf routing from per-box
+  federation accounts into a per-user hub account, cross-domain sourcing through
+  a split, a subject-filtered purge of one recipient's inbox, and that local
+  subjects stay off the leaf under a hub-side subscription.
+
 - `SignatureCB` in the pinned `nats-server` version (SUBC).
 - ck-bus presents `ConsumerIdentity` on its `route.open`, since without it
   `sign` and `open` answer `not_found`, identical to "no such key" (ck-bus spec
@@ -343,3 +407,19 @@ What shape 3 commits us to (CKCRED):
 - Stated facts corrected: callosum has no stable box id, seal keys and `hub_read`
   are not built.
 - New decisions: rooms across machines, and who mints the stable box id.
+
+## Changes in r3
+
+- Callosum mints the stable box id (operator ruling); the rooms question widens
+  into a prefrontal-across-machines design pass.
+- Rotation needs the machines to meet; the old key stays openable until every
+  peer acknowledges the new generation; the machine's own generation rides the
+  trust document (CKCRED, CALLO).
+- Shape 3 leaf signing: its own vault identity, a named signer in connect
+  errors, and the rebuild commitment (CKCRED).
+- From Athena: a separate federation account so local plaintext can never cross
+  the leaf; sign-inside-then-seal over the full destination, message id and a
+  per-sender sequence; unsigned blobs refused and unopenable ones quarantined; a
+  fuller list of what the hub sees; a hosted hub is never a recipient; removal is
+  not instantaneous and must revoke the leaf credential; a rig arm for the
+  unverified NATS behaviour.
