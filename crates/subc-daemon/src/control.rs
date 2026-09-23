@@ -1103,6 +1103,7 @@ impl ControlHandler {
             ctx,
             frame,
             target_module_id,
+            "open_admission_full",
             error_codes::TARGET_UNAVAILABLE,
             message,
         )
@@ -2192,10 +2193,11 @@ impl ControlHandler {
         ctx: &RouteCtx,
         frame: &Frame,
         module_id: &str,
+        reason: &'static str,
         code: &'static str,
         message: impl Into<String>,
     ) -> Result<Frame, RouterError> {
-        self.observe_route_open_refusal(ctx, module_id, code);
+        self.observe_route_open_refusal(ctx, module_id, reason, code);
         control_error_frame(frame, code, message.into())
     }
 
@@ -2256,11 +2258,26 @@ impl ControlHandler {
     /// requester's bytes (an unknown target is whatever the client sent) and
     /// is Debug-formatted so control characters land in the log escaped
     /// rather than as terminal sequences for whoever tails it.
-    fn observe_route_open_refusal(&self, ctx: &RouteCtx, module_id: &str, code: &'static str) {
+    ///
+    /// `reason` names the check that refused, because one wire code has
+    /// several senders: after a module registers, `target_unavailable` can
+    /// come from a missing role, an inactive registration, a supervisor that
+    /// has not marked the process live, a missing forwarding connection, or a
+    /// failed relay, and a log that records only the code cannot say which of
+    /// them fired. It is a static, daemon-chosen label per branch, so it is
+    /// safe to print plainly and stays a closed set.
+    fn observe_route_open_refusal(
+        &self,
+        ctx: &RouteCtx,
+        module_id: &str,
+        reason: &'static str,
+        code: &'static str,
+    ) {
         self.counters.increment_route_open_refused(code);
         info!(
             target: "control",
             code,
+            reason,
             module_id = ?module_id,
             connection_id = ctx.connection_id.get(),
             "route.open refused"
@@ -2334,6 +2351,7 @@ impl ControlHandler {
         info!(
             target: "control",
             code,
+            reason = "supervised_not_registered",
             module_id = ?module_id,
             connection_id = ctx.connection_id.get(),
             state = %status.state,
@@ -2409,6 +2427,7 @@ impl ControlHandler {
                         ctx,
                         &frame,
                         &target_module_id,
+                        "protocol_none",
                         error_codes::MODULE_NO_PROTOCOL,
                         format!(
                             "module_id '{target_module_id}' is declared protocol: none; \
@@ -2436,6 +2455,7 @@ impl ControlHandler {
                     ctx,
                     &frame,
                     &target_module_id,
+                    "removed",
                     error_codes::MODULE_REMOVED,
                     format!("module_id '{target_module_id}' was removed {removed_ago_ms} ms ago"),
                 )?]);
@@ -2444,6 +2464,7 @@ impl ControlHandler {
                 ctx,
                 &frame,
                 &target_module_id,
+                "not_registered",
                 error_codes::UNKNOWN_MODULE,
                 format!("module_id '{target_module_id}' is not registered"),
             )?]);
@@ -2482,6 +2503,7 @@ impl ControlHandler {
                 ctx,
                 &frame,
                 &target_module_id,
+                "role_not_provided",
                 "target_unavailable",
                 format!("module_id '{target_module_id}' does not provide the requested target"),
             )?]);
@@ -2492,6 +2514,7 @@ impl ControlHandler {
                 ctx,
                 &frame,
                 &target_module_id,
+                "registration_not_active",
                 "target_unavailable",
                 format!("module_id '{target_module_id}' is not active"),
             )?]);
@@ -2506,6 +2529,7 @@ impl ControlHandler {
                 ctx,
                 &frame,
                 &target_module_id,
+                "reloading",
                 "module_reloading",
                 format!("module_id '{target_module_id}' is reloading"),
             )?]);
@@ -2521,6 +2545,7 @@ impl ControlHandler {
                 ctx,
                 &frame,
                 &target_module_id,
+                "supervisor_not_live",
                 "target_unavailable",
                 format!("module_id '{target_module_id}' is not live"),
             )?]);
@@ -2535,6 +2560,7 @@ impl ControlHandler {
                 ctx,
                 &frame,
                 &target_module_id,
+                "no_forwarding_connection",
                 "target_unavailable",
                 format!("module_id '{target_module_id}' has no live forwarding connection"),
             )?]);
@@ -2543,14 +2569,24 @@ impl ControlHandler {
         if let Some(error) =
             self.guard_module_control_op(&frame, &target_module_id, "route.bind")?
         {
-            self.observe_route_open_refusal(ctx, &target_module_id, "op_not_allowed");
+            self.observe_route_open_refusal(
+                ctx,
+                &target_module_id,
+                "op_not_allowed",
+                "op_not_allowed",
+            );
             return Ok(vec![error]);
         }
 
         let principal = match self.route_open_principal(&frame, consumer_identity)? {
             Ok(principal) => principal,
             Err(error) => {
-                self.observe_route_open_refusal(ctx, &target_module_id, "bad_consumer_identity");
+                self.observe_route_open_refusal(
+                    ctx,
+                    &target_module_id,
+                    "bad_consumer_identity",
+                    "bad_consumer_identity",
+                );
                 return Ok(vec![error]);
             }
         };
@@ -2580,6 +2616,7 @@ impl ControlHandler {
                         ctx,
                         &frame,
                         &target_module_id,
+                        "capability_deny_edge",
                         "capability_forbidden",
                         format!(
                             "module_id '{opening_module_id}' must never reach capability '{capability}' provided by '{target_module_id}'"
@@ -2600,6 +2637,7 @@ impl ControlHandler {
                     ctx,
                     &frame,
                     &target_module_id,
+                    "admission_facts_carrier_not_permitted",
                     "admission_facts_not_permitted",
                     "admission facts may only be carried by the configured reserved module",
                 )?]);
@@ -2614,6 +2652,7 @@ impl ControlHandler {
                     ctx,
                     &frame,
                     &target_module_id,
+                    "admission_facts_target_not_listed",
                     "admission_facts_target_not_allowed",
                     format!(
                         "admission facts are not permitted for target module_id '{target_module_id}'"
@@ -2741,6 +2780,7 @@ impl ControlHandler {
                     ctx,
                     &frame,
                     &target_module_id,
+                    "relay_reservation_failed",
                     forwarding_error_code(&err),
                     err.to_string(),
                 )?])
@@ -2808,6 +2848,7 @@ impl ControlHandler {
                 ctx,
                 &frame,
                 &target_module_id,
+                "relay_send_failed",
                 "target_unavailable",
                 err.to_string(),
             )?]);
@@ -2873,6 +2914,7 @@ impl ControlHandler {
                     ctx,
                     &frame,
                     &target_module_id,
+                    "relay_abandoned",
                     "target_unavailable",
                     message,
                 )?])
@@ -2884,6 +2926,7 @@ impl ControlHandler {
                     ctx,
                     &frame,
                     &target_module_id,
+                    "relay_waiter_canceled",
                     "target_unavailable",
                     "route.bind relay waiter was canceled before the module responded",
                 )?])
@@ -2921,6 +2964,7 @@ impl ControlHandler {
                     ctx,
                     &frame,
                     &target_module_id,
+                    "relay_timed_out",
                     "module_timeout",
                     format!(
                         "module_id '{target_module_id}' did not answer route.bind within {:?}",
@@ -7999,6 +8043,40 @@ mod tests {
             .contains("state=running, enabled=true, live=false"));
     }
 
+    /// One wire code has several senders, so the refusal line names the check
+    /// that refused. This drives the shared refusal path (every non-supervised
+    /// refusal goes through `route_open_refusal_frame`) with an unregistered
+    /// target and requires the branch label on the event.
+    #[tokio::test]
+    async fn route_open_refusal_names_the_check_that_refused() {
+        let handler = ControlHandler::new(Arc::new(Registry::default()));
+        let capture = EventCapture::default();
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+        let (ctx, _rx) = route_ctx(ConnectionId::new(95));
+        let response = handler
+            .handle_control_frame(
+                &ctx,
+                route_open_frame(395, "nobody", unique_project_root("refusal-reason")),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(parse_error(&response[0])["code"], "unknown_module");
+        let event = capture
+            .events()
+            .into_iter()
+            .find(|event| {
+                event.target == "control"
+                    && event.fields.get("code") == Some(&"\"unknown_module\"".to_string())
+            })
+            .expect("route.open refusal event");
+        assert_eq!(
+            event.fields.get("reason"),
+            Some(&"\"not_registered\"".to_string())
+        );
+    }
+
     #[tokio::test]
     async fn route_open_supervised_absence_emits_refusal_fields_and_counts_code() {
         let registry = Arc::new(Registry::default());
@@ -8060,6 +8138,10 @@ mod tests {
             Some(&"\"warming\"".to_string())
         );
         assert_eq!(event.fields.get("connection_id"), Some(&"94".to_string()));
+        assert_eq!(
+            event.fields.get("reason"),
+            Some(&"\"supervised_not_registered\"".to_string())
+        );
         assert_eq!(event.fields.get("state"), Some(&"running".to_string()));
         assert_eq!(event.fields.get("enabled"), Some(&"true".to_string()));
         assert_eq!(event.fields.get("live"), Some(&"false".to_string()));

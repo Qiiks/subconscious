@@ -446,7 +446,11 @@ async fn declared_not_ready_and_supervised_absence_are_observably_distinct() {
     );
     assert!(!declared_log.fields.contains_key("state"));
     let absent_log = refusal_event(&events, absent_id);
-    assert!(!absent_log.fields.contains_key("reason"));
+    // Both refusals name their check; what tells them apart is the value.
+    assert_eq!(
+        absent_log.fields.get("reason"),
+        Some(&"\"supervised_not_registered\"".to_string())
+    );
     assert_eq!(absent_log.fields.get("state"), Some(&"running".to_string()));
     assert_eq!(absent_log.fields.get("enabled"), Some(&"true".to_string()));
     assert_eq!(absent_log.fields.get("live"), Some(&"false".to_string()));

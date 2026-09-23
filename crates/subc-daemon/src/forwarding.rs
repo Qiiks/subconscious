@@ -1747,7 +1747,51 @@ fn begin_drain_locked(
     }
 }
 
+/// What a drain that timed out was still waiting on, for the log line that
+/// reports the timeout. Counts only: per-request ages are not tracked.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct DrainHoldouts {
+    /// Requests still counted against the drain (subscriptions flagged as
+    /// such are excluded from the drain and not counted here).
+    pub(crate) requests: usize,
+    /// Routes holding at least one of those requests.
+    pub(crate) routes: usize,
+    /// Every route on the endpoint, for scale.
+    pub(crate) total_routes: usize,
+    /// The client connections holding the most requests, largest first, at
+    /// most three: enough to name the consumer without listing every route.
+    pub(crate) top_connections: Vec<(u64, usize)>,
+}
+
 impl ForwardingTable {
+    /// Summarise the requests one endpoint's drain is still waiting on.
+    pub(crate) fn endpoint_drain_holdouts(
+        &self,
+        endpoint: ModuleEndpointId,
+    ) -> Result<DrainHoldouts, ForwardingError> {
+        let inner = self.read_inner()?;
+        let mut holdouts = DrainHoldouts::default();
+        let mut by_connection: HashMap<u64, usize> = HashMap::new();
+        for (key, route) in &inner.client_to_module {
+            if route.module_endpoint != endpoint {
+                continue;
+            }
+            holdouts.total_routes += 1;
+            let held = route.flow.drain_in_flight();
+            if held == 0 {
+                continue;
+            }
+            holdouts.requests += held;
+            holdouts.routes += 1;
+            *by_connection.entry(key.connection_id.get()).or_default() += held;
+        }
+        let mut connections = by_connection.into_iter().collect::<Vec<_>>();
+        connections.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+        connections.truncate(3);
+        holdouts.top_connections = connections;
+        Ok(holdouts)
+    }
+
     pub(crate) fn endpoint_in_flight_count(
         &self,
         endpoint: ModuleEndpointId,
@@ -3084,6 +3128,53 @@ mod tests {
         forwarding
             .begin_route_bind_relay_for_test(client_connection, client_sink, corr, module_id)
             .unwrap()
+    }
+
+    /// The drain-timeout line reports these numbers, so they must count the
+    /// requests the drain is waiting on and no others: a route with nothing in
+    /// flight is not a holdout, and a flagged subscription is excluded from the
+    /// drain and so from the count.
+    #[tokio::test]
+    async fn drain_holdouts_count_held_requests_and_name_the_connection() {
+        let (forwarding, module_connection, endpoint, client, sink, mut client_rx) =
+            route_fixture("holdouts");
+        let mut bound = |corr| {
+            let route = begin_test_route(&forwarding, client, sink.clone(), corr, "holdouts");
+            forwarding
+                .complete_pending_relay(
+                    module_connection,
+                    route.corr,
+                    RouteBindRelayOutcome::Accepted,
+                )
+                .unwrap();
+            client_rx.try_recv().unwrap();
+            match forwarding
+                .lookup_data_route(client, route.client_channel, route.client_epoch)
+                .unwrap()
+            {
+                DataRoute::Client(DataRouteState::Bound(binding)) => binding,
+                other => panic!("expected live route, got {other:?}"),
+            }
+        };
+        let holding = bound(61);
+        let _idle = bound(62);
+        holding.flow.acquire_tagged(1, false).await.unwrap();
+        holding.flow.acquire_tagged(2, false).await.unwrap();
+        holding.flow.acquire_tagged(3, true).await.unwrap();
+        forwarding
+            .begin_module_drain("holdouts", RouteCloseReason::Restart)
+            .unwrap();
+
+        let holdouts = forwarding.endpoint_drain_holdouts(endpoint).unwrap();
+        assert_eq!(
+            holdouts,
+            DrainHoldouts {
+                requests: 2,
+                routes: 1,
+                total_routes: 2,
+                top_connections: vec![(client.get(), 2)],
+            }
+        );
     }
 
     #[test]

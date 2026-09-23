@@ -6018,10 +6018,22 @@ async fn begin_forwarding_drain_with(
                 "forwarding quiescence wait failed after route.closing; forcing route.closed(drained: false) so the client is not left waiting on an unfulfilled promise"
             );
         } else if !drained {
+            // Name what the drain waited on. Without it the line says only that
+            // something did not settle, and "one wedged call" and "every
+            // session's held stream" read the same; the first is a module bug,
+            // the second is a module that should end its streams on
+            // module.draining. Read before teardown releases the routes.
+            let holdouts = forwarding
+                .endpoint_drain_holdouts(target.endpoint)
+                .unwrap_or_default();
             warn!(
                 module_id = %spec.module_id,
                 waited = ?drain_timeout,
                 ?reason,
+                held_requests = holdouts.requests,
+                held_routes = holdouts.routes,
+                total_routes = holdouts.total_routes,
+                top_connections = ?holdouts.top_connections,
                 "route drain timed out before request quiescence; forcing teardown"
             );
         }
