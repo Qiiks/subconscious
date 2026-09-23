@@ -49,3 +49,9 @@ members = [
 # every reachable panic in the tree from a single dropped request into a
 # fleet-wide outage, and no test would fail. Change it only deliberately.
 panic = "unwind"
+
+# The daemon's executable-identity probe hashes whole images. In tests the
+# daemon runs in-process, so its own image is the large test executable; fast
+# SHA-256 compression keeps that first provenance request responsive in debug.
+[profile.dev.package.sha2]
+opt-level = 3
