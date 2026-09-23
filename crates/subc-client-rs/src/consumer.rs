@@ -3537,10 +3537,26 @@ impl RouteKey {
     }
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Clone, Hash, PartialEq, Eq)]
 struct ConsumerIdentityKey {
     module_id: String,
     launch_nonce: String,
+}
+
+// Hand-written so the launch nonce is never printed. The nonce is the credential
+// that attributes a connection to a supervised module, and a derived Debug would
+// write it into any log line or panic message that formats this value. This key sits
+// inside the route cache key, which is formatted in logs.
+impl fmt::Debug for ConsumerIdentityKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConsumerIdentityKey")
+            .field("module_id", &self.module_id)
+            .field(
+                "launch_nonce",
+                &format_args!("<{} bytes redacted>", self.launch_nonce.len()),
+            )
+            .finish()
+    }
 }
 
 impl From<&ConsumerIdentity> for ConsumerIdentityKey {
@@ -6569,5 +6585,28 @@ mod tests {
             .expect("catalog.list must finish at its configured deadline")
             .unwrap_err();
         assert!(matches!(result, CallError::NotSent(_)));
+    }
+}
+
+#[cfg(test)]
+mod launch_nonce_redaction_tests {
+    use super::*;
+
+    const NONCE: &str = "nonce-f00dfeed1234abcd";
+
+    #[test]
+    fn option_types_and_route_keys_never_print_the_nonce() {
+        let identity = ConsumerIdentity {
+            module_id: "wernicke".to_string(),
+            launch_nonce: NONCE.to_string(),
+        };
+        let call = CallOptions {
+            consumer_identity: Some(identity.clone()),
+            ..CallOptions::default()
+        };
+        let key = ConsumerIdentityKey::from(&identity);
+        for printed in [format!("{call:?}"), format!("{key:?}")] {
+            assert!(!printed.contains(NONCE), "launch nonce printed: {printed}");
+        }
     }
 }

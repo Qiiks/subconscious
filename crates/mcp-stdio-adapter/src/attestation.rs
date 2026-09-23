@@ -3,10 +3,26 @@ use std::{env, fmt};
 use subc_protocol::{SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV};
 
 /// Startup-only daemon attestation retained after its environment carrier is scrubbed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct StartupAttestation {
     module_id: String,
     launch_nonce: String,
+}
+
+// Hand-written so the launch nonce is never printed. The nonce is the credential
+// that attributes a connection to a supervised module, and a derived Debug would
+// write it into any log line or panic message that formats this value. Same
+// reasoning as ConnectionInfo's Debug in subc-transport.
+impl fmt::Debug for StartupAttestation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StartupAttestation")
+            .field("module_id", &self.module_id)
+            .field(
+                "launch_nonce",
+                &format_args!("<{} bytes redacted>", self.launch_nonce.len()),
+            )
+            .finish()
+    }
 }
 
 impl StartupAttestation {
@@ -123,5 +139,24 @@ mod tests {
             Some(value) => env::set_var(name, value),
             None => env::remove_var(name),
         }
+    }
+}
+
+#[cfg(test)]
+mod launch_nonce_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn startup_attestation_debug_never_prints_the_nonce() {
+        let attestation = StartupAttestation {
+            module_id: "mcp-stdio".to_string(),
+            launch_nonce: "nonce-f00dfeed1234abcd".to_string(),
+        };
+        let printed = format!("{attestation:?}");
+        assert!(printed.contains("mcp-stdio"), "{printed}");
+        assert!(
+            !printed.contains("nonce-f00dfeed1234abcd"),
+            "launch nonce printed: {printed}"
+        );
     }
 }

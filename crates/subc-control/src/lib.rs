@@ -70,10 +70,26 @@ macro_rules! open_string_enum {
 }
 
 /// Daemon-spawned consumer identity presented on route.open.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ConsumerIdentity {
     pub module_id: String,
     pub launch_nonce: String,
+}
+
+// Hand-written so the launch nonce is never printed. The nonce is the credential
+// that attributes a connection to a supervised module, and a derived Debug would
+// write it into any log line or panic message that formats this value. Same
+// reasoning as ConnectionInfo's Debug in subc-transport.
+impl std::fmt::Debug for ConsumerIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConsumerIdentity")
+            .field("module_id", &self.module_id)
+            .field(
+                "launch_nonce",
+                &format_args!("<{} bytes redacted>", self.launch_nonce.len()),
+            )
+            .finish()
+    }
 }
 
 /// Reserved dotted operation prefixes for the v0.4 control vocabulary.
@@ -2349,5 +2365,45 @@ mod tests {
             modules[0].routes[1].consumer,
             SupervisorRouteConsumer::Direct { connection_id: 7 }
         );
+    }
+}
+
+#[cfg(test)]
+mod launch_nonce_redaction_tests {
+    use super::*;
+
+    const NONCE: &str = "nonce-f00dfeed1234abcd";
+
+    fn identity() -> ConsumerIdentity {
+        ConsumerIdentity {
+            module_id: "wernicke".to_string(),
+            launch_nonce: NONCE.to_string(),
+        }
+    }
+
+    #[test]
+    fn consumer_identity_debug_names_the_module_and_never_the_nonce() {
+        let printed = format!("{:?}", identity());
+        assert!(printed.contains("wernicke"), "{printed}");
+        assert!(!printed.contains(NONCE), "launch nonce printed: {printed}");
+    }
+
+    #[test]
+    fn route_open_request_debug_never_prints_the_nonce() {
+        let request = ClientControlRequest::RouteOpen {
+            target: subc_protocol::RouteTarget::ToolProvider {
+                module_id: "broca".to_string(),
+            },
+            identity: subc_protocol::BindIdentity::new(
+                PathBuf::from("/tmp/project"),
+                "test".to_string(),
+                "session".to_string(),
+            ),
+            consumer_identity: Some(identity()),
+            consumer_capabilities: None,
+            admission_facts: None,
+        };
+        let printed = format!("{request:?}");
+        assert!(!printed.contains(NONCE), "launch nonce printed: {printed}");
     }
 }

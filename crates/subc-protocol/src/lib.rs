@@ -301,7 +301,7 @@ impl ErrorBody {
 }
 
 /// Module-to-subc `HELLO` body used during module registration.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModuleHelloBody {
     pub manifest: manifest::ModuleManifest,
     pub protocol_ver: u8,
@@ -316,6 +316,27 @@ pub struct ModuleHelloBody {
     /// self-connecting providers, which are never nonce-checked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_nonce: Option<String>,
+}
+
+// Hand-written so the launch nonce is never printed. The nonce is the credential
+// that attributes a connection to a supervised module, and a derived Debug would
+// write it into any log line or panic message that formats this value. Same
+// reasoning as ConnectionInfo's Debug in subc-transport.
+impl fmt::Debug for ModuleHelloBody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ModuleHelloBody")
+            .field("manifest", &self.manifest)
+            .field("protocol_ver", &self.protocol_ver)
+            .field("control_ops", &self.control_ops)
+            .field(
+                "launch_nonce",
+                &self
+                    .launch_nonce
+                    .as_ref()
+                    .map(|nonce| format!("<{} bytes redacted>", nonce.len())),
+            )
+            .finish()
+    }
 }
 
 /// subc-to-module `HELLO_ACK` body used during module registration.
@@ -1041,6 +1062,27 @@ mod tests {
         assert_eq!(
             decode_header(&h.encode()),
             Err(DecodeError::NonzeroEpochOnControlChannel { epoch: u32::MAX })
+        );
+    }
+}
+
+#[cfg(test)]
+mod launch_nonce_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn hello_body_debug_never_prints_the_nonce() {
+        let body = ModuleHelloBody {
+            manifest: manifest::ModuleManifest::builder("broca", "0.1.0").build(),
+            protocol_ver: 2,
+            control_ops: None,
+            launch_nonce: Some("nonce-f00dfeed1234abcd".to_string()),
+        };
+        let printed = format!("{body:?}");
+        assert!(printed.contains("broca"), "{printed}");
+        assert!(
+            !printed.contains("nonce-f00dfeed1234abcd"),
+            "launch nonce printed: {printed}"
         );
     }
 }
