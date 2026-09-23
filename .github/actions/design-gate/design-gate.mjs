@@ -30,6 +30,15 @@ export const TRIVIAL_LABEL = "trivial";
 /** Hidden marker that lets a later run find the comment it already posted. */
 export const COMMENT_MARKER = "<!-- design-gate -->";
 
+/**
+ * Second hidden marker, carried in the same gate comment, recording that the
+ * gate itself pushed this pull request back to draft. Approving the linked
+ * issue marks a draft ready only when its comment carries this marker: a draft
+ * the author opened or left as a draft on purpose is the author's decision,
+ * and the gate should undo only what it did.
+ */
+export const CONVERTED_MARKER = "<!-- design-gate:converted -->";
+
 /** The name of the check run published from the issue arm. Must match the job id. */
 export const CHECK_NAME = "design-gate";
 
@@ -236,16 +245,39 @@ export function draftNote(linkedIssue) {
     : `Converted back to draft; it will be marked ready automatically once #${linkedIssue} is design-approved.`;
 }
 
-/** Comment body for a decision, or null when no comment should exist yet. */
+/**
+ * Comment body for a decision, or null when no comment should exist yet.
+ *
+ * `draftConverted` means "this pull request is a draft the gate is holding":
+ * either the gate converted it on this run, or an earlier run did and it is
+ * still a draft. The body then carries `CONVERTED_MARKER`, which is the only
+ * record the issue arm consults before marking a draft ready. The caller has
+ * to pass it on every run while the hold lasts, because the body is rebuilt
+ * from scratch each time and a run that dropped the marker would leave the
+ * draft stranded after approval.
+ */
 export function buildCommentBody(decision, { draftConverted = false, commentExists = false } = {}) {
   if (decision.conclusion === "success") {
     // Never open a conversation on a passing PR — only close the one already
-    // there, so the author is not left reading a stale blocker.
-    return commentExists ? `${COMMENT_MARKER}\n\n${decision.message}` : null;
+    // there, so the author is not left reading a stale blocker. The draft
+    // note would be stale here too, but the marker stays while the gate still
+    // holds the draft.
+    if (!commentExists) return null;
+    const parts = [COMMENT_MARKER];
+    if (draftConverted) parts.push(CONVERTED_MARKER);
+    parts.push(decision.message);
+    return parts.join("\n\n");
   }
-  const parts = [COMMENT_MARKER, decision.message];
+  const parts = [COMMENT_MARKER];
+  if (draftConverted) parts.push(CONVERTED_MARKER);
+  parts.push(decision.message);
   if (draftConverted) parts.push(draftNote(decision.linkedIssue));
   return parts.join("\n\n");
+}
+
+/** Whether a gate comment records that the gate converted its pull request to draft. */
+export function carriesConvertedMarker(comment) {
+  return Boolean(comment && (comment.body ?? "").includes(CONVERTED_MARKER));
 }
 
 /** Fetch the linked issue (if any) and decide. */
@@ -257,13 +289,22 @@ export async function evaluatePullRequest({ api, repoFullName, pullRequest, acti
   return decide({ pullRequest, repoFullName, issue, action });
 }
 
+/** The gate comment already on a pull request, or null. Throws when comments cannot be read. */
+async function findGateComment({ api, pullRequest }) {
+  const comments = await api.listComments(pullRequest.number);
+  return comments.find((comment) => (comment.body ?? "").includes(COMMENT_MARKER)) ?? null;
+}
+
 /**
  * Keep exactly one gate comment per pull request: create it the first time the
  * gate blocks, edit that same comment on every later run.
+ *
+ * `existing` is the gate comment as read earlier in the same run (null when
+ * there is none), so the caller can act on its markers before it is rewritten.
+ * `draftConverted` is whether the rewritten body should keep recording a
+ * gate-held draft; see `buildCommentBody`.
  */
-async function syncComment({ api, pullRequest, decision, draftConverted = false }) {
-  const comments = await api.listComments(pullRequest.number);
-  const existing = comments.find((comment) => (comment.body ?? "").includes(COMMENT_MARKER));
+async function syncComment({ api, pullRequest, decision, existing, draftConverted = false }) {
   const body = buildCommentBody(decision, { draftConverted, commentExists: Boolean(existing) });
   if (body === null) return { action: "none" };
   if (!existing) {
@@ -336,7 +377,21 @@ export async function runPullRequestGate({
 
   let comment = { action: "none" };
   try {
-    comment = await syncComment({ api, pullRequest, decision, draftConverted });
+    const existing = await findGateComment({ api, pullRequest });
+    // The converted marker is sticky while the pull request stays a draft, so
+    // a later `synchronize` or `edited` run does not erase the record the
+    // issue arm needs. Once the pull request is seen out of draft (the author
+    // or a maintainer marked it ready), the hold is over and the marker goes:
+    // a later draft is the author's own, not the gate's.
+    const gateHeld =
+      draftConverted || (pullRequest.isDraft && carriesConvertedMarker(existing));
+    comment = await syncComment({
+      api,
+      pullRequest,
+      decision,
+      existing,
+      draftConverted: gateHeld,
+    });
   } catch (error) {
     log.warn?.(`design-gate: could not post the gate comment on #${pullRequest.number}: ${error}`);
   }
@@ -346,8 +401,15 @@ export async function runPullRequestGate({
 
 /**
  * A maintainer labelled an issue `design-approved`: release the draft pull
- * requests that were waiting on it, and re-evaluate every open pull request
- * (draft or not) linking this issue.
+ * requests the gate itself converted while they waited on it, and re-evaluate
+ * every open pull request (draft or not) linking this issue.
+ *
+ * Only drafts whose gate comment carries `CONVERTED_MARKER` are marked ready.
+ * A draft the author opened as a draft, or left as one on purpose (say, to ask
+ * for design guidance), is the author's own decision, and approval must not
+ * flip it to ready under them. Such a draft still gets the green check and the
+ * updated comment. When the comments cannot be read, nothing is marked ready:
+ * the gate cannot tell whose draft it is, so it fails closed on the flip.
  *
  * Marking a PR ready with GITHUB_TOKEN does not start another workflow run, so
  * this arm also publishes the `design-gate` check run itself. Without that the
@@ -381,7 +443,18 @@ export async function runIssueLabeled({ api, checkApi, repoFullName, issue, log 
       continue;
     }
 
-    if (pullRequest.isDraft) {
+    let existing = null;
+    let commentReadable = true;
+    try {
+      existing = await findGateComment({ api, pullRequest });
+    } catch (error) {
+      commentReadable = false;
+      log.warn?.(
+        `design-gate: could not read the gate comment on #${number}; leaving its draft state alone: ${error}`,
+      );
+    }
+
+    if (commentReadable && pullRequest.isDraft && carriesConvertedMarker(existing)) {
       await api.markPullRequestReadyForReview(pullRequest.nodeId);
       released.push(number);
     }
@@ -391,10 +464,15 @@ export async function runIssueLabeled({ api, checkApi, repoFullName, issue, log 
       title: decision.title,
       summary: decision.message,
     });
-    try {
-      await syncComment({ api, pullRequest, decision });
-    } catch (error) {
-      log.warn?.(`design-gate: could not update the gate comment on #${number}: ${error}`);
+    // Rewritten without the converted marker in every case: a released draft
+    // is no longer held, and a pull request that was not released either was
+    // never held or is no longer a draft.
+    if (commentReadable) {
+      try {
+        await syncComment({ api, pullRequest, decision, existing });
+      } catch (error) {
+        log.warn?.(`design-gate: could not update the gate comment on #${number}: ${error}`);
+      }
     }
     updated.push(number);
   }

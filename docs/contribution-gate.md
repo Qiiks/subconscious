@@ -17,8 +17,15 @@ A pull request must link an issue carrying a maintainer-applied
 pull request back to draft, and publishes a failing `design-gate` check on the
 head commit.
 
-Applying `design-approved` to the issue later flips the waiting drafts to ready
-automatically and turns their check green, with no push required.
+Applying `design-approved` to the issue later turns the check green on every
+open pull request linking it, with no push required, and flips back to ready
+only the drafts the gate itself converted. The gate records each conversion as a
+second hidden marker (`<!-- design-gate:converted -->`) in its own comment; the
+marker stays while the pull request remains a draft and is dropped once any run
+sees it out of draft or approval releases it. A draft without that record, such
+as one the author opened as a draft to ask for design guidance, is the author's
+own decision and stays a draft. If the gate cannot read the comments it marks
+nothing ready.
 
 Bypasses are a maintainer-only `trivial` label on the pull request, and the
 `ci/**`, `train/**` and `alfonso/**` branch prefixes. The prefixes count only
@@ -214,8 +221,8 @@ against both files that actually run the gate.
 node --test scripts/design-gate.test.mjs
 ```
 
-**The suite is 114 arms.** That number is pinned here on purpose: a lift that
-reports anything other than `# tests 114` has a setup defect before it has a
+**The suite is 119 arms.** That number is pinned here on purpose: a lift that
+reports anything other than `# tests 119` has a setup defect before it has a
 gate. The security arms read the workflow and the action from disk, and a
 missing file reports as a named failure — `workflow file missing at <path>` —
 rather than as arms that quietly fail to register.

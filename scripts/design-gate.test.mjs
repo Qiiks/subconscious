@@ -19,6 +19,7 @@ import {
   buildCommentBody,
   CHECK_NAME,
   COMMENT_MARKER,
+  CONVERTED_MARKER,
   decide,
   draftNote,
   GATE_MESSAGE,
@@ -726,7 +727,13 @@ describe("runIssueLabeled", () => {
     const { api, checkApi, state } = createFixtureApi({
       issues: [labelled],
       pullRequests: [waiting],
-      comments: [{ id: 3, issueNumber: 101, body: `${COMMENT_MARKER}\n\n${GATE_MESSAGE}` }],
+      comments: [
+        {
+          id: 3,
+          issueNumber: 101,
+          body: `${COMMENT_MARKER}\n\n${CONVERTED_MARKER}\n\n${GATE_MESSAGE}`,
+        },
+      ],
     });
 
     const { released } = await runIssueLabeled({
@@ -753,7 +760,17 @@ describe("runIssueLabeled", () => {
       isDraft: true,
       body: "Approved issue: #42",
     });
-    const { api, checkApi, state } = createFixtureApi({ issues: [labelled], pullRequests: [waiting] });
+    const { api, checkApi, state } = createFixtureApi({
+      issues: [labelled],
+      pullRequests: [waiting],
+      comments: [
+        {
+          id: 4,
+          issueNumber: 106,
+          body: `${COMMENT_MARKER}\n\n${CONVERTED_MARKER}\n\n${GATE_MESSAGE}`,
+        },
+      ],
+    });
 
     const { released } = await runIssueLabeled({
       api,
@@ -865,6 +882,166 @@ describe("runIssueLabeled", () => {
     assert.deepEqual(updated, []);
     assert.equal(state.readyForReview.length, 0);
     assert.equal(state.checkRuns.length, 0);
+  });
+
+  // Approval undoes only what the gate did. The following arms drive the pull
+  // request arm first, so the record the issue arm reads is the one the gate
+  // actually writes rather than a hand-built comment.
+  function waitingOnApproval(number) {
+    const issue = { number: 42, state: "open", labels: [] };
+    const pr = pullRequest({ number, nodeId: `PR_node_${number}`, body: "Refs #42" });
+    const fixture = createFixtureApi({ issues: [issue], pullRequests: [pr] });
+    const runGate = (action) =>
+      runPullRequestGate({ ...fixture, repoFullName: REPO, pullRequest: pr, action, log: silentLog });
+    const approve = () => {
+      issue.labels = ["design-approved"];
+      return runIssueLabeled({ ...fixture, repoFullName: REPO, issue, log: silentLog });
+    };
+    return { ...fixture, pr, runGate, approve };
+  }
+
+  test("releases a draft the gate converted when its issue is approved", async () => {
+    const { pr, state, runGate, approve } = waitingOnApproval(110);
+
+    const blocked = await runGate("opened");
+    assert.equal(blocked.draftConverted, true);
+    assert.equal(pr.isDraft, true);
+    assert.ok(state.comments[0].body.includes(CONVERTED_MARKER));
+
+    const { released } = await approve();
+
+    assert.deepEqual(released, [110]);
+    assert.deepEqual(state.readyForReview, ["PR_node_110"]);
+    assert.equal(pr.isDraft, false);
+    assert.equal(state.checkRuns.at(-1).conclusion, "success");
+    // Released, so the hold is over and the record goes with it.
+    assert.ok(!state.comments[0].body.includes(CONVERTED_MARKER));
+  });
+
+  test("does not release an author's own draft linking the approved issue", async () => {
+    // One draft has never been touched by the gate; the other has a gate
+    // comment (the gate blocked it) but was already a draft, so the gate never
+    // converted it. Neither is the gate's to release.
+    const noComment = pullRequest({
+      number: 111,
+      nodeId: "PR_node_111",
+      isDraft: true,
+      body: "Draft for design guidance. Refs #42",
+      headSha: "d".repeat(40),
+    });
+    const unmarked = pullRequest({
+      number: 112,
+      nodeId: "PR_node_112",
+      isDraft: true,
+      body: "Refs #42",
+      headSha: "e".repeat(40),
+    });
+    const { api, checkApi, state } = createFixtureApi({
+      issues: [labelled],
+      pullRequests: [noComment, unmarked],
+      comments: [{ id: 9, issueNumber: 112, body: `${COMMENT_MARKER}\n\n${GATE_MESSAGE}` }],
+    });
+
+    const { released, updated } = await runIssueLabeled({
+      api,
+      checkApi,
+      repoFullName: REPO,
+      issue: labelled,
+      log: silentLog,
+    });
+
+    assert.deepEqual(released, []);
+    assert.deepEqual(state.readyForReview, []);
+    assert.equal(noComment.isDraft, true);
+    assert.equal(unmarked.isDraft, true);
+    assert.deepEqual(updated, [111, 112]);
+    assert.deepEqual(
+      state.checkRuns.map((run) => [run.headSha, run.conclusion, run.via]),
+      [
+        ["d".repeat(40), "success", "check"],
+        ["e".repeat(40), "success", "check"],
+      ],
+    );
+    assert.ok(!state.comments[0].body.includes(GATE_MESSAGE));
+  });
+
+  test("the converted marker survives a synchronize run while the PR stays a draft", async () => {
+    const { pr, state, runGate, approve } = waitingOnApproval(113);
+
+    await runGate("opened");
+    assert.equal(pr.isDraft, true);
+
+    const pushed = await runGate("synchronize");
+    assert.equal(pushed.draftConverted, false);
+    assert.equal(state.comments.length, 1);
+    assert.ok(state.comments[0].body.includes(CONVERTED_MARKER));
+    assert.ok(state.comments[0].body.includes(draftNote(42)));
+
+    const { released } = await approve();
+    assert.deepEqual(released, [113]);
+    assert.equal(pr.isDraft, false);
+  });
+
+  test("the converted marker is cleared once a run sees the PR out of draft", async () => {
+    const { pr, state, runGate, approve } = waitingOnApproval(114);
+
+    await runGate("opened");
+    assert.ok(state.comments[0].body.includes(CONVERTED_MARKER));
+
+    // Someone marks it ready; the next run sees it out of draft.
+    pr.isDraft = false;
+    await runGate("synchronize");
+    assert.ok(!state.comments[0].body.includes(CONVERTED_MARKER));
+
+    // The author then turns it back into a draft themselves. That draft is
+    // theirs, so approval leaves it alone.
+    pr.isDraft = true;
+    const { released, updated } = await approve();
+    assert.deepEqual(released, []);
+    assert.deepEqual(updated, [114]);
+    assert.equal(pr.isDraft, true);
+    assert.equal(state.checkRuns.at(-1).conclusion, "success");
+  });
+
+  test("an unreadable gate comment releases nothing but still publishes the check", async () => {
+    const waiting = pullRequest({
+      number: 115,
+      nodeId: "PR_node_115",
+      isDraft: true,
+      body: "Refs #42",
+      headSha: "f".repeat(40),
+    });
+    const warnings = [];
+    const { api, checkApi, state } = createFixtureApi({
+      issues: [labelled],
+      pullRequests: [waiting],
+      comments: [
+        {
+          id: 10,
+          issueNumber: 115,
+          body: `${COMMENT_MARKER}\n\n${CONVERTED_MARKER}\n\n${GATE_MESSAGE}`,
+        },
+      ],
+      refuse: ["listComments"],
+    });
+
+    const { released, updated } = await runIssueLabeled({
+      api,
+      checkApi,
+      repoFullName: REPO,
+      issue: labelled,
+      log: { warn: (message) => warnings.push(message) },
+    });
+
+    assert.deepEqual(released, []);
+    assert.deepEqual(state.readyForReview, []);
+    assert.equal(waiting.isDraft, true);
+    assert.deepEqual(updated, [115]);
+    assert.equal(state.checkRuns.length, 1);
+    assert.equal(state.checkRuns[0].conclusion, "success");
+    assert.equal(state.checkRuns[0].headSha, "f".repeat(40));
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /#115/);
   });
 });
 

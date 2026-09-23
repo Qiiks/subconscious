@@ -108,6 +108,11 @@ jobs:
   # workflow run, so this job re-runs the gate logic itself and publishes the
   # `design-gate` check run on the PR head. Without that the PR would stay
   # blocked until the author pushed a commit.
+  #
+  # It marks ready only the drafts the gate itself converted (their gate
+  # comment carries the `design-gate:converted` marker). A draft the author
+  # left as a draft on purpose is theirs; it gets the green check but stays a
+  # draft.
   design-approved-sync:
     if: github.event_name == 'issues' && github.event.label.name == 'design-approved'
     runs-on: ubuntu-latest
