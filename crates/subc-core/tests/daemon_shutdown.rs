@@ -550,6 +550,41 @@ fn observer_records_after_marker(fixture: &Fixture) -> Vec<Value> {
         .collect()
 }
 
+/// The daemon's own log, every dated file concatenated.
+fn daemon_log(fixture: &Fixture) -> String {
+    let mut files: Vec<PathBuf> = fs::read_dir(fixture.root.join("data/cortexkit/run/logs"))
+        .map(|dir| {
+            dir.filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("subc"))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    files
+        .iter()
+        .map(|path| fs::read_to_string(path).unwrap_or_default())
+        .collect()
+}
+
+/// The supervisor's reap path, not only the record, must know the exit came
+/// from the shutdown: its crash arm is what schedules a respawn.
+fn assert_reap_saw_daemon_shutdown(fixture: &Fixture) {
+    let log = daemon_log(fixture);
+    assert!(
+        log.contains("supervised module exited during daemon shutdown"),
+        "the reap path did not treat the exit as part of the daemon shutdown:\n{log}"
+    );
+    assert!(
+        !log.contains("exited abnormally (crash)"),
+        "an exit during daemon shutdown was handled as a crash:\n{log}"
+    );
+}
+
 fn signal_pid(pid: i32, signal: rustix::process::Signal) {
     rustix::process::kill_process(rustix::process::Pid::from_raw(pid).unwrap(), signal).unwrap();
 }
@@ -592,6 +627,7 @@ fn module_exiting_nonzero_on_shutdown_eof_is_recorded_as_daemon_shutdown_and_not
         observer,
         "the module was respawned during daemon shutdown"
     );
+    assert_reap_saw_daemon_shutdown(&fixture);
 }
 
 /// A systemd unit with KillMode=control-group signals every module at the same
@@ -631,6 +667,7 @@ fn module_signalled_during_daemon_shutdown_is_recorded_as_daemon_shutdown_and_no
         observer,
         "the module was respawned during daemon shutdown"
     );
+    assert_reap_saw_daemon_shutdown(&fixture);
 }
 
 /// The control for the two above: the same signal while the daemon is NOT
