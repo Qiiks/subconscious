@@ -298,17 +298,24 @@ say "staged sidecar $sidecar: OK"
 # Deciding by location is how a seat that adopts the better format at the old
 # filename gets its correct declaration parsed as garbage -- which is exactly
 # what happened when PLEX rewrote ck-plexus.current in the new shape.
+# The currency pointer names the BINARY being placed, not the module id. A
+# module can ship more than one binary (plexus ships ck-plexus and
+# ck-plexus-admin), each with its own pointer; keying the lookup on --module
+# made the admin placement read the daemon's pointer and refuse a correct
+# artifact. CUR is the destination binary's name without its "ck-" prefix, so
+# for the usual single-binary module it equals --module and nothing changes.
+CUR=$(basename "$DEST"); CUR=${CUR#ck-}
 root_manifest=""
-for cand in "$(dirname "$staged_dir")/$MODULE.current" \
-            "$staged_dir/$MODULE.current" \
-            "$(dirname "$staged_dir")/ck-$MODULE.current" \
-            "$staged_dir/ck-$MODULE.current"; do
+for cand in "$(dirname "$staged_dir")/$CUR.current" \
+            "$staged_dir/$CUR.current" \
+            "$(dirname "$staged_dir")/ck-$CUR.current" \
+            "$staged_dir/ck-$CUR.current"; do
   if [ -f "$cand" ] && grep -q '^stage=' "$cand" 2>/dev/null; then
     root_manifest="$cand"
     break
   fi
 done
-manifest="$staged_dir/ck-$MODULE.current"
+manifest="$staged_dir/ck-$CUR.current"
 staged_base=$(basename "$STAGED")
 if [ -n "$root_manifest" ]; then
   want_stage=$(awk -F= '$1=="stage"{print $2}' "$root_manifest")
@@ -318,11 +325,11 @@ if [ -n "$root_manifest" ]; then
   # what the declaration is FOR is naming which thing is live, and both spellings
   # do that unambiguously.
   if [ "$staged_dir" = "$want_stage" ] || [ "$STAGED" = "$want_stage" ]; then
-    say "currency: matches $MODULE.current (owner-declared stage), rev ${want_rev:0:12}"
+    say "currency: matches $CUR.current (owner-declared stage), rev ${want_rev:0:12}"
   elif [ "$OLDER" -eq 1 ]; then
     say "currency: placing from $staged_dir although the owner declares $want_stage (--older given)"
   else
-    echo "REFUSED: $staged_dir is not the stage $MODULE.current declares" >&2
+    echo "REFUSED: $staged_dir is not the stage $CUR.current declares" >&2
     echo "         owner declares: $want_stage" >&2
     echo "         you passed:     $staged_dir" >&2
     echo "         The root manifest is the owner's statement of WHICH STAGE is live," >&2
@@ -337,11 +344,11 @@ elif [ -f "$manifest" ]; then
   if [ "$have_sha" = "$want_sha" ]; then
     # Name matching is secondary: the sha is the identity. A renamed copy of the
     # current bytes is the current artifact.
-    say "currency: matches ck-$MODULE.current (owner-declared), sha ${have_sha:0:16}"
+    say "currency: matches ck-$CUR.current (owner-declared), sha ${have_sha:0:16}"
   elif [ "$OLDER" -eq 1 ]; then
     say "currency: placing $staged_base although the owner declares $want_file current (--older given)"
   else
-    echo "REFUSED: $staged_base is not what ck-$MODULE.current declares" >&2
+    echo "REFUSED: $staged_base is not what ck-$CUR.current declares" >&2
     echo "         owner declares: $want_file  ${want_sha:0:16}" >&2
     echo "         you passed:     $staged_base  ${have_sha:0:16}" >&2
     echo "         The manifest is the module owner's statement of which artifact is" >&2
@@ -370,18 +377,18 @@ else
     | head -1) || true
   if [ -n "$newest" ] && [ "$newest" != "$staged_base" ]; then
     if [ "$OLDER" -eq 1 ]; then
-      say "currency: INFERRED from mtime (no ck-$MODULE.current); placing $staged_base although $newest is newer (--older given)"
+      say "currency: INFERRED from mtime (no ck-$CUR.current); placing $staged_base although $newest is newer (--older given)"
     else
       echo "REFUSED: $staged_base is not the newest staged artifact for $MODULE" >&2
       echo "         newer: $newest" >&2
-      echo "         INFERRED FROM MTIME -- there is no ck-$MODULE.current manifest, so" >&2
+      echo "         INFERRED FROM MTIME -- there is no ck-$CUR.current manifest, so" >&2
       echo "         this gate is GUESSING from file ordering. The named file may be" >&2
       echo "         stale too; it is a fact about timestamps, not a recommendation." >&2
-      echo "         Ask the module owner to write ck-$MODULE.current, or pass --older." >&2
+      echo "         Ask the module owner to write ck-$CUR.current, or pass --older." >&2
       exit 2
     fi
   else
-    say "currency: INFERRED from mtime (no ck-$MODULE.current); $staged_base is newest"
+    say "currency: INFERRED from mtime (no ck-$CUR.current); $staged_base is newest"
   fi
 fi
 
