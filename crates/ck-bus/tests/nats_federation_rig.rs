@@ -709,6 +709,40 @@ async fn publish_until_received(
     }
 }
 
+/// Subscribes to `subject` and returns only once the server has registered the
+/// subscription.
+///
+/// `async_nats::Client::flush` only drains the client's socket write buffer; it sends no
+/// PING, so it does not wait for the server to process the SUB. The server reads each
+/// connection independently, so a PUB sent right afterwards on ANOTHER connection can be
+/// processed first and routed to nobody (measured in the revocation test: the server's
+/// trace showed the other client's PUB 7 µs before this client's SUB). The server does
+/// process one connection's commands in order, so publishing a marker on the same
+/// connection and receiving it back proves the SUB is in place. The marker is consumed
+/// here and never reaches the caller.
+async fn subscribe_confirmed(client: &async_nats::Client, subject: &str) -> async_nats::Subscriber {
+    let mut sub = client
+        .subscribe(subject.to_string())
+        .await
+        .expect("subscribe");
+    let marker = format!("subscription-registered-{}", client.new_inbox());
+    client
+        .publish(subject.to_string(), marker.clone().into())
+        .await
+        .expect("publish subscription marker");
+    client.flush().await.expect("flush");
+    let msg = tokio::time::timeout(Duration::from_secs(5), sub.next())
+        .await
+        .unwrap_or_else(|_| panic!("the server never echoed the marker on {subject}"))
+        .expect("subscription closed before its marker arrived");
+    assert_eq!(
+        msg.payload.as_ref(),
+        marker.as_bytes(),
+        "the first message on a fresh subscription must be its own marker"
+    );
+    sub
+}
+
 /// Everything that arrives on `sub` within `window`, as `(subject, payload)`.
 async fn drain(sub: &mut async_nats::Subscriber, window: Duration) -> Vec<(String, String)> {
     let deadline = Instant::now() + window;
@@ -1437,8 +1471,7 @@ async fn rig6_revoking_one_user() {
         .await
         .expect("u1 connect");
     let c2 = connect(&rig.hub.url(), &u2).await;
-    let mut c2_sub = c2.subscribe("rev.check").await.expect("sub");
-    c2.flush().await.expect("flush");
+    let mut c2_sub = subscribe_confirmed(&c2, "rev.check").await;
     c1.publish("rev.check", "before".into()).await.expect("pub");
     c1.flush().await.expect("flush");
     let before = drain(&mut c2_sub, Duration::from_millis(500)).await;
