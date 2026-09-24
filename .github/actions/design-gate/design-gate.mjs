@@ -42,6 +42,7 @@ const REQUIRED_LABELS = [
 
 /** Leave existing labels untouched; concurrent runs may both see a label missing. */
 export async function ensureLabels({ api, log = console }) {
+  const missingPermission = [];
   for (const label of REQUIRED_LABELS) {
     if (await api.getLabel(label.name)) {
       log.log?.(`design-gate: label ${label.name} present`);
@@ -55,12 +56,15 @@ export async function ensureLabels({ api, log = console }) {
         log.log?.(`design-gate: label ${label.name} present`);
         continue;
       }
-      if (error.status === 403) {
-        throw new Error(`design-gate: cannot create label ${label.name}; token needs issues: write permission`, { cause: error });
+      if (error.status === 403 || error.status === 404) {
+        log.warn?.(`design-gate: could not create label ${label.name}; CK CI App needs Issues: write permission`);
+        missingPermission.push(label.name);
+        continue;
       }
       throw error;
     }
   }
+  return missingPermission;
 }
 
 /** Hidden marker that lets a later run find the comment it already posted. */
@@ -292,7 +296,7 @@ export function draftNote(linkedIssue) {
  * from scratch each time and a run that dropped the marker would leave the
  * draft stranded after approval.
  */
-export function buildCommentBody(decision, { draftConverted = false, commentExists = false } = {}) {
+export function buildCommentBody(decision, { draftConverted = false, commentExists = false, labelWarning = null } = {}) {
   if (decision.conclusion === "success") {
     // Never open a conversation on a passing PR — only close the one already
     // there, so the author is not left reading a stale blocker. The draft
@@ -302,12 +306,14 @@ export function buildCommentBody(decision, { draftConverted = false, commentExis
     const parts = [COMMENT_MARKER];
     if (draftConverted) parts.push(CONVERTED_MARKER);
     parts.push(decision.message);
+    if (labelWarning) parts.push(labelWarning);
     return parts.join("\n\n");
   }
   const parts = [COMMENT_MARKER];
   if (draftConverted) parts.push(CONVERTED_MARKER);
   parts.push(decision.message);
   if (draftConverted) parts.push(draftNote(decision.linkedIssue));
+  if (labelWarning) parts.push(labelWarning);
   return parts.join("\n\n");
 }
 
@@ -340,8 +346,8 @@ async function findGateComment({ api, pullRequest }) {
  * `draftConverted` is whether the rewritten body should keep recording a
  * gate-held draft; see `buildCommentBody`.
  */
-async function syncComment({ api, pullRequest, decision, existing, draftConverted = false }) {
-  const body = buildCommentBody(decision, { draftConverted, commentExists: Boolean(existing) });
+async function syncComment({ api, pullRequest, decision, existing, draftConverted = false, labelWarning = null }) {
+  const body = buildCommentBody(decision, { draftConverted, commentExists: Boolean(existing), labelWarning });
   if (body === null) return { action: "none" };
   if (!existing) {
     await api.createComment(pullRequest.number, body);
@@ -388,7 +394,10 @@ export async function runPullRequestGate({
   action = "opened",
   log = console,
 }) {
-  await ensureLabels({ api, log });
+  const missingPermission = await ensureLabels({ api, log });
+  const labelWarning = missingPermission.length
+    ? `Gate labels (${missingPermission.map((name) => `\`${name}\``).join(", ")}) could not be created. A maintainer must create them manually or grant the CK CI App Issues: write permission.`
+    : null;
   const decision = await evaluatePullRequest({ api, repoFullName, pullRequest, action });
 
   let draftConverted = false;
@@ -428,6 +437,7 @@ export async function runPullRequestGate({
       decision,
       existing,
       draftConverted: gateHeld,
+      labelWarning,
     });
   } catch (error) {
     log.warn?.(`design-gate: could not post the gate comment on #${pullRequest.number}: ${error}`);
@@ -458,7 +468,6 @@ export async function runPullRequestGate({
  * token, because an `issues` event needs no app token at all.
  */
 export async function runIssueLabeled({ api, checkApi, repoFullName, issue, log = console }) {
-  await ensureLabels({ api, log });
   const search = api.searchOpenPullRequests
     ? (number) => api.searchOpenPullRequests(number)
     : (number) => api.searchDraftPullRequests(number);
@@ -555,13 +564,13 @@ export function createGitHubApi({
     "x-github-api-version": "2022-11-28",
   };
 
-  async function rest(method, path, body) {
+  async function rest(method, path, body, missingIsError = false) {
     const response = await fetchImpl(`${apiBase}${path}`, {
       method,
       headers: body ? { ...headers, "content-type": "application/json" } : headers,
       body: body ? JSON.stringify(body) : undefined,
     });
-    if (response.status === 404) return null;
+    if (response.status === 404 && !missingIsError) return null;
     if (!response.ok) {
       const body = await response.text();
       const error = new Error(`${method} ${path} failed: ${response.status} ${body}`);
@@ -590,7 +599,7 @@ export function createGitHubApi({
       return await rest("GET", `/repos/${repoFullName}/labels/${encodeURIComponent(name)}`);
     },
     async createLabel(label) {
-      return await rest("POST", `/repos/${repoFullName}/labels`, label);
+      return await rest("POST", `/repos/${repoFullName}/labels`, label, true);
     },
     async getIssue(number) {
       const raw = await rest("GET", `/repos/${repoFullName}/issues/${number}`);

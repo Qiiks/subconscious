@@ -70,7 +70,7 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read # fetch the gate action
-      issues: write # create gate labels when missing, read the linked issue
+      issues: read # read the linked issue's labels
       pull-requests: write # post the gate comment, convert back to draft
       checks: write # publish the design-gate check run on the PR head
     steps:
@@ -119,7 +119,7 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read # fetch the gate action
-      issues: write # create gate labels when missing, read the labelled issue
+      issues: read # read the labelled issue
       pull-requests: write # mark waiting drafts ready for review
       checks: write # publish the design-gate check run on the PR head
     steps:

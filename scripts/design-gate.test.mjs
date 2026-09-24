@@ -186,11 +186,11 @@ describe("required labels", () => {
     ]);
   });
 
-  test("an issue run leaves present labels unchanged without writes", async () => {
+  test("a pull request run leaves present labels unchanged without writes", async () => {
     const { api, checkApi, state } = createFixtureApi({ labels: expected });
     const lines = [];
-    await runIssueLabeled({
-      api, checkApi, repoFullName: REPO, issue: { number: 42, labels: [DESIGN_APPROVED_LABEL] },
+    await runPullRequestGate({
+      api, checkApi, repoFullName: REPO, pullRequest: pullRequest({ labels: [TRIVIAL_LABEL] }),
       log: { log: (line) => lines.push(line) },
     });
     assert.deepEqual(state.createdLabels, []);
@@ -218,17 +218,40 @@ describe("required labels", () => {
     ]);
   });
 
-  test("a 403 creating a label fails the run with issues: write named", async () => {
+  for (const status of [403, 404]) {
+    test(`a ${status} creating labels warns and still evaluates the PR`, async () => {
+      const error = Object.assign(new Error("refused"), { status });
+      const { api, checkApi, state } = createFixtureApi({ labels: [], createLabelError: error });
+      const warnings = [];
+      const result = await runPullRequestGate({
+        api, checkApi, repoFullName: REPO, pullRequest: pullRequest(),
+        log: { warn: (line) => warnings.push(line) },
+      });
+      assert.equal(result.conclusion, "failure");
+      assert.equal(state.checkRuns[0].conclusion, "failure");
+      assert.equal(warnings.length, 2);
+      for (const warning of warnings) assert.match(warning, /CK CI App needs Issues: write permission/);
+      assert.match(state.comments[0].body, /Gate labels \(`design-approved`, `trivial`\) could not be created/);
+      assert.match(state.comments[0].body, /grant the CK CI App Issues: write permission/);
+    });
+  }
+
+  test("a missing label permission does not block a passing PR", async () => {
     const error = Object.assign(new Error("Forbidden"), { status: 403 });
     const { api, checkApi, state } = createFixtureApi({ labels: [], createLabelError: error });
-    await assert.rejects(
-      runPullRequestGate({
-        api, checkApi, repoFullName: REPO, pullRequest: pullRequest({ labels: [TRIVIAL_LABEL] }),
-        log: silentLog,
-      }),
-      /issues: write permission/,
-    );
-    assert.deepEqual(state.checkRuns, []);
+    const result = await runPullRequestGate({
+      api, checkApi, repoFullName: REPO, pullRequest: pullRequest({ labels: [TRIVIAL_LABEL] }),
+      log: silentLog,
+    });
+    assert.equal(result.conclusion, "success");
+    assert.equal(state.checkRuns[0].conclusion, "success");
+    assert.deepEqual(state.comments, []);
+  });
+
+  test("an issue-labeled run does not try to create labels with the workflow token", async () => {
+    const { api, checkApi, state } = createFixtureApi({ labels: [], createLabelError: new Error("no App token") });
+    await runIssueLabeled({ api, checkApi, repoFullName: REPO, issue: { number: 42 }, log: silentLog });
+    assert.deepEqual(state.createdLabels, []);
   });
 
   test("GitHub client gets labels and creates them with the write token", async () => {
@@ -250,6 +273,15 @@ describe("required labels", () => {
     ]);
     assert.equal(calls[1].options.headers.authorization, "Bearer write-token");
     assert.deepEqual(JSON.parse(calls[1].options.body), expected[0]);
+  });
+
+  test("GitHub client preserves a 404 refusal on label creation", async () => {
+    const api = createGitHubApi({
+      token: "write-token", repoFullName: REPO,
+      fetchImpl: async () => new Response("Not Found", { status: 404 }),
+    });
+    assert.equal(await api.getLabel(DESIGN_APPROVED_LABEL), null);
+    await assert.rejects(api.createLabel(expected[0]), (error) => error.status === 404);
   });
 });
 
