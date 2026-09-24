@@ -1,6 +1,9 @@
 // Each runtime capability is installed independently; until then its placeholder returns an explicit not-implemented error.
 #[allow(dead_code)]
 mod runtime;
+// Generated grants; credential issuance is their first caller, so nothing calls them yet.
+#[allow(dead_code)]
+mod grants;
 
 use std::{
     env,
