@@ -1,6 +1,6 @@
 [package]
 name = "ck-bus"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 publish = false
 description = "Supervised owner of the CortexKit NATS message plane."
@@ -13,22 +13,26 @@ path = "src/main.rs"
 
 [dependencies]
 async-trait = "0.1"
+base64 = "0.22"
 cortexkit-bus-trait = { version = "0.1.0", git = "https://github.com/cortexkit/commons.git", rev = "4f09c7c7c7f86394d21abde6ed3f97b582ee4d28" }
 cortexkit-bus-inmemory = { version = "0.1.0", git = "https://github.com/cortexkit/commons.git", rev = "4f09c7c7c7f86394d21abde6ed3f97b582ee4d28" }
 cortexkit-bus-naming = { version = "0.1.0", git = "https://github.com/cortexkit/commons.git", rev = "4f09c7c7c7f86394d21abde6ed3f97b582ee4d28" }
 cortexkit-bus-nats = { version = "0.1.0", git = "https://github.com/cortexkit/commons.git", rev = "4f09c7c7c7f86394d21abde6ed3f97b582ee4d28" }
 cortexkit-store-types = "0.2.2"
+# Base32 for the nkey encoding ck-bus builds from a vault public key (role prefix, base32,
+# crc16). Pinned exactly, with nkeys, per the spec's rule for nkey and JWT crates.
+data-encoding = "=2.11.1"
+# Per-process user keys: generated and held in memory only, never persisted.
+nkeys = "=0.4.5"
 serde_json = "1"
+sha2 = "0.10"
 subc-client-rs = { path = "../subc-client-rs", version = "0.18" }
 subc-protocol = { path = "../subc-protocol", version = "0.25.0" }
 tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
 async-nats = "0.50"
-base64 = "0.22"
 futures-util = "0.3"
-nkeys = "0.4"
-sha2 = "0.10"
 tempfile = "3"
 tokio = { version = "1", features = ["io-util", "net"] }
 subc-control = { path = "../subc-control", version = "0.19" }

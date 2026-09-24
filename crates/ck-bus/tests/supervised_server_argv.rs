@@ -95,6 +95,7 @@ async fn a1_argv_non_injection() {
         "operator data home must remain unchanged"
     );
     harness::report::RowReport::passed(harness::report::Row::SupervisedServerArgv)
+        .served_by(harness::report::ServedBy::None)
         .validate(&Default::default())
         .unwrap();
 }
@@ -106,7 +107,8 @@ fn a1_argv_non_injection() {
         harness::report::Row::SupervisedServerArgv,
         "a1-signal-unix-only",
         "non-unix host",
-    );
+    )
+    .served_by(harness::report::ServedBy::None);
     report.validate(&Default::default()).unwrap();
     eprintln!("a1-signal-unix-only: non-unix host");
 }

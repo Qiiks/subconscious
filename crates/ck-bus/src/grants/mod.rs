@@ -311,3 +311,21 @@ fn validate_role_entries(
         Err(error) => Err(error.into()),
     }
 }
+
+/// The runtime's grant-generation seam as wired at start.
+///
+/// Every grant is derived for the box account `{acct}`, which comes from the machine id
+/// the daemon sends in HELLO_ACK, and reading that id belongs to the bootstrap area. Until
+/// bootstrap supplies the account, this seam answers with a named refusal rather than a
+/// grant for a guessed account. Bootstrap is expected to reshape the seam so it takes the
+/// account names and the user key as arguments.
+pub struct GrantSeam;
+
+/// The refusal `GrantSeam` answers with until bootstrap supplies the account.
+pub const GRANT_SEAM_UNBOUND: &str = "grant-generation: account unbound until bootstrap";
+
+impl crate::runtime::GrantGeneration for GrantSeam {
+    fn generated_subjects(&self) -> crate::runtime::SeamResult<BTreeSet<String>> {
+        Err(crate::runtime::AreaNotLanded::new(GRANT_SEAM_UNBOUND))
+    }
+}

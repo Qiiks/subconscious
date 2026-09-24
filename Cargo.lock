@@ -254,7 +254,7 @@ dependencies = [
 
 [[package]]
 name = "ck-bus"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -264,6 +264,7 @@ dependencies = [
  "cortexkit-bus-nats",
  "cortexkit-bus-trait",
  "cortexkit-store-types",
+ "data-encoding",
  "futures-util",
  "nkeys",
  "serde_json",

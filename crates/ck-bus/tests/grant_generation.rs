@@ -14,6 +14,11 @@
 mod grants;
 #[allow(dead_code)]
 mod harness;
+// The grant area implements a runtime seam, so it names `crate::runtime`; this gives it
+// the seam definitions without the rest of the binary.
+#[allow(dead_code)]
+#[path = "../src/runtime/seams.rs"]
+mod runtime;
 
 use std::{collections::BTreeSet, fs, path::PathBuf};
 
@@ -436,4 +441,13 @@ fn disposition_mapping_covers_every_foundation_row() {
             "F-PROV act {act:?} must map to a ladder row: {cell}"
         );
     }
+}
+
+#[test]
+fn wired_grant_seam_refuses_by_name_until_bootstrap_supplies_the_account() {
+    use runtime::GrantGeneration;
+    let refusal = grants::GrantSeam
+        .generated_subjects()
+        .expect_err("the wired grant seam has no account before bootstrap and must refuse");
+    assert_eq!(refusal.area(), grants::GRANT_SEAM_UNBOUND);
 }

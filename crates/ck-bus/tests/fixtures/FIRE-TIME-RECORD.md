@@ -115,9 +115,10 @@ alias is advertised.
 ## Foundation disposition
 
 `foundation/nats-message-plane-foundation.md` is a byte-for-byte copy from prefrontal
-commit `76a910737c646b72c5c2cc931113ab72a071b38d`, SHA-256
-`27bdfeac9393ec41d02aebafc01f4cc0c3d32fef7ba2dbf4d80176b6291c5901`.
-Its disposition table is quoted verbatim at lines 124-134 of that copy. Every row is
+commit `b9e827c69d98fb0c1241925961ebb5184752a25a`, SHA-256
+`bc306d7478134fb02b3ac5c5cc8271e52b34cbeffd95fb1a999ed5d6916ef657`, re-vendored by
+slice 2 (`foundation/SOURCE`). Slice 0 had vendored `76a910737`, which predates the
+2026-09-23 credential-custody amendment. Every row is
 mapped to a ck-bus acceptance row or a named exclusion in
 `foundation/DISPOSITION-MAPPING.md`, discharging
 `foundation-disposition-table-unquoted`.

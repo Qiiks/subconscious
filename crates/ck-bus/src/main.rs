@@ -5,6 +5,10 @@ mod runtime;
 // lands, is expected to be the first caller.
 #[allow(dead_code)]
 mod grants;
+// Vault roots, in-memory user keys and user JWTs. Bootstrap and issuance, when they land,
+// are its callers; until then it is constructed and held but not called.
+#[allow(dead_code)]
+mod credentials;
 
 use std::{
     env,
@@ -59,7 +63,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let module_id = env::var(SUBC_MODULE_ID_ENV)
         .map_err(|_| format!("{SUBC_MODULE_ID_ENV} is required; ck-bus only runs supervised"))?;
     let store_root = runtime::resolve_store_root()?;
-    let runtime = Arc::new(runtime::Runtime::refusing_defaults(store_root));
+    let runtime = Arc::new(
+        runtime::Runtime::refusing_defaults(store_root).with_grants(Arc::new(grants::GrantSeam)),
+    );
+
+    let _credentials = credentials::Credentials::supervised()?;
 
     let sentinel_period_ms = positive_env_ms("CKBUS_SENTINEL_PERIOD_MS", SENTINEL_PERIOD_MS)?;
     let sentinel_timeout_ms = positive_env_ms("CKBUS_SENTINEL_TIMEOUT_MS", SENTINEL_TIMEOUT_MS)?;

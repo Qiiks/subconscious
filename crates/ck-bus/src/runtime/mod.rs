@@ -3,6 +3,7 @@ mod store;
 
 use std::{path::PathBuf, sync::Arc};
 
+pub use seams::{AreaNotLanded, SeamResult};
 pub use seams::{
     Census, CredentialMinting, GrantGeneration, LeafConfiguration, Revocation, SentinelHealth,
     SpawnStream,

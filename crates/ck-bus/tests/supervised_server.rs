@@ -139,6 +139,7 @@ async fn a1_supervised_server_lifecycle() {
     );
     eprintln!("A1 lifecycle wall time: {:?}", started.elapsed());
     harness::report::RowReport::passed(harness::report::Row::SupervisedServer)
+        .served_by(harness::report::ServedBy::None)
         .validate(&Default::default())
         .unwrap();
 }
@@ -167,7 +168,8 @@ fn a1_supervised_server_lifecycle() {
         harness::report::Row::SupervisedServer,
         "a1-signal-unix-only",
         "non-unix host",
-    );
+    )
+    .served_by(harness::report::ServedBy::None);
     report.validate(&Default::default()).unwrap();
     eprintln!("a1-signal-unix-only: non-unix host");
 }
