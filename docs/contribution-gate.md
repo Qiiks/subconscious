@@ -38,8 +38,8 @@ its secrets. Two tokens do the work. A CK CI App token posts the comment and
 converts the pull request back to draft, which is what makes those writes work
 on a fork pull request. The `design-gate` check run — the one output branch
 protection actually reads — is published with the calling job's own
-`GITHUB_TOKEN`, so the path that decides whether a pull request is blocked
-depends on nothing but the workflow itself.
+`GITHUB_TOKEN`, so publishing the required check does not depend on the App's
+checks permission. The App needs `issues: write` to create missing labels.
 
 ## What a repository adds
 
@@ -60,7 +60,7 @@ jobs:
   design-gate:
     permissions:
       contents: read # fetch the gate action
-      issues: read # read the linked issue's labels
+      issues: write # create missing gate labels and read the linked issue
       pull-requests: write # gate comment, draft conversion, ready for review
       checks: write # publish the design-gate check run
     uses: cortexkit/subconscious/.github/workflows/design-gate.yml@master
@@ -85,7 +85,7 @@ do.
 The `permissions:` block is an obligation rather than a knob, and `checks:
 write` is the half worth understanding. The gate publishes the `design-gate`
 check run with the calling job's own `GITHUB_TOKEN`, so that the blocking path
-needs no permission from outside the workflow — but a called workflow can only
+needs no App checks permission — but a called workflow can only
 narrow the scopes its caller grants, never widen them, and a repository whose
 default workflow permissions are read-only grants none of them by default.
 Withhold `checks: write` and the publish is refused; the gate fails closed, so
@@ -109,7 +109,8 @@ that forgets one fails when the workflow is parsed rather than part-way through
 the run at the token mint step. That is why the template passes them explicitly
 instead of using `secrets: inherit`.
 
-The app needs issue read and pull request write on the adopting repository. It
+The app needs issue write and pull request write on the adopting repository, so
+it can create missing gate labels on pull request runs. It
 does not need checks write: the check run is published with the caller's own
 `GITHUB_TOKEN`, not with the app token. That split is deliberate. A run can
 read the permissions a workflow grants — they are in the file above — but
@@ -125,13 +126,11 @@ setting nobody at the keyboard could check.
 | `design-approved` | issues | a maintainer, once the design is agreed |
 | `trivial` | pull requests | a maintainer, when there is no design to agree |
 
-Both must exist in the adopting repository before the gate is switched on.
-
-Create them under the operator's `gh` as a one-time repository-admin act.
-`gh label create` is not declared in the gh-shim manifest, so a seat's first
-lift at this step hits a shim refusal; until shim v14 lands, that refusal is
-the expected response and not a blocker — it is telling you the step is the
-operator's, not the seat's.
+The gate creates both labels on its first run if they are missing. An adopting
+repository needs no manual label-creation step; existing labels are left as-is.
+The App token on pull request runs and the workflow token on issue runs need
+`issues: write` to create them. If the token lacks that permission, label
+creation fails the gate step rather than silently skipping it.
 
 ### 4. The pull request template
 
@@ -221,8 +220,8 @@ against both files that actually run the gate.
 node --test scripts/design-gate.test.mjs
 ```
 
-**The suite is 119 arms.** That number is pinned here on purpose: a lift that
-reports anything other than `# tests 119` has a setup defect before it has a
+**The suite is 124 arms.** That number is pinned here on purpose: a lift that
+reports anything other than `# tests 124` has a setup defect before it has a
 gate. The security arms read the workflow and the action from disk, and a
 missing file reports as a named failure — `workflow file missing at <path>` —
 rather than as arms that quietly fail to register.

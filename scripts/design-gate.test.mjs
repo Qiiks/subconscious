@@ -20,13 +20,16 @@ import {
   CHECK_NAME,
   COMMENT_MARKER,
   CONVERTED_MARKER,
+  createGitHubApi,
   decide,
+  DESIGN_APPROVED_LABEL,
   draftNote,
   GATE_MESSAGE,
   parseLinkedIssue,
   pullRequestSkipReason,
   runIssueLabeled,
   runPullRequestGate,
+  TRIVIAL_LABEL,
 } from "../.github/actions/design-gate/design-gate.mjs";
 
 const REPO = "cortexkit/aft";
@@ -58,9 +61,15 @@ function pullRequest(overrides = {}) {
  * naming the client that published it, so an arm can assert which token the
  * check went out on rather than only that some check was published.
  */
-function createFixtureApi({ issues = [], pullRequests = [], comments = [], refuse = [] } = {}) {
+function createFixtureApi({
+  issues = [], pullRequests = [], comments = [], refuse = [],
+  labels = [{ name: DESIGN_APPROVED_LABEL }, { name: TRIVIAL_LABEL }],
+  createLabelError = null,
+} = {}) {
   const state = {
     issues: new Map(issues.map((issue) => [issue.number, issue])),
+    labels: new Map(labels.map((label) => [label.name, label])),
+    createdLabels: [],
     pullRequests: new Map(pullRequests.map((pr) => [pr.number, pr])),
     comments: comments.map((comment) => ({ ...comment })),
     checkRuns: [],
@@ -74,6 +83,15 @@ function createFixtureApi({ issues = [], pullRequests = [], comments = [], refus
   }
 
   const api = {
+    async getLabel(name) {
+      return state.labels.get(name) ?? null;
+    },
+    async createLabel(label) {
+      if (createLabelError) throw createLabelError;
+      state.createdLabels.push(label);
+      state.labels.set(label.name, label);
+      return label;
+    },
     async getIssue(number) {
       return state.issues.get(number) ?? null;
     },
@@ -138,6 +156,102 @@ function createFixtureApi({ issues = [], pullRequests = [], comments = [], refus
 }
 
 const silentLog = { warn() {}, log() {} };
+
+describe("required labels", () => {
+  const expected = [
+    {
+      name: DESIGN_APPROVED_LABEL,
+      color: "0E8A16",
+      description: "Design agreed by a maintainer; a PR referencing this issue can be reviewed",
+    },
+    {
+      name: TRIVIAL_LABEL,
+      color: "C2E0C6",
+      description: "Typo-class change; exempt from the design-approved gate",
+    },
+  ];
+
+  test("a pull request run creates both missing labels before evaluating", async () => {
+    const { api, checkApi, state } = createFixtureApi({ labels: [] });
+    const lines = [];
+    const result = await runPullRequestGate({
+      api, checkApi, repoFullName: REPO, pullRequest: pullRequest({ labels: [TRIVIAL_LABEL] }),
+      log: { log: (line) => lines.push(line) },
+    });
+    assert.equal(result.conclusion, "success");
+    assert.deepEqual(state.createdLabels, expected);
+    assert.deepEqual(lines, [
+      "design-gate: label design-approved created",
+      "design-gate: label trivial created",
+    ]);
+  });
+
+  test("an issue run leaves present labels unchanged without writes", async () => {
+    const { api, checkApi, state } = createFixtureApi({ labels: expected });
+    const lines = [];
+    await runIssueLabeled({
+      api, checkApi, repoFullName: REPO, issue: { number: 42, labels: [DESIGN_APPROVED_LABEL] },
+      log: { log: (line) => lines.push(line) },
+    });
+    assert.deepEqual(state.createdLabels, []);
+    assert.deepEqual([...state.labels.values()], expected);
+    assert.deepEqual(lines, [
+      "design-gate: label design-approved present",
+      "design-gate: label trivial present",
+    ]);
+  });
+
+  test("an already-exists 422 from concurrent creation is treated as present", async () => {
+    const error = Object.assign(new Error("already exists"), {
+      status: 422, body: '{"errors":[{"code":"already_exists"}]}',
+    });
+    const { api, checkApi, state } = createFixtureApi({ labels: [], createLabelError: error });
+    const lines = [];
+    await runPullRequestGate({
+      api, checkApi, repoFullName: REPO, pullRequest: pullRequest({ labels: [TRIVIAL_LABEL] }),
+      log: { log: (line) => lines.push(line) },
+    });
+    assert.deepEqual(state.createdLabels, []);
+    assert.deepEqual(lines, [
+      "design-gate: label design-approved present",
+      "design-gate: label trivial present",
+    ]);
+  });
+
+  test("a 403 creating a label fails the run with issues: write named", async () => {
+    const error = Object.assign(new Error("Forbidden"), { status: 403 });
+    const { api, checkApi, state } = createFixtureApi({ labels: [], createLabelError: error });
+    await assert.rejects(
+      runPullRequestGate({
+        api, checkApi, repoFullName: REPO, pullRequest: pullRequest({ labels: [TRIVIAL_LABEL] }),
+        log: silentLog,
+      }),
+      /issues: write permission/,
+    );
+    assert.deepEqual(state.checkRuns, []);
+  });
+
+  test("GitHub client gets labels and creates them with the write token", async () => {
+    const calls = [];
+    const api = createGitHubApi({
+      token: "write-token", repoFullName: REPO,
+      fetchImpl: async (url, options) => {
+        calls.push({ url, options });
+        return new Response(options.method === "GET" ? "" : JSON.stringify(expected[0]), {
+          status: options.method === "GET" ? 404 : 201,
+        });
+      },
+    });
+    assert.equal(await api.getLabel(DESIGN_APPROVED_LABEL), null);
+    await api.createLabel(expected[0]);
+    assert.deepEqual(calls.map(({ url, options }) => [options.method, url]), [
+      ["GET", `https://api.github.com/repos/${REPO}/labels/design-approved`],
+      ["POST", `https://api.github.com/repos/${REPO}/labels`],
+    ]);
+    assert.equal(calls[1].options.headers.authorization, "Bearer write-token");
+    assert.deepEqual(JSON.parse(calls[1].options.body), expected[0]);
+  });
+});
 
 describe("parseLinkedIssue", () => {
   const cases = [

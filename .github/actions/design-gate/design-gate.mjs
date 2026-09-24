@@ -27,6 +27,42 @@ import { pathToFileURL } from "node:url";
 export const DESIGN_APPROVED_LABEL = "design-approved";
 export const TRIVIAL_LABEL = "trivial";
 
+const REQUIRED_LABELS = [
+  {
+    name: DESIGN_APPROVED_LABEL,
+    color: "0E8A16",
+    description: "Design agreed by a maintainer; a PR referencing this issue can be reviewed",
+  },
+  {
+    name: TRIVIAL_LABEL,
+    color: "C2E0C6",
+    description: "Typo-class change; exempt from the design-approved gate",
+  },
+];
+
+/** Leave existing labels untouched; concurrent runs may both see a label missing. */
+export async function ensureLabels({ api, log = console }) {
+  for (const label of REQUIRED_LABELS) {
+    if (await api.getLabel(label.name)) {
+      log.log?.(`design-gate: label ${label.name} present`);
+      continue;
+    }
+    try {
+      await api.createLabel(label);
+      log.log?.(`design-gate: label ${label.name} created`);
+    } catch (error) {
+      if (error.status === 422 && /already[ _]exists/i.test(error.body ?? "")) {
+        log.log?.(`design-gate: label ${label.name} present`);
+        continue;
+      }
+      if (error.status === 403) {
+        throw new Error(`design-gate: cannot create label ${label.name}; token needs issues: write permission`, { cause: error });
+      }
+      throw error;
+    }
+  }
+}
+
 /** Hidden marker that lets a later run find the comment it already posted. */
 export const COMMENT_MARKER = "<!-- design-gate -->";
 
@@ -352,6 +388,7 @@ export async function runPullRequestGate({
   action = "opened",
   log = console,
 }) {
+  await ensureLabels({ api, log });
   const decision = await evaluatePullRequest({ api, repoFullName, pullRequest, action });
 
   let draftConverted = false;
@@ -421,6 +458,7 @@ export async function runPullRequestGate({
  * token, because an `issues` event needs no app token at all.
  */
 export async function runIssueLabeled({ api, checkApi, repoFullName, issue, log = console }) {
+  await ensureLabels({ api, log });
   const search = api.searchOpenPullRequests
     ? (number) => api.searchOpenPullRequests(number)
     : (number) => api.searchDraftPullRequests(number);
@@ -525,7 +563,11 @@ export function createGitHubApi({
     });
     if (response.status === 404) return null;
     if (!response.ok) {
-      throw new Error(`${method} ${path} failed: ${response.status} ${await response.text()}`);
+      const body = await response.text();
+      const error = new Error(`${method} ${path} failed: ${response.status} ${body}`);
+      error.status = response.status;
+      error.body = body;
+      throw error;
     }
     return response.status === 204 ? null : await response.json();
   }
@@ -544,6 +586,12 @@ export function createGitHubApi({
   }
 
   return {
+    async getLabel(name) {
+      return await rest("GET", `/repos/${repoFullName}/labels/${encodeURIComponent(name)}`);
+    },
+    async createLabel(label) {
+      return await rest("POST", `/repos/${repoFullName}/labels`, label);
+    },
     async getIssue(number) {
       const raw = await rest("GET", `/repos/${repoFullName}/issues/${number}`);
       return raw ? normalizeIssue(raw) : null;
