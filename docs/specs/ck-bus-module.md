@@ -1337,3 +1337,14 @@ SECTION governs.
   is accepted by a real `nats-server`, and proves no vault authority.
   `claustrum-binary` alone serves authorization rows, and its absence is a loud skip,
   never a pass. Every row states its side.
+- R13 (operator, 2026-09-24): leaf signing is shape (3), a Go binary embedding
+  `nats-server` whose `RemoteLeafOpts.SignatureCB` gets each connect signature from the
+  vault, so the leaf credential's seed never touches disk. The rig settled that stock
+  `nats-server` cannot do this: it reads only a creds file, and re-reads it at every
+  reconnect. The Go binary is built, signed and released with the fleet's other
+  binaries. Still open under `leaf-signing-shape-unchosen`, for SUBC and CKCRED: how
+  the callback reaches the vault. SUBC's recommendation is that the Go binary be a subc
+  module with its own launch nonce and an exact `sign` grant on the leaf key, which
+  needs a minimal Go subc client (handshake, HELLO, route.open, request). The
+  alternative, routing the callback through a local ck-bus socket, turns ck-bus into a
+  signing oracle for any process running as the same user.
