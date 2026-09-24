@@ -41,10 +41,29 @@ pub(crate) struct RosterEntry {
     drain_budget: Arc<Mutex<Duration>>,
 }
 
+/// Set once, when the daemon begins its announced shutdown, and never cleared.
+///
+/// Shared by the roster (which refuses spawns once it is set) and every
+/// module's terminal ring (which records any exit after it as
+/// `daemon_shutdown`), so the reap path, the spawn path and the record all
+/// read the same flag.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DaemonShutdownFlag(Arc<AtomicBool>);
+
+impl DaemonShutdownFlag {
+    pub(crate) fn is_set(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    fn set(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 #[derive(Debug, Default)]
 struct RosterInner {
     next_key: AtomicU64,
-    closed: AtomicBool,
+    closed: DaemonShutdownFlag,
     live: Mutex<HashMap<u64, RosterEntry>>,
 }
 
@@ -94,7 +113,12 @@ impl ChildRoster {
     /// so spawning refuses instead (the supervisor would otherwise restart each
     /// module as it exits on EOF).
     pub(crate) fn is_closed(&self) -> bool {
-        self.inner.closed.load(Ordering::SeqCst)
+        self.inner.closed.is_set()
+    }
+
+    /// The flag [`Self::close`] sets, for the terminal rings to read.
+    pub(crate) fn shutdown_flag(&self) -> DaemonShutdownFlag {
+        self.inner.closed.clone()
     }
 
     pub(crate) fn admit(
@@ -129,9 +153,14 @@ impl ChildRoster {
             .collect()
     }
 
+    /// Mark daemon shutdown as begun. Idempotent.
+    ///
+    /// Called at the very start of the announced shutdown, before the notice
+    /// and before any connection is closed: from then on no module is
+    /// respawned, and every exit is recorded as `daemon_shutdown`.
     #[cfg(unix)]
-    fn close(&self) {
-        self.inner.closed.store(true, Ordering::SeqCst);
+    pub(crate) fn close(&self) {
+        self.inner.closed.set();
     }
 }
 

@@ -26,13 +26,13 @@ macro_rules! open_string_enum {
     (
         $(#[$meta:meta])*
         $name:ident {
-            $( $variant:ident => $wire_name:literal ),+ $(,)?
+            $( $(#[$variant_meta:meta])* $variant:ident => $wire_name:literal ),+ $(,)?
         }
     ) => {
         $(#[$meta])*
         #[derive(Debug, Clone, PartialEq, Eq)]
         pub enum $name {
-            $( $variant, )+
+            $( $(#[$variant_meta])* $variant, )+
             Unknown(String),
         }
 
@@ -1524,6 +1524,11 @@ open_string_enum! {
         Disabled => "disabled",
         Failed => "failed",
         Restarting => "restarting",
+        /// The child exited after the daemon had begun its own announced
+        /// shutdown, whatever its exit code or signal. Such an exit is not
+        /// a crash and is never followed by a respawn. Readers that predate
+        /// this value decode it as `Unknown("daemon_shutdown")`.
+        DaemonShutdown => "daemon_shutdown",
     }
 }
 
@@ -2103,6 +2108,7 @@ mod tests {
             (TerminalDisposition::Disabled, "disabled"),
             (TerminalDisposition::Failed, "failed"),
             (TerminalDisposition::Restarting, "restarting"),
+            (TerminalDisposition::DaemonShutdown, "daemon_shutdown"),
         ] {
             let wire = serde_json::to_string(&value).unwrap();
             assert_eq!(wire, format!("\"{expected}\""));

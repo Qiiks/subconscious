@@ -26,6 +26,7 @@ pub mod router;
 pub mod server;
 pub mod stderr_tail;
 pub mod supervise;
+mod systemd_kill_mode;
 mod terminal_journal;
 pub mod terminal_ring;
 #[cfg(any(test, feature = "test-support"))]

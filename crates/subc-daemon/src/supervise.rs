@@ -1885,8 +1885,19 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
+    /// The first step of an announced daemon shutdown, before the notice and
+    /// before any connection is closed.
+    ///
+    /// Sets the daemon-shutdown flag first: from here on no module is
+    /// respawned (crash restart, operator restart, or swap), and every child
+    /// exit is recorded as `daemon_shutdown` rather than as a crash, whether
+    /// the module exits on the EOF this shutdown gives it or is signalled by a
+    /// service manager that kills the whole cgroup. Then writes the journal's
+    /// shutdown marker, which records the instant and closes this daemon
+    /// incarnation's stretch of the journal.
     #[cfg(unix)]
-    pub(crate) fn stamp_shutdown(&self) {
+    pub(crate) fn begin_daemon_shutdown(&self) {
+        self.child_roster.close();
         if let Some(journal) = &self.terminal_journal {
             journal.stamp_shutdown();
         }
@@ -1920,8 +1931,10 @@ impl Supervisor {
                 .endpoint_routes(target.endpoint)
                 .map_err(SuperviseError::Forwarding)?;
             // Restart allows deployed consumers to reopen after the new daemon
-            // appears. The terminal journal's daemon_shutdown marker distinguishes
-            // a daemon cut from a module restart without changing wire reasons.
+            // appears. The wire reason stays `restart`; what tells a daemon cut
+            // apart from a module restart afterwards is the terminal record
+            // itself, whose disposition is `daemon_shutdown` for every exit
+            // observed once `begin_daemon_shutdown` has run.
             let command = serde_json::to_vec(&ModuleControlCommand::Draining {
                 reason: RouteCloseReason::Restart,
                 deadline_ms,
@@ -2283,7 +2296,8 @@ impl Supervisor {
                     self.daemon_start_clock.started_at_ms(),
                 )
                 .with_start_clock(self.daemon_start_clock)
-                .with_journal(self.terminal_journal.clone()),
+                .with_journal(self.terminal_journal.clone())
+                .with_daemon_shutdown(self.child_roster.shutdown_flag()),
             )),
             spawn_events: self.spawn_events.clone(),
             #[cfg(target_os = "linux")]
@@ -4296,6 +4310,7 @@ async fn supervise_loop(
                         &snapshot,
                         &runtime.terminal_ring,
                         &runtime.spawn_events,
+                        &runtime.child_roster,
                         exit_report,
                     ).await {
                         NextAction::Stop { registration_released } => {
@@ -4366,6 +4381,17 @@ async fn supervise_loop(
                     // have stopped the module; never respawn past an operator's
                     // disable or drain.
                     if !respawn_still_pending(&snapshot) {
+                        continue;
+                    }
+                    // The daemon began shutting down during the backoff: the
+                    // spawn would be refused anyway, and refusing it here
+                    // leaves the module stopped instead of reporting a
+                    // failed restart.
+                    if runtime.child_roster.is_closed() {
+                        let _ = update_snapshot(&snapshot, Some(&spec.module_id), |state| {
+                            state.state = ModuleState::Stopped;
+                        });
+                        debug!(module_id = %spec.module_id, "crash respawn cancelled by daemon shutdown");
                         continue;
                     }
                     if let Err(err) = wait_for_registration_release(
@@ -4982,8 +5008,25 @@ async fn on_child_exit(
     snapshot: &SharedSnapshot,
     terminal_ring: &Arc<Mutex<TerminalRing>>,
     spawn_events: &SpawnEventFeed,
+    roster: &ChildRoster,
     exit_report: ExitReport,
 ) -> NextAction {
+    // Once the daemon has begun shutting down, no exit is a crash to recover
+    // from: the module is exiting because the daemon is going away (EOF on its
+    // connection, or a service manager signalling the whole cgroup). Record it
+    // as such and never schedule a respawn, which would only start a process
+    // for the shutdown to end again.
+    if roster.is_closed() {
+        return on_child_exit_during_daemon_shutdown(
+            spec,
+            registry,
+            snapshot,
+            terminal_ring,
+            spawn_events,
+            exit_report,
+        )
+        .await;
+    }
     match exit_report.kind {
         ExitKind::Clean => {
             info!(
@@ -5163,6 +5206,44 @@ async fn on_child_exit(
     }
 }
 
+async fn on_child_exit_during_daemon_shutdown(
+    spec: &ModuleSpec,
+    registry: &Registry,
+    snapshot: &SharedSnapshot,
+    terminal_ring: &Arc<Mutex<TerminalRing>>,
+    spawn_events: &SpawnEventFeed,
+    exit_report: ExitReport,
+) -> NextAction {
+    info!(
+        module_id = %spec.module_id,
+        exit_code = ?exit_report.code,
+        exit_signal = ?exit_report.signal,
+        exit_kind = ?exit_report.kind,
+        "supervised module exited during daemon shutdown; not restarting it"
+    );
+    if let Err(err) = update_snapshot(snapshot, Some(&spec.module_id), |state| {
+        state.state = ModuleState::Stopped;
+        clear_current_process_facts(state);
+        state.last_exit = Some(exit_report.clone());
+    }) {
+        error!(module_id = %spec.module_id, error = %err, "failed to record module exit during daemon shutdown");
+    }
+    record_terminal(
+        &spec.module_id,
+        terminal_ring,
+        spawn_events,
+        &exit_report,
+        TerminalDisposition::DaemonShutdown,
+    );
+    let registration_released =
+        wait_for_registration_release(registry, &spec.module_id, REGISTRY_RELEASE_TIMEOUT)
+            .await
+            .is_ok();
+    NextAction::Stop {
+        registration_released,
+    }
+}
+
 fn record_wait_error_terminal(
     module_id: &str,
     terminal_ring: &Arc<Mutex<TerminalRing>>,
@@ -5217,9 +5298,6 @@ fn record_terminal_with_detail(
     disposition_detail: Option<String>,
 ) {
     spawn_events.emit_exited(module_id, exit_report.code, exit_report.signal);
-    let mut ring = terminal_ring
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let record = TerminalRecord {
         exit_code: exit_report.code,
         exit_signal: exit_report.signal,
@@ -5228,8 +5306,10 @@ fn record_terminal_with_detail(
         exit_kind: exit_report.kind.into(),
         disposition_detail,
     };
-    ring.append_journal(module_id, &record);
-    ring.push(record);
+    terminal_ring
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .record_exit(module_id, record);
 }
 
 fn untrack_if_registration_released(
@@ -5541,6 +5621,27 @@ fn spawn_child_in_slot(
         spec.protocol,
         process_start_time,
     );
+    // The check at the top of this function can pass just before daemon
+    // shutdown begins, and the process is only in the roster from here on.
+    // The shutdown stop returns as soon as it finds the roster empty, so a
+    // process admitted after that look would outlive the daemon. The roster
+    // is closed before the stop first reads it and admission happens under
+    // the roster's lock, so either the stop sees this process or this check
+    // sees the roster closed: end the process now rather than start a module
+    // the daemon is about to stop.
+    if roster.is_closed() {
+        if let Err(error) = child.start_kill() {
+            debug!(module_id = %spec.module_id, pid, %error, "kill of a process spawned during daemon shutdown failed; it may already have exited");
+        }
+        drop(roster_guard);
+        return Err(SuperviseError::Spawn {
+            program: spec.program.clone(),
+            source: io::Error::other(
+                "the daemon began shutting down while this process was starting; ended it",
+            ),
+            cgroup_path,
+        });
+    }
 
     let stdout_pump = match child.stdout.take() {
         Some(stdout) => Some(tokio::spawn(pump_stdout_to(stdout, output_sink.clone()))),
@@ -6380,6 +6481,7 @@ async fn handle_reload_child_registration_failure(
         snapshot,
         &runtime.terminal_ring,
         &runtime.spawn_events,
+        &runtime.child_roster,
         exit_report,
     )
     .await
@@ -7534,6 +7636,7 @@ mod terminal_history_tests {
                 &crash_snapshot,
                 &runtime.terminal_ring,
                 &runtime.spawn_events,
+                &runtime.child_roster,
                 ExitReport {
                     kind: ExitKind::Crash,
                     code: Some(1),
@@ -7640,6 +7743,7 @@ mod terminal_history_tests {
                 &snapshot,
                 &runtime.terminal_ring,
                 &runtime.spawn_events,
+                &runtime.child_roster,
                 exit_report,
             )
             .await,
@@ -7677,6 +7781,7 @@ mod terminal_history_tests {
                 &snapshot,
                 &runtime.terminal_ring,
                 &runtime.spawn_events,
+                &runtime.child_roster,
                 ExitReport {
                     kind: ExitKind::Crash,
                     code: Some(1),
@@ -7740,6 +7845,7 @@ mod terminal_history_tests {
                         &snapshot,
                         &runtime.terminal_ring,
                         &runtime.spawn_events,
+                        &runtime.child_roster,
                         crash_exit_report(attempt),
                     )
                     .await,
@@ -7757,6 +7863,7 @@ mod terminal_history_tests {
                 &snapshot,
                 &runtime.terminal_ring,
                 &runtime.spawn_events,
+                &runtime.child_roster,
                 crash_exit_report(3),
             )
             .await,
@@ -7818,6 +7925,7 @@ mod terminal_history_tests {
                     &snapshot,
                     &runtime.terminal_ring,
                     &runtime.spawn_events,
+                    &runtime.child_roster,
                     crash_exit_report(attempt),
                 )
                 .await,
@@ -7841,6 +7949,7 @@ mod terminal_history_tests {
                     &snapshot,
                     &runtime.terminal_ring,
                     &runtime.spawn_events,
+                    &runtime.child_roster,
                     crash_exit_report(3),
                 )
                 .await,
@@ -7885,6 +7994,7 @@ mod terminal_history_tests {
                     &snapshot,
                     &runtime.terminal_ring,
                     &runtime.spawn_events,
+                    &runtime.child_roster,
                     crash_exit_report(attempt),
                 )
                 .await,
@@ -7914,6 +8024,7 @@ mod terminal_history_tests {
                     &snapshot,
                     &runtime.terminal_ring,
                     &runtime.spawn_events,
+                    &runtime.child_roster,
                     crash_exit_report(3),
                 )
                 .await,

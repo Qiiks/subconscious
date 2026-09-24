@@ -525,6 +525,144 @@ fn quiescent_provider_does_not_spend_the_whole_drain_budget() {
     fixture.wait_exit(Duration::from_millis(1500));
 }
 
+/// Every line of the durable terminal journal, in file order.
+fn journal(fixture: &Fixture) -> Vec<Value> {
+    fs::read_to_string(fixture.root.join("data/cortexkit/run/terminals.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+/// The observer's terminal records written after the daemon's shutdown
+/// marker. Panics if there is no marker, which would make "nothing after it"
+/// vacuous.
+fn observer_records_after_marker(fixture: &Fixture) -> Vec<Value> {
+    let lines = journal(fixture);
+    let marker = lines
+        .iter()
+        .position(|line| line["event"] == "daemon_shutdown")
+        .unwrap_or_else(|| panic!("no daemon_shutdown marker in the journal: {lines:?}"));
+    lines[marker + 1..]
+        .iter()
+        .filter(|line| line["module_id"] == "shutdown-observer")
+        .cloned()
+        .collect()
+}
+
+fn signal_pid(pid: i32, signal: rustix::process::Signal) {
+    rustix::process::kill_process(rustix::process::Pid::from_raw(pid).unwrap(), signal).unwrap();
+}
+
+/// A module that exits nonzero on the EOF of an ordered shutdown is exiting
+/// because the daemon is going away. It must be recorded as a daemon shutdown,
+/// not a crash, and never respawned.
+#[test]
+fn module_exiting_nonzero_on_shutdown_eof_is_recorded_as_daemon_shutdown_and_not_respawned() {
+    let mut fixture = Fixture::boot_with(
+        false,
+        json!({ "env": { "FAKE_AFT_EOF_EXIT_CODE": "1" } }),
+        None,
+    );
+    let observer = fixture.pid_of("observer.pid");
+    fixture.term();
+    fixture.wait_exit(Duration::from_secs(5));
+    fixture.wait_event("teardown_complete");
+
+    let records = observer_records_after_marker(&fixture);
+    assert_eq!(
+        records.len(),
+        1,
+        "exactly one exit after the marker: {records:?}"
+    );
+    assert_eq!(
+        records[0]["exit_code"], 1,
+        "the module must have exited nonzero, or this test does not reach the crash path: {records:?}"
+    );
+    assert_eq!(
+        records[0]["disposition"], "daemon_shutdown",
+        "an exit during daemon shutdown is not a crash to restart from: {records:?}"
+    );
+    assert!(
+        records.iter().all(|r| r["disposition"] != "restarting"),
+        "no exit after the shutdown marker may be recorded as restarting: {records:?}"
+    );
+    assert_eq!(
+        fixture.pid_of("observer.pid"),
+        observer,
+        "the module was respawned during daemon shutdown"
+    );
+}
+
+/// A systemd unit with KillMode=control-group signals every module at the same
+/// moment as the daemon. A module killed that way, while the daemon is still
+/// in its notice and drain, must be recorded as a daemon shutdown and must not
+/// be respawned into a daemon that is going away.
+#[test]
+fn module_signalled_during_daemon_shutdown_is_recorded_as_daemon_shutdown_and_not_respawned() {
+    // Busy, so the drain holds the daemon for its full budget: long enough
+    // for a respawn (100 ms of backoff) to happen if the supervisor allowed it.
+    let mut fixture = Fixture::boot(true);
+    let observer = fixture.pid_of("observer.pid");
+    fixture.term();
+    // The notice has been sent, so the daemon has begun its shutdown and not
+    // yet closed any connection.
+    fixture.wait_event("draining");
+    signal_pid(observer, rustix::process::Signal::TERM);
+    fixture.wait_exit(Duration::from_secs(8));
+
+    let records = observer_records_after_marker(&fixture);
+    assert!(
+        !records.is_empty(),
+        "the signalled module's exit was never recorded"
+    );
+    assert_eq!(
+        records[0]["exit_signal"], 15,
+        "the first exit after the marker must be the SIGTERM this test sent: {records:?}"
+    );
+    assert!(
+        records
+            .iter()
+            .all(|r| r["disposition"] == "daemon_shutdown"),
+        "every exit after the shutdown marker is a daemon shutdown: {records:?}"
+    );
+    assert_eq!(
+        fixture.pid_of("observer.pid"),
+        observer,
+        "the module was respawned during daemon shutdown"
+    );
+}
+
+/// The control for the two above: the same signal while the daemon is NOT
+/// shutting down is a crash, recorded as `restarting`, and respawned.
+#[test]
+fn module_signalled_while_the_daemon_runs_is_a_crash_and_is_respawned() {
+    let fixture = Fixture::boot(false);
+    let observer = fixture.pid_of("observer.pid");
+    signal_pid(observer, rustix::process::Signal::TERM);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while fixture.pid_of("observer.pid") == observer {
+        assert!(
+            Instant::now() < deadline,
+            "a crashed module was not respawned"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let lines = journal(&fixture);
+    assert!(
+        lines.iter().all(|line| line["event"] != "daemon_shutdown"),
+        "no shutdown marker while the daemon runs: {lines:?}"
+    );
+    let records: Vec<&Value> = lines
+        .iter()
+        .filter(|line| line["module_id"] == "shutdown-observer")
+        .collect();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["exit_signal"], 15, "{records:?}");
+    assert_eq!(records[0]["exit_kind"], "crash", "{records:?}");
+    assert_eq!(records[0]["disposition"], "restarting", "{records:?}");
+}
+
 #[test]
 fn second_sigterm_cuts_short_a_stubborn_provider_wait() {
     let mut fixture = Fixture::boot(true);

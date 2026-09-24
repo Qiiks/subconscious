@@ -746,6 +746,11 @@ async fn serve_bound_daemon(
         AbortOnDrop::new(tokio::spawn(serve_listeners(bound.listeners, router, auth)));
     tokio::task::yield_now().await;
     let _clock_step_task = AbortOnDrop::new(crate::watchdog::spawn_clock_step_monitor());
+    // Off the startup path: it runs `systemctl`, and only ever logs.
+    #[cfg(target_os = "linux")]
+    let _kill_mode_check = AbortOnDrop::new(tokio::spawn(
+        crate::systemd_kill_mode::warn_if_kill_mode_defeats_ordered_shutdown(),
+    ));
     let _watchdog_task = AbortOnDrop::new(
         DaemonSelfWatchdog::new(
             bound.connection_info.clone(),
@@ -804,8 +809,11 @@ async fn serve_bound_daemon(
             }
             _ = terminate.recv() => {}
         }
-        // Stamp before allowing a second signal to cut the bounded wait short.
-        supervisor.stamp_shutdown();
+        // First, before the notice, the drain, or any connection close: from
+        // here on a module exit is recorded as `daemon_shutdown` and never
+        // respawned. Also before allowing a second signal to cut the bounded
+        // wait short, so the journal marker is always written.
+        supervisor.begin_daemon_shutdown();
         // Dropping the listener stops new accepts, not established connections:
         // their detached tasks must remain live throughout notice and drain.
         drop(serve_task);
@@ -822,10 +830,12 @@ async fn serve_bound_daemon(
                 false
             }
         };
-        // Supervised modules lead their own process groups, so the service
-        // manager's kill of this process's group does not reach them. The
-        // daemon ends them itself: EOF (or SIGTERM for a protocol none child)
-        // first, then signals at each child's own drain deadline.
+        // Supervised modules lead their own process groups, so a service
+        // manager's kill of this process's group does not reach them. (A
+        // systemd unit with KillMode=control-group kills by cgroup instead and
+        // does reach them; see `systemd_kill_mode`.) The daemon ends them
+        // itself: EOF (or SIGTERM for a protocol none child) first, then
+        // signals at each child's own drain deadline.
         supervisor
             .end_children_for_daemon_shutdown(escalated, async {
                 terminate.recv().await;

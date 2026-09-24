@@ -20,6 +20,14 @@ const RETENTION: cortexkit_log::Retention = cortexkit_log::Retention {
     max_age_days: 30,
 };
 
+/// A non-exit line in the journal.
+///
+/// `daemon_shutdown` is written when a daemon begins its announced shutdown.
+/// It bounds that daemon incarnation's stretch of the journal and records the
+/// instant the shutdown began, for someone reading the file. No reader in this
+/// daemon applies it: `merge` skips it, because whether an exit belongs to a
+/// shutdown is already in that exit's own record (disposition
+/// `daemon_shutdown`), so nothing has to be inferred from position.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 enum DaemonMarker {
@@ -232,6 +240,7 @@ impl JournalRead {
                                 ));
                             }
                         }
+                        // Markers are not exits; see `DaemonMarker`.
                         _ if line.ends_with(b"\n")
                             && serde_json::from_slice::<DaemonMarker>(&line).is_ok() => {}
                         _ => history.journal_skipped_lines += 1,

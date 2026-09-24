@@ -1,6 +1,9 @@
 use std::{collections::VecDeque, sync::Arc};
 
-use crate::terminal_journal::{ring_history, JournalRead, TerminalJournal};
+use crate::{
+    child_roster::DaemonShutdownFlag,
+    terminal_journal::{ring_history, JournalRead, TerminalJournal},
+};
 
 use subc_control::{TerminalDisposition, TerminalExitKind};
 
@@ -75,6 +78,7 @@ impl DurableHistoryRead {
 #[derive(Debug)]
 pub struct TerminalRing {
     journal: Option<Arc<TerminalJournal>>,
+    daemon_shutdown: Option<DaemonShutdownFlag>,
     config: TerminalRingConfig,
     daemon_started_at_ms: u64,
     start_clock: Option<crate::clock::StartClock>,
@@ -86,6 +90,7 @@ impl TerminalRing {
     pub fn new(config: TerminalRingConfig, daemon_started_at_ms: u64) -> Self {
         Self {
             journal: None,
+            daemon_shutdown: None,
             config,
             daemon_started_at_ms,
             start_clock: None,
@@ -102,6 +107,33 @@ impl TerminalRing {
     pub(crate) fn with_journal(mut self, journal: Option<Arc<TerminalJournal>>) -> Self {
         self.journal = journal;
         self
+    }
+
+    pub(crate) fn with_daemon_shutdown(mut self, flag: DaemonShutdownFlag) -> Self {
+        self.daemon_shutdown = Some(flag);
+        self
+    }
+
+    /// Whether the daemon has begun its announced shutdown.
+    pub(crate) fn daemon_shutting_down(&self) -> bool {
+        self.daemon_shutdown
+            .as_ref()
+            .is_some_and(DaemonShutdownFlag::is_set)
+    }
+
+    /// Journal and retain one observed exit.
+    ///
+    /// An exit observed after the daemon began shutting down is recorded as
+    /// `daemon_shutdown` whichever path observed it (the reap after a crash, an
+    /// operator stop or restart in flight, a swap retiring its incumbent), so
+    /// no exit caused by the daemon going away reads as a module crash or a
+    /// pending restart. Any detail the caller gave is kept.
+    pub(crate) fn record_exit(&mut self, module_id: &str, mut entry: TerminalRecord) {
+        if self.daemon_shutting_down() {
+            entry.disposition = TerminalDisposition::DaemonShutdown;
+        }
+        self.append_journal(module_id, &entry);
+        self.push(entry);
     }
 
     pub(crate) fn append_journal(&self, module_id: &str, entry: &TerminalRecord) {

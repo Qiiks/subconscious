@@ -184,6 +184,11 @@ const FAKE_AFT_EOF_TEARDOWN_MS_ENV: &str = "FAKE_AFT_EOF_TEARDOWN_MS";
 /// connection instead of exiting: a module whose teardown ignores the daemon's
 /// stop request, which only a signal can end.
 const FAKE_AFT_IGNORE_EOF_ENV: &str = "FAKE_AFT_IGNORE_EOF";
+/// Exit with this code after EOF on the control connection (after any
+/// `FAKE_AFT_EOF_TEARDOWN_MS`), instead of returning normally. Real modules
+/// do exit nonzero on EOF, and the supervisor classifies that as a crash
+/// unless it knows the daemon is shutting down.
+const FAKE_AFT_EOF_EXIT_CODE_ENV: &str = "FAKE_AFT_EOF_EXIT_CODE";
 /// Presence installs a SIGTERM handler in a subc-mode stub that records a
 /// `sigterm` event (with `at_ms`) and does NOT exit, so a test can see whether
 /// and when the daemon signalled it, and a later SIGKILL is still what ends it.
@@ -693,6 +698,12 @@ async fn handle_frame(
         }
         if env_flag(FAKE_AFT_IGNORE_EOF_ENV) {
             std::future::pending::<()>().await;
+        }
+        if let Some(code) = env::var(FAKE_AFT_EOF_EXIT_CODE_ENV)
+            .ok()
+            .and_then(|raw| raw.parse::<i32>().ok())
+        {
+            std::process::exit(code);
         }
         return Ok(false);
     };

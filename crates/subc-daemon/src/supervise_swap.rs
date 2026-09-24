@@ -819,10 +819,6 @@ async fn retire_incumbent(
         exit_report.signal,
     );
     {
-        let mut ring = runtime
-            .terminal_ring
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let record = TerminalRecord {
             exit_code: exit_report.code,
             exit_signal: exit_report.signal,
@@ -831,8 +827,13 @@ async fn retire_incumbent(
             exit_kind: exit_report.kind.into(),
             disposition_detail: Some("replaced by a blue/green swap".to_string()),
         };
-        ring.append_journal(module_id, &record);
-        ring.push(record);
+        // Recorded as `daemon_shutdown` instead if the daemon has begun
+        // shutting down (see `TerminalRing::record_exit`).
+        runtime
+            .terminal_ring
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record_exit(module_id, record);
     }
     let _ = update_snapshot(snapshot, Some(module_id), |state| {
         state.last_exit = Some(exit_report.clone());
