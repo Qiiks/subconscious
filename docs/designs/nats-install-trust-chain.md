@@ -262,3 +262,39 @@ once `user-jwt-ttl-unpinned` is pinned. This differs from the spec (6.7).
 12. Open question 8 (does a new `{acct}` need new root keys): this design's answer is no,
     because the new account lists the same account signing key. Sharing that key across
     the old and new accounts is a choice for CKCRED and the operator to confirm.
+
+## 7. SUBC's decisions on section 6 (2026-09-24)
+
+- 6.1: the spec's Credentials table and `RootCredential` get two operator rows, root and
+  signer, and the root gets no ck-bus row. That lands with slice 4.
+- 6.2: ask CKCRED for an exact `read` grant on the signer to `reserved:ckbus`. Matching
+  `key_id` against the operator JWT is a second path to the same fact, and it would silently
+  disagree the day the id derivation changes.
+- 6.3: proposed to CKCRED as written: `signing:ck-bus-sysaccount:1`, exact `sign` and `read`
+  to `reserved:ckbus`.
+- 6.4: agreed, ck-bus creates the box account through the signer. That needs ALF to amend
+  the foundation's install step (4).
+- 6.5: slice 4 owns it. ck-bus reads the operator JWT path, the server URL and the system
+  account id from its supervised config (env), and `account.json` gains the box account's
+  public id. An ABSENT `account.json` triggers a lookup by account name before any create,
+  and a found account is adopted, never duplicated.
+- 6.6: already settled. commons `bd7f699` adds the claims lookup and `_INBOX.<cred>.>`
+  subscribe to the system grant, and ck-bus re-pins in slice 4.
+- 6.7: agreed, ck-bus does not revoke its own previous system-account users; the spec's
+  bootstrap wording is amended. Their seeds died with the process, so they can't answer a
+  nonce challenge.
+- 6.8: agreed. The signer and sysaccount public halves are pinned from mint output beside
+  the root pin. ck-bus refuses to start (health down, naming the mismatch) when the vault
+  disagrees with what the JWTs list.
+- 6.9: CKCRED's call.
+- 6.10: no TLS on the local listener. It binds loopback only, and every client authenticates
+  by JWT nonce challenge, the same trust boundary as the daemon's loopback HMAC. TLS
+  belongs on the leaf link to the hub, which is a federation slice. That needs ALF to amend
+  the foundation's install step (4).
+- 6.11: setup asks the daemon to restart the nats-server module (`supervisor.restart`) after
+  writing a new operator JWT, and verifies the new process. The spec gate is renamed to
+  SUBC.
+- 6.12: agreed, no new root keys for a new `{acct}`.
+- N5 is a security fact the slices must carry: a claims update is saved without a trust or
+  `iat` check. So only ck-bus's system user may hold the claims-update permission, and every
+  push is read back through the lookup before ck-bus treats it as applied.
