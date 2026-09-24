@@ -335,22 +335,31 @@ fn fixtures_carry_no_production_root() {
 fn production_binary_has_no_path_to_the_harness_signer() {
     let production = Path::new(env!("CARGO_BIN_EXE_ck-bus"));
     let this_test = std::env::current_exe().expect("current test binary");
-    let symbols = |binary: &Path| {
-        let output = Command::new("nm")
-            .arg(binary)
-            .output()
-            .unwrap_or_else(|error| panic!("nm {}: {error}", binary.display()));
-        assert!(output.status.success(), "nm {} failed", binary.display());
-        String::from_utf8_lossy(&output.stdout).into_owned()
-    };
-    assert!(
-        symbols(&this_test).contains("HarnessSigner"),
-        "control: this test binary links the signer, so the symbol scan must see it"
-    );
-    assert!(
-        !symbols(production).contains("HarnessSigner"),
-        "the production ck-bus binary must not contain the harness signer"
-    );
+    // The symbol read runs only where `nm` can see a Rust binary's symbols. A
+    // Windows MSVC executable keeps them in a separate .pdb, so `nm` returns
+    // nothing and the positive control below fails by design. There the
+    // dependency-tree and source reads still prove the signer is absent.
+    #[cfg(not(windows))]
+    {
+        let symbols = |binary: &Path| {
+            let output = Command::new("nm")
+                .arg(binary)
+                .output()
+                .unwrap_or_else(|error| panic!("nm {}: {error}", binary.display()));
+            assert!(output.status.success(), "nm {} failed", binary.display());
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+        assert!(
+            symbols(&this_test).contains("HarnessSigner"),
+            "control: this test binary links the signer, so the symbol scan must see it"
+        );
+        assert!(
+            !symbols(production).contains("HarnessSigner"),
+            "the production ck-bus binary must not contain the harness signer"
+        );
+    }
+    #[cfg(windows)]
+    let _ = (production, this_test);
 
     let tree = Command::new(env!("CARGO"))
         .args([
