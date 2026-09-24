@@ -1358,7 +1358,11 @@ SECTION governs.
   pipe option: it signs only nonce-shaped input (a length cap and the NATS nonce
   charset), and its vault connection is CLOEXEC toward anything it spawns.
   `leaf-signing-shape-unchosen` is discharged; the module id is named when slice 12 is
-  written.
+  written. The Go module's subc client presents ConsumerIdentity {module_id,
+  launch_nonce} on its route.open. Slice 12's acceptance includes one real
+  `credential.sign` arriving as `reserved:<that id>`, confirmed by CKCRED from the vault's
+  first-use row. Without the identity the call arrives as `direct` and is refused as
+  not_found, which is indistinguishable from a missing grant.
 - R14 (operator, 2026-09-24): revocation uses a narrow signing key plus short-lived
   user tokens. The operator's root identity key stays out of daily use; it vouches for
   an operator signing key that ck-bus alone may sign with (exact `sign` grant to
