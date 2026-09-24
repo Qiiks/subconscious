@@ -1348,3 +1348,14 @@ SECTION governs.
   needs a minimal Go subc client (handshake, HELLO, route.open, request). The
   alternative, routing the callback through a local ck-bus socket, turns ck-bus into a
   signing oracle for any process running as the same user.
+  Settled with CKCRED the same day. A third option, the Go binary as ck-bus's child
+  signing over an inherited pipe, was weighed and rejected: the embedded server is the
+  whole bus, not only the leaf, so tying it to ck-bus's lifetime would drop every
+  module's bus connection on each ck-bus restart. The measured property is that with
+  ck-bus down only new connections wait. So the Go binary is a subc-declared module
+  with its own launch nonce, and the exact `sign` grant on the leaf key goes to its own
+  reserved principal, never to `reserved:ckbus`. Two obligations carried over from the
+  pipe option: it signs only nonce-shaped input (a length cap and the NATS nonce
+  charset), and its vault connection is CLOEXEC toward anything it spawns.
+  `leaf-signing-shape-unchosen` is discharged; the module id is named when slice 12 is
+  written.
