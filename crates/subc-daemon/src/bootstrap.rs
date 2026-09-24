@@ -705,7 +705,7 @@ async fn serve_bound_daemon(
     let control_start_clock = crate::clock::StartClock::capture();
     let mut control = ControlHandler::with_forwarding(Arc::clone(&registry), forwarding)
         .with_process_liveness(process_liveness)
-        .with_supervisor(supervisor_handle)
+        .with_supervisor(supervisor_handle.clone())
         .with_connected_clients(connected_clients.clone())
         .with_storage_config(storage_config)
         .with_machine_id(bound.machine_id.clone())
@@ -801,6 +801,16 @@ async fn serve_bound_daemon(
     control.refresh_capability_requirements();
     Arc::clone(&control).spawn_capability_deadline_loop();
 
+    // Windows-only: an OMP-owned daemon retires itself when the last harness
+    // holder is gone. Gated at runtime by `OMP_SUBC_OWNED=1` inside
+    // `spawn_if_owned`, so standalone, service, and test daemons are untouched.
+    #[cfg(windows)]
+    let mut holder_task = crate::holder_monitor::HolderMonitor::spawn_if_owned(
+        bound.connection_file_path.clone(),
+        supervisor_handle.clone(),
+    )
+    .map(AbortOnDrop::new);
+
     #[cfg(unix)]
     {
         tokio::select! {
@@ -844,11 +854,31 @@ async fn serve_bound_daemon(
         Ok(())
     }
     #[cfg(not(unix))]
-    serve_task
-        .join()
-        .await
-        .map_err(BootstrapError::ServeJoin)?
-        .map_err(BootstrapError::Serve)
+    {
+        // A harness-owned daemon can also end itself: the holder monitor
+        // completes retirement, then this arm tears the listener and watchdog
+        // down and returns, so the process exits without a signal.
+        #[cfg(windows)]
+        if let Some(task) = holder_task.as_mut() {
+            tokio::select! {
+                result = serve_task.join() => {
+                    return result.map_err(BootstrapError::ServeJoin)?.map_err(BootstrapError::Serve);
+                }
+                result = task.join() => {
+                    let _retired: crate::holder_monitor::Retired =
+                        result.map_err(BootstrapError::ServeJoin)?;
+                    drop(serve_task);
+                    drop(_watchdog_task);
+                    return Ok(());
+                }
+            }
+        }
+        serve_task
+            .join()
+            .await
+            .map_err(BootstrapError::ServeJoin)?
+            .map_err(BootstrapError::Serve)
+    }
 }
 
 fn normalized_build_provenance(value: &str) -> Option<String> {

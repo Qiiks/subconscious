@@ -16,6 +16,8 @@ pub mod daemon_config;
 pub(crate) mod dispatch_spike;
 pub mod fleet_lint;
 pub mod forwarding;
+#[cfg(windows)]
+pub mod holder_monitor;
 pub mod identity;
 pub mod machine_id;
 pub mod observability;
