@@ -1,4 +1,4 @@
-//! Ladder row "Vault authorization" (slice 3). served-by: claustrum-binary only.
+//! Ladder row "Vault authorization" (slice 3 of `docs/specs/ck-bus-module.md`). served-by: claustrum-binary only.
 //!
 //! The fixture vault gets the operator ceremony with the placed `ck auth`:
 //! `mint-signing-key --id signing:ck-bus-account:1`, then exact `sign` and `read` grants

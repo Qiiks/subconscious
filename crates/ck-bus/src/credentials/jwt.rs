@@ -15,7 +15,8 @@ use sha2::{Digest, Sha256};
 
 use crate::grants::Grant;
 
-/// The fixed JWT header of every token the server accepts from an nkey issuer.
+/// The header ck-bus writes on every user JWT: a nats-io/jwt v2 token signed with an
+/// Ed25519 nkey.
 pub const JWT_HEADER: &str = r#"{"alg":"ed25519-nkey","typ":"JWT"}"#;
 
 /// The claims of one user JWT.
