@@ -1359,3 +1359,13 @@ SECTION governs.
   charset), and its vault connection is CLOEXEC toward anything it spawns.
   `leaf-signing-shape-unchosen` is discharged; the module id is named when slice 12 is
   written.
+- R14 (operator, 2026-09-24): revocation uses a narrow signing key plus short-lived
+  user tokens. The operator's root identity key stays out of daily use; it vouches for
+  an operator signing key that ck-bus alone may sign with (exact `sign` grant to
+  `reserved:ckbus`), and ck-bus re-signs the account JWT's revocation list with that key.
+  If the signing key is ever exposed, the root key removes it from the operator JWT.
+  User JWTs carry a short expiry that ck-bus renews while the module runs, so a token
+  that escapes revocation stops working at expiry. This resolves open question 2. The
+  key id and the expiry value are unagreed: the key needs CKCRED and the operator (a
+  ceremony like `signing:ck-bus-account:1`), and the expiry is `user-jwt-ttl-unpinned`
+  (ALF), with 15 minutes proposed by SUBC. Both gate slice 6 only.
