@@ -630,7 +630,9 @@ fi
 
 say "=== rollback"
 ts=$(date -u +%Y%m%dT%H%M%SZ)
-rb="$STAGING/ck-$MODULE.rollback-$ts"
+# Named for the binary, like the currency pointer: two binaries of one module
+# placed a second apart must not produce rollbacks only a timestamp tells apart.
+rb="$STAGING/$(basename "$DEST").rollback-$ts"
 mkdir -p "$STAGING"
 cp "$DEST" "$rb"
 # THE SNAPSHOT IS COMPARED AGAINST ITS SOURCE, not against a hash taken from
