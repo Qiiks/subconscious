@@ -1,9 +1,10 @@
 //! Ladder row "Grant generation" (slice 2). served-by: none -- the row opens no
 //! Claustrum or Callosum route and starts no server.
 //!
-//! The generator in `src/grants`, fed the foundation's pinned golden literals, emits the
-//! participant, bus-module and system-account permission sets. Rendered as a document,
-//! they must equal prefrontal's committed golden (vendored under
+//! The generator in `src/grants`, fed the fixed fixture identities the foundation pins
+//! (`PINNED_GOLDEN_FIXTURE`), emits the participant, bus-module and system-account
+//! permission sets. Rendered as a document, they must equal prefrontal's committed
+//! reference document `permission_golden.txt` (vendored under
 //! `tests/fixtures/foundation/`) except for the header line and the subjects named in
 //! `ADDED_SUBJECTS`. The controls show that a partial-token wildcard, a `deny` entry and
 //! an out-of-lexicon account are each refused.

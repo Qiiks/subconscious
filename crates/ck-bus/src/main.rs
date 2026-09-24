@@ -1,7 +1,8 @@
 // Each runtime capability is installed independently; until then its placeholder returns an explicit not-implemented error.
 #[allow(dead_code)]
 mod runtime;
-// Generated grants; credential issuance is their first caller, so nothing calls them yet.
+// Generated grants. Nothing in the runtime calls them yet; credential issuance, when it
+// lands, is expected to be the first caller.
 #[allow(dead_code)]
 mod grants;
 
