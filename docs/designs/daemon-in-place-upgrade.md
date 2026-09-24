@@ -825,16 +825,18 @@ state in the daemon, and this design already removes the expensive part.
 
 ## Unsettled
 
-- **The unsafe exception.** Adopting inherited fd numbers needs
-  `OwnedFd::from_raw_fd` (and closing unknown fds needs the same). Options: a
-  one-function crate that allows unsafe, or an existing crate that wraps it
-  (`listenfd`-style). Recommendation: the one-function crate, so the audited
-  surface is ours and tiny.
-- **macOS process identity.** The sweep needs a per-pid start time and running
-  executable on macOS. Candidates: the `sysctl` `KERN_PROC_PID` entry through a
-  safe wrapper crate, `libproc` (`proc_pidinfo`, `proc_pidpath`), or `ps -o
-  lstart=,comm=` (one-second resolution, a subprocess per entry). Not chosen
-  here.
+- **The unsafe exception. Decided (SUBC, 2026-09-24): one small crate of our own**
+  that alone allows unsafe, following the precedent of `subc-uptime` and
+  `subc-cgroup`: each wraps the smallest unsafe surface behind a safe API, so the
+  daemon crates keep `forbid(unsafe_code)`. Its API takes ownership of an
+  inherited fd number only after checking the fd is open and of the expected kind,
+  and closes inherited fds that are not adopted. Not an external wrapper crate: the
+  audited surface stays ours and a few dozen lines.
+- **macOS process identity. Decided: the same crate**, reading the start time from
+  `sysctl` `KERN_PROC_PID` (`kinfo_proc.kp_proc.p_starttime`, microsecond
+  resolution) and the executable from `proc_pidpath`. Not `ps`: one-second resolution
+  and a subprocess per entry. Until slice 1 lands this, the sweep logs and signals
+  nothing on macOS, as stated above.
 - **Module-side liveness timers.** The quiesce is only invisible to modules
   that do not time out an idle daemon. The Rust SDK answers pings
   (`subc-client-rs/src/lib.rs:1039`) and a search found no daemon-liveness
