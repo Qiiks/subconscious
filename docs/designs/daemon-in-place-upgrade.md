@@ -837,12 +837,28 @@ state in the daemon, and this design already removes the expensive part.
   resolution) and the executable from `proc_pidpath`. Not `ps`: one-second resolution
   and a subprocess per entry. Until slice 1 lands this, the sweep logs and signals
   nothing on macOS, as stated above.
-- **Module-side liveness timers.** The quiesce is only invisible to modules
-  that do not time out an idle daemon. The Rust SDK answers pings
-  (`subc-client-rs/src/lib.rs:1039`) and a search found no daemon-liveness
-  timer in it or in the TS provider, but hand-rolled modules were not checked.
-  The quiesce budget (drain plus late-GOODBYE bound plus park) must stay below
-  any such timer.
-- **The `module.draining` wire contract.** Whether any module relies on
-  receiving `module.draining` before every daemon incarnation change was not
-  checked; this design stops sending it on reexec.
+- **Module-side liveness timers. Settled (fleet census, 2026-09-24, #fleet-notices
+  #720-#739).** Every supervised module's owner answered from source: no module
+  closes, reconnects or exits on a quiet serve connection. That covers aft,
+  astrocyte, broca, callosum, cerebellum, claustrum, condition-runner, engram,
+  fusiform, insula, magic-context, plexus, prefrontal-core, synapse, thalamus and
+  wernicke. For subc-mcp, mcp-stdio-adapter and entorhinal, SUBC checked. One
+  bound to respect: aft gives its Pong a 250 ms enqueue bound and closes the
+  connection if its 256-frame writer queue is full. So the quiesce sends no Ping
+  or health probe into the parked window; step 2 already holds the prober and
+  settles pending control RPCs before the park.
+- **The `module.draining` wire contract. Settled (same census).** No module
+  depends on receiving it. Where a module reads it (aft, cerebellum), it is only an
+  optimisation, and those modules shut down correctly on EOF or SIGTERM without it.
+- **Second (client) daemon connections.** An in-place upgrade closes every
+  non-module connection, and several modules hold one besides their serve
+  connection (broca, callosum, insula, plexus, prefrontal-core, wernicke). All of
+  them reconnect on close, except **subc-mcp**: its tool-call relay client
+  (`SubcClient::start`, `crates/subc-mcp/src/main.rs`) never reconnects, so after an
+  in-place upgrade it would stay alive and relay nothing. Prerequisite before slice
+  3b ships: that relay reconnects, or subc-mcp exits so the daemon respawns it.
+- **In-flight work at the route drain (asked by broca, thalamus, cerebellum).**
+  The in-place path runs the same per-route drain as a module restart (step 4), so a
+  tool call, transform or input sequence that finishes within the budget completes.
+  Only work still running when the budget runs out is cut, exactly as on a module
+  restart.
