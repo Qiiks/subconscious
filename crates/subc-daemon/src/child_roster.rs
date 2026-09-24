@@ -55,6 +55,7 @@ impl DaemonShutdownFlag {
         self.0.load(Ordering::SeqCst)
     }
 
+    #[cfg(unix)]
     fn set(&self) {
         self.0.store(true, Ordering::SeqCst);
     }

@@ -2553,11 +2553,7 @@ async fn module_terminals(
                     entry.get("exit_code").and_then(Value::as_i64),
                 )
                 .unwrap_or_else(|| "unknown".to_string());
-                let disposition = entry
-                    .get("disposition")
-                    .and_then(Value::as_str)
-                    .map(humanize_identifier)
-                    .unwrap_or_else(|| "unknown".to_string());
+                let disposition = terminal_disposition_label(entry);
                 let incarnation = entry
                     .get("daemon_incarnation")
                     .and_then(Value::as_str)
@@ -5967,6 +5963,16 @@ fn format_exit(signal: Option<i64>, code: Option<i64>) -> Option<String> {
     }
 }
 
+/// The `disposition` column of `ck module terminals`, in words: `restarting`,
+/// `daemon shutdown`, and any value a newer daemon sends, spelled the same way.
+fn terminal_disposition_label(entry: &Value) -> String {
+    entry
+        .get("disposition")
+        .and_then(Value::as_str)
+        .map(humanize_identifier)
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 fn humanize_identifier(value: &str) -> String {
     value.replace(['_', '-'], " ")
 }
@@ -7560,6 +7566,19 @@ impl From<serde_json::Error> for CkError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn terminal_dispositions_render_as_words() {
+        let label = |disposition: &str| {
+            super::terminal_disposition_label(&serde_json::json!({ "disposition": disposition }))
+        };
+        assert_eq!(label("daemon_shutdown"), "daemon shutdown");
+        assert_eq!(label("restarting"), "restarting");
+        assert_eq!(
+            super::terminal_disposition_label(&serde_json::json!({})),
+            "unknown"
+        );
+    }
+
     /// A module keeps its pre-adoption r1 history beside its r2 segments, so the
     /// merged view reads one directory holding both grammars. The r1 lines must
     /// be dated and interleave by time: left undated, they sort after every r2

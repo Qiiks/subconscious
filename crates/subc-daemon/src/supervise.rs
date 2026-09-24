@@ -5001,6 +5001,7 @@ async fn set_child_enabled(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn on_child_exit(
     spec: &ModuleSpec,
     policy: RestartPolicy,
