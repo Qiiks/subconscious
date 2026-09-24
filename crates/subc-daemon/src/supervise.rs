@@ -79,6 +79,27 @@ const DEFAULT_RESTART_WINDOW: Duration = Duration::from_secs(600);
 pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const REGISTRY_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 const REGISTRY_RELEASE_POLL: Duration = Duration::from_millis(10);
+/// How long a restart waits for the exited process's output readers.
+///
+/// The restart does not depend on the stderr reader finishing. A reader still
+/// running at this bound is left running, and whatever it delivers later goes
+/// into the exited process's own section of the stderr ring (see
+/// `StderrRing::push_line_from`), ending naturally at EOF on its pipe. So the
+/// bound no longer decides whether a crash's last lines are kept: under load
+/// the reader may simply not have been scheduled yet, and cutting it there
+/// discarded exactly the lines that explained the crash.
+///
+/// What the bound still decides is when the tail starts reporting
+/// `Incomplete`: a pipe open past it usually means a descendant of the exited
+/// process still holds it, and the tail cannot claim to be whole until that
+/// pipe closes. That is also the only case in which the wait costs the restart
+/// anything, because a pipe with no other holder reaches EOF when the process
+/// exits. Under load a slow reader can show `Incomplete` briefly; it returns to
+/// `Captured` at EOF with nothing lost.
+///
+/// The stdout reader carries no ring, only the capture file, and is still
+/// stopped at this bound so an old process's stdout cannot trail into the file
+/// after its successor starts.
 const STDERR_PUMP_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 /// Maximum number of supervised process spawn/exit facts retained per daemon incarnation.
 pub const SPAWN_EVENT_RING_CAPACITY: usize = 4096;
@@ -98,7 +119,7 @@ struct SupervisedChild {
     #[cfg(target_os = "linux")]
     cgroup_placement: Option<subc_cgroup::Placement>,
     stdout_pump: Option<JoinHandle<()>>,
-    stderr_pump: Option<JoinHandle<()>>,
+    stderr_pump: Option<StderrPump>,
     stderr_ring: Arc<Mutex<StderrRing>>,
     spawned_at_ms: u64,
     spawned_from: PathBuf,
@@ -158,33 +179,67 @@ impl SupervisedChild {
             }
         }
 
-        let Some(mut pump) = self.stderr_pump.take() else {
+        let Some(pump) = self.stderr_pump.take() else {
             return;
         };
-        match timeout(STDERR_PUMP_DRAIN_TIMEOUT, &mut pump).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                self.stderr_ring
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .mark_incomplete(format!("stderr pump ended unexpectedly: {err}"));
-                warn!(module_id, error = %err, "stderr pump ended before clean EOF");
-            }
-            Err(_) => {
-                pump.abort();
-                self.stderr_ring
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .mark_incomplete(format!(
-                        "stderr pump did not reach EOF within {:?} before restart",
-                        STDERR_PUMP_DRAIN_TIMEOUT
-                    ));
-                warn!(
-                    module_id,
-                    waited = ?STDERR_PUMP_DRAIN_TIMEOUT,
-                    "stderr pump did not drain before restart; stopped it before marking the new process"
-                );
-            }
+        settle_stderr_pump(
+            module_id,
+            &self.stderr_ring,
+            pump,
+            STDERR_PUMP_DRAIN_TIMEOUT,
+        )
+        .await;
+    }
+}
+
+/// The reader task for one process's stderr, with the ring generation its
+/// lines are attributed to.
+struct StderrPump {
+    task: JoinHandle<()>,
+    generation: u64,
+}
+
+/// Retire an exited process's stderr reader and wait up to `bound` for it to
+/// reach EOF. A reader still running at the bound is detached, not stopped: it
+/// keeps filling the exited process's section of the ring until its pipe
+/// closes, and the tail reads `Incomplete` until then. See
+/// [`STDERR_PUMP_DRAIN_TIMEOUT`] for why.
+async fn settle_stderr_pump(
+    module_id: &str,
+    ring: &Arc<Mutex<StderrRing>>,
+    pump: StderrPump,
+    bound: Duration,
+) {
+    let lock = || ring.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let StderrPump {
+        mut task,
+        generation,
+    } = pump;
+    lock().retire_pump(generation);
+    match timeout(bound, &mut task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            let mut ring = lock();
+            ring.mark_incomplete(format!("stderr pump ended unexpectedly: {err}"));
+            ring.finish_pump(generation);
+            warn!(module_id, error = %err, "stderr pump ended before clean EOF");
+        }
+        Err(_) => {
+            // Dropping the handle detaches the task; it ends at EOF on its pipe.
+            drop(task);
+            lock().mark_pump_late(
+                generation,
+                format!(
+                    "stderr of the exited process had not reached EOF {bound:?} after it was \
+                     retired (a descendant may still hold the pipe open); lines it still \
+                     writes are kept in that process's section"
+                ),
+            );
+            warn!(
+                module_id,
+                waited = ?bound,
+                "stderr pipe of the exited process is still open; its reader keeps running without delaying the restart"
+            );
         }
     }
 }
@@ -5656,14 +5711,19 @@ fn spawn_child_in_slot(
     };
     let stderr_pump = match child.stderr.take() {
         Some(stderr) => {
-            ring.lock()
+            let generation = ring
+                .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push_process_start();
-            Some(tokio::spawn(pump_stderr_to(
-                stderr,
-                Arc::clone(ring),
-                output_sink,
-            )))
+                .begin_process();
+            Some(StderrPump {
+                task: tokio::spawn(pump_stderr_to(
+                    stderr,
+                    Arc::clone(ring),
+                    generation,
+                    output_sink,
+                )),
+                generation,
+            })
         }
         None => {
             // Spawning succeeded but the pipe did not materialise. Recording it as
@@ -9150,5 +9210,202 @@ mod terminal_history_read_concurrency_tests {
             "the next read merges ring and journal with no duplicate"
         );
         assert_eq!(after.journal_skipped_lines, 0);
+    }
+}
+
+/// What a restart does with the exited process's stderr reader. These drive
+/// the same `settle_stderr_pump` the supervisor calls, with a reader the test
+/// holds, so a reader that has not been scheduled by the bound is a controlled
+/// input rather than something only a loaded machine produces.
+#[cfg(test)]
+mod stderr_settle_tests {
+    use std::{
+        future::Future,
+        io,
+        pin::Pin,
+        sync::{Arc, Mutex},
+        task::{Context, Poll},
+        time::Duration,
+    };
+
+    use tokio::{
+        io::{AsyncRead, ReadBuf},
+        sync::oneshot,
+        time::Instant,
+    };
+
+    use super::{settle_stderr_pump, StderrPump};
+    use crate::stderr_tail::{
+        pump_stderr_to, CaptureState, OutputSink, StderrRing, StderrTailConfig, TailEntry,
+    };
+
+    const BOUND: Duration = Duration::from_millis(250);
+
+    /// Yields `before`, then stays pending until the gate is released, then
+    /// yields `after` and reaches EOF. The bytes after the gate were written
+    /// by a process that has already exited; only the reader is behind.
+    struct HeldReader {
+        before: Option<Vec<u8>>,
+        gate: Option<oneshot::Receiver<()>>,
+        after: io::Cursor<Vec<u8>>,
+    }
+
+    impl AsyncRead for HeldReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if let Some(bytes) = self.before.take() {
+                buf.put_slice(&bytes);
+                return Poll::Ready(Ok(()));
+            }
+            if let Some(gate) = self.gate.as_mut() {
+                match Pin::new(gate).poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(_) => self.gate = None,
+                }
+            }
+            Pin::new(&mut self.after).poll_read(cx, buf)
+        }
+    }
+
+    struct DiscardSink;
+
+    impl OutputSink for DiscardSink {
+        fn write_line(&mut self, _line: &[u8]) {}
+    }
+
+    fn line(text: &str) -> TailEntry {
+        TailEntry::Line {
+            text: text.to_string(),
+            truncated: false,
+        }
+    }
+
+    fn lock(ring: &Arc<Mutex<StderrRing>>) -> std::sync::MutexGuard<'_, StderrRing> {
+        ring.lock().unwrap()
+    }
+
+    /// Start a reader for a new process generation that delivers `before`
+    /// immediately and `after` only once the returned sender fires (or is
+    /// dropped).
+    fn held_pump(
+        ring: &Arc<Mutex<StderrRing>>,
+        before: &str,
+        after: &str,
+    ) -> (StderrPump, oneshot::Sender<()>) {
+        let generation = lock(ring).begin_process();
+        let (release, gate) = oneshot::channel();
+        let reader = HeldReader {
+            before: Some(before.as_bytes().to_vec()),
+            gate: Some(gate),
+            after: io::Cursor::new(after.as_bytes().to_vec()),
+        };
+        let task = tokio::spawn(pump_stderr_to(
+            reader,
+            Arc::clone(ring),
+            generation,
+            DiscardSink,
+        ));
+        (StderrPump { task, generation }, release)
+    }
+
+    async fn wait_until(ring: &Arc<Mutex<StderrRing>>, done: impl Fn(&StderrRing) -> bool) {
+        for _ in 0..1000 {
+            if done(&lock(ring)) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!(
+            "ring never reached the expected state: {:?}",
+            lock(ring).snapshot(None, None)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_crash_line_the_reader_had_not_reached_by_the_bound_is_kept_before_the_restart() {
+        let ring = Arc::new(Mutex::new(StderrRing::new(StderrTailConfig::default())));
+        let (pump, release) = held_pump(&ring, "booting\n", "config error: missing storage\n");
+
+        settle_stderr_pump("crasher", &ring, pump, BOUND).await;
+        let before_release = lock(&ring).snapshot(None, None);
+        assert!(
+            matches!(before_release.capture, CaptureState::Incomplete { .. }),
+            "a reader that has not reached EOF cannot claim a whole tail: {before_release:?}"
+        );
+
+        // The restart: the next process starts and writes before the old
+        // reader catches up.
+        let next = lock(&ring).begin_process();
+        lock(&ring).push_line_from(next, "next process booting");
+        release.send(()).unwrap();
+        wait_until(&ring, |ring| {
+            ring.snapshot(None, None).capture == CaptureState::Captured
+        })
+        .await;
+
+        assert_eq!(
+            lock(&ring).snapshot(None, None).entries,
+            vec![
+                line("booting"),
+                line("config error: missing storage"),
+                TailEntry::ProcessStart,
+                line("next process booting"),
+            ],
+            "the crash's last line must survive a slow reader and stay in the crashed process's section"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pipe_held_open_by_a_descendant_reads_incomplete_without_delaying_the_restart_past_the_bound(
+    ) {
+        let ring = Arc::new(Mutex::new(StderrRing::new(StderrTailConfig::default())));
+        // `_held` is never fired: a descendant keeps the pipe open for the
+        // whole test.
+        let (pump, _held) = held_pump(&ring, "parent exiting\n", "");
+
+        let started = Instant::now();
+        settle_stderr_pump("orphaning", &ring, pump, BOUND).await;
+        assert_eq!(
+            started.elapsed(),
+            BOUND,
+            "the restart must wait exactly the bound for a pipe that stays open, no longer"
+        );
+
+        let next = lock(&ring).begin_process();
+        lock(&ring).push_line_from(next, "next process booting");
+        tokio::time::sleep(Duration::from_secs(60)).await;
+
+        let snapshot = lock(&ring).snapshot(None, None);
+        match &snapshot.capture {
+            CaptureState::Incomplete { reason } => assert!(
+                reason.contains("had not reached EOF") && reason.contains("250ms"),
+                "the reason must say what is missing and after how long: {reason}"
+            ),
+            other => panic!("expected Incomplete while the pipe is held open, got {other:?}"),
+        }
+        assert_eq!(
+            snapshot.entries,
+            vec![
+                line("parent exiting"),
+                TailEntry::ProcessStart,
+                line("next process booting"),
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reader_that_reaches_eof_within_the_bound_leaves_the_tail_captured() {
+        let ring = Arc::new(Mutex::new(StderrRing::new(StderrTailConfig::default())));
+        let (pump, release) = held_pump(&ring, "one\n", "two\n");
+        release.send(()).unwrap();
+
+        settle_stderr_pump("clean", &ring, pump, BOUND).await;
+
+        let snapshot = lock(&ring).snapshot(None, None);
+        assert_eq!(snapshot.capture, CaptureState::Captured);
+        assert_eq!(snapshot.entries, vec![line("one"), line("two")]);
     }
 }

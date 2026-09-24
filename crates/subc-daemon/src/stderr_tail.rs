@@ -18,7 +18,7 @@
 //! to know they are reading a tail rather than a history. The daemon log keeps
 //! doing its job; this exists because that job has a time limit.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -57,7 +57,10 @@ pub const DEFAULT_MAX_BYTES: usize = 64 * 1024;
 pub enum CaptureState {
     /// A reader is attached, or was attached and reached clean EOF.
     Captured,
-    /// Retained entries are valid, but capture ended before clean EOF.
+    /// Retained entries are valid, but capture ended before clean EOF, or the
+    /// pipe of a process the supervisor has already moved on from has not
+    /// reached EOF yet. The second kind clears when that pipe does reach EOF,
+    /// because from then on nothing that process wrote is missing.
     Incomplete { reason: String },
     /// No reader was attached. The tail says nothing about what the module wrote.
     NotCaptured { reason: String },
@@ -88,6 +91,38 @@ impl TailEntry {
             Self::ProcessStart => 0,
         }
     }
+}
+
+/// One stored entry. Unlike [`TailEntry`], a boundary remembers which process
+/// generation it starts, so a line that arrives late from an older process can
+/// be put back in that process's section instead of after its successor's
+/// boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Slot {
+    Line { text: String, truncated: bool },
+    ProcessStart { generation: u64 },
+}
+
+impl Slot {
+    fn cost(&self) -> usize {
+        match self {
+            Self::Line { text, .. } => text.len(),
+            Self::ProcessStart { .. } => 0,
+        }
+    }
+}
+
+/// Where the stderr reader of one process generation stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PumpPhase {
+    /// The process is the supervisor's current concern; its lines go at the end.
+    Attached,
+    /// The supervisor has moved on from the process, but its pipe is still open.
+    /// Lines it still delivers belong in its own section.
+    Retired,
+    /// Retired, and the pipe was still open when the supervisor stopped waiting
+    /// for it. Reported as `Incomplete` until the pipe reaches EOF.
+    Late { reason: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,10 +187,16 @@ impl StderrTailSnapshot {
 /// *before* that exit, so clearing on restart would discard the lines exactly
 /// when they become the thing being asked for. [`TailEntry::ProcessStart`] keeps
 /// the generations distinguishable instead.
+///
+/// A process's stderr reader can outlive the supervisor's interest in it: the
+/// reader may not have been scheduled yet when the process exited, or a
+/// descendant may still hold the pipe open. Lines such a reader delivers after
+/// the next process started are placed before that next process's boundary, so
+/// the section a line appears in always names the process that wrote it.
 #[derive(Debug)]
 pub struct StderrRing {
     config: StderrTailConfig,
-    entries: VecDeque<TailEntry>,
+    entries: VecDeque<Slot>,
     // Count of `TailEntry::Line` entries, kept running because eviction checks
     // it on every push and recounting would walk the whole ring under the
     // mutex each time.
@@ -163,6 +204,14 @@ pub struct StderrRing {
     bytes: usize,
     dropped_lines: u64,
     capture: CaptureState,
+    /// Generation of the newest process boundary; 0 before the first.
+    generation: u64,
+    /// Readers that have not reached EOF yet, by the generation they read for.
+    pumps: BTreeMap<u64, PumpPhase>,
+    /// Highest generation whose boundary was evicted from the front. A late line
+    /// from an older generation belongs in front of that boundary, which is
+    /// evicted territory, so it is counted as dropped rather than stored.
+    evicted_through: u64,
 }
 
 impl StderrRing {
@@ -178,7 +227,15 @@ impl StderrRing {
             capture: CaptureState::NotCaptured {
                 reason: "stderr reader has not started".to_string(),
             },
+            generation: 0,
+            pumps: BTreeMap::new(),
+            evicted_through: 0,
         }
+    }
+
+    /// Generation of the newest process boundary.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn mark_captured(&mut self) {
@@ -199,22 +256,69 @@ impl StderrRing {
         };
     }
 
-    /// Record that a new process was spawned for this module.
+    /// Record that a new process was spawned for this module, returning the
+    /// generation number its lines are attributed to.
     ///
     /// A boundary separates output on either side of it, so one with nothing
     /// before it separates nothing: on the FIRST spawn it would make a module
     /// that printed nothing render as a marker rather than as empty, and the
     /// caller then has to decide whether a one-marker tail counts as silence.
-    /// Recording it only once there is something to divide keeps "captured and
-    /// empty" literally empty.
-    pub fn push_process_start(&mut self) {
-        if self.entries.is_empty() && self.dropped_lines == 0 {
-            return;
+    /// The boundary is still stored, because a late line from an older process
+    /// needs it to find its section, but [`Self::snapshot`] shows it only once
+    /// there is output before it to divide, which keeps "captured and empty"
+    /// literally empty.
+    pub fn push_process_start(&mut self) -> u64 {
+        self.generation += 1;
+        let generation = self.generation;
+        // Two boundaries in a row mean the process between them has written
+        // nothing retained. The earlier one can go only if no reader from its
+        // generation onward is still open: such a reader may yet deliver a line
+        // that belongs between the two. Without this a module that restarts
+        // silently would grow the ring by one boundary per restart forever.
+        if let Some(Slot::ProcessStart {
+            generation: previous,
+        }) = self.entries.back()
+        {
+            if self.pumps.range(*previous..).next().is_none() {
+                self.entries.pop_back();
+            }
         }
-        if matches!(self.entries.back(), Some(TailEntry::ProcessStart)) {
-            return;
+        self.push_entry(Slot::ProcessStart { generation });
+        generation
+    }
+
+    /// [`Self::push_process_start`] for a process whose stderr reader is
+    /// attached: the reader is tracked until it calls [`Self::finish_pump`].
+    pub(crate) fn begin_process(&mut self) -> u64 {
+        let generation = self.push_process_start();
+        self.pumps.insert(generation, PumpPhase::Attached);
+        generation
+    }
+
+    /// The supervisor has moved on from this generation's process. Its reader
+    /// keeps running, and any line it still delivers is kept in its own section.
+    pub(crate) fn retire_pump(&mut self, generation: u64) {
+        if let Some(phase @ PumpPhase::Attached) = self.pumps.get_mut(&generation) {
+            *phase = PumpPhase::Retired;
         }
-        self.push_entry(TailEntry::ProcessStart);
+    }
+
+    /// The supervisor stopped waiting for this generation's reader before its
+    /// pipe reached EOF. The capture reads as `Incomplete` with `reason` until
+    /// the reader finishes. A reader that already finished is left alone: it
+    /// got everything.
+    pub(crate) fn mark_pump_late(&mut self, generation: u64, reason: impl Into<String>) {
+        if let Some(phase) = self.pumps.get_mut(&generation) {
+            *phase = PumpPhase::Late {
+                reason: reason.into(),
+            };
+        }
+    }
+
+    /// This generation's reader has stopped: at EOF, or on a read error that
+    /// has already been recorded with [`Self::mark_incomplete`].
+    pub(crate) fn finish_pump(&mut self, generation: u64) {
+        self.pumps.remove(&generation);
     }
 
     /// Admit one complete line, truncating it if it exceeds the per-line cap.
@@ -222,16 +326,51 @@ impl StderrRing {
     /// `line` must not contain a trailing newline; the reader strips it so the
     /// stored text and the byte accounting agree.
     pub fn push_line(&mut self, line: &str) {
-        let (text, truncated) = truncate_line(line, self.config.max_line_bytes);
-        self.push_entry(TailEntry::Line { text, truncated });
+        self.push_line_from(self.generation, line);
     }
 
-    fn push_entry(&mut self, entry: TailEntry) {
+    /// [`Self::push_line`] for a line read from `generation`'s pipe.
+    ///
+    /// A line from a retired process that arrives after a newer process started
+    /// goes in front of the first boundary newer than its own generation. Lines
+    /// from a process the supervisor has not retired (the incumbent during a
+    /// swap's overlap) go at the end, as they arrive.
+    pub(crate) fn push_line_from(&mut self, generation: u64, line: &str) {
+        let (text, truncated) = truncate_line(line, self.config.max_line_bytes);
+        let slot = Slot::Line { text, truncated };
+        let retired = matches!(
+            self.pumps.get(&generation),
+            Some(PumpPhase::Retired | PumpPhase::Late { .. })
+        );
+        if !retired || generation >= self.generation {
+            self.push_entry(slot);
+            return;
+        }
+        if self.evicted_through > generation {
+            // The section this line belongs to has been evicted, so the line is
+            // older than everything retained.
+            self.dropped_lines += 1;
+            return;
+        }
+        let index = self.entries.iter().position(
+            |slot| matches!(slot, Slot::ProcessStart { generation: start } if *start > generation),
+        );
+        match index {
+            Some(index) => self.insert_entry(index, slot),
+            None => self.push_entry(slot),
+        }
+    }
+
+    fn push_entry(&mut self, entry: Slot) {
+        self.insert_entry(self.entries.len(), entry);
+    }
+
+    fn insert_entry(&mut self, index: usize, entry: Slot) {
         self.bytes += entry.cost();
-        if matches!(entry, TailEntry::Line { .. }) {
+        if matches!(entry, Slot::Line { .. }) {
             self.lines += 1;
         }
-        self.entries.push_back(entry);
+        self.entries.insert(index, entry);
         self.evict_to_fit();
     }
 
@@ -243,9 +382,14 @@ impl StderrRing {
                 break;
             };
             self.bytes -= evicted.cost();
-            if matches!(evicted, TailEntry::Line { .. }) {
-                self.lines -= 1;
-                self.dropped_lines += 1;
+            match evicted {
+                Slot::Line { .. } => {
+                    self.lines -= 1;
+                    self.dropped_lines += 1;
+                }
+                Slot::ProcessStart { generation } => {
+                    self.evicted_through = self.evicted_through.max(generation);
+                }
             }
         }
     }
@@ -261,12 +405,34 @@ impl StderrRing {
         let line_limit = max_lines.unwrap_or(self.config.max_lines);
         let byte_limit = max_bytes.unwrap_or(self.config.max_bytes);
 
+        // The stored boundaries, reduced to the ones worth showing: a boundary
+        // with no output before it (retained or evicted) divides nothing, and
+        // two in a row say no more than one.
+        let mut visible: Vec<TailEntry> = Vec::with_capacity(self.entries.len());
+        let mut output_before = self.dropped_lines > 0;
+        for slot in &self.entries {
+            match slot {
+                Slot::Line { text, truncated } => {
+                    visible.push(TailEntry::Line {
+                        text: text.clone(),
+                        truncated: *truncated,
+                    });
+                    output_before = true;
+                }
+                Slot::ProcessStart { .. } => {
+                    if output_before && !matches!(visible.last(), Some(TailEntry::ProcessStart)) {
+                        visible.push(TailEntry::ProcessStart);
+                    }
+                }
+            }
+        }
+
         let mut taken: Vec<TailEntry> = Vec::new();
         let mut bytes = 0usize;
         let mut lines = 0usize;
         // Walk backwards: a tail is anchored at the newest end, so a caller
         // asking for 20 lines wants the last 20, not the first 20.
-        for entry in self.entries.iter().rev() {
+        for entry in visible.iter().rev() {
             match entry {
                 TailEntry::Line { .. } => {
                     if lines >= line_limit {
@@ -286,20 +452,25 @@ impl StderrRing {
         }
         taken.reverse();
 
-        let withheld = self
-            .entries
-            .iter()
-            .filter(|entry| matches!(entry, TailEntry::Line { .. }))
-            .count()
-            .saturating_sub(
-                taken
-                    .iter()
-                    .filter(|entry| matches!(entry, TailEntry::Line { .. }))
-                    .count(),
-            );
+        let withheld = self.lines.saturating_sub(lines);
+
+        // A retired process whose pipe the supervisor stopped waiting for may
+        // still be writing; until its reader reaches EOF the tail cannot claim
+        // to hold everything. A permanent state (a read failure, no pipe at
+        // all) is the more specific fact and is reported as is.
+        let late = self.pumps.values().find_map(|phase| match phase {
+            PumpPhase::Late { reason } => Some(reason),
+            _ => None,
+        });
+        let capture = match (&self.capture, late) {
+            (CaptureState::Captured, Some(reason)) => CaptureState::Incomplete {
+                reason: reason.clone(),
+            },
+            (capture, _) => capture.clone(),
+        };
 
         StderrTailSnapshot {
-            capture: self.capture.clone(),
+            capture,
             entries: taken,
             // Lines the ring evicted plus lines this request's own limits held
             // back. Both mean the same thing to the reader -- the text above is
@@ -398,14 +569,19 @@ impl OutputSink for ChildOutputSink {
     }
 }
 
-pub(crate) async fn pump_stderr_to<R>(
+/// Read one process generation's stderr to EOF. `generation` is the value
+/// [`StderrRing::begin_process`] returned for that process; it decides which
+/// section of the ring a line lands in if the reader outlives the process.
+pub(crate) async fn pump_stderr_to<R, S>(
     source: R,
     ring: Arc<Mutex<StderrRing>>,
-    mut sink: ChildOutputSink,
+    generation: u64,
+    mut sink: S,
 ) where
     R: AsyncReadExt + Unpin,
+    S: OutputSink,
 {
-    pump_stderr_into(source, ring, &mut sink).await;
+    pump_lines_into(source, Some((&ring, generation)), &mut sink, "stderr").await;
 }
 
 pub(crate) async fn pump_stdout_to<R>(source: R, mut sink: ChildOutputSink)
@@ -415,24 +591,27 @@ where
     pump_lines_into(source, None, &mut sink, "stdout").await;
 }
 
+/// Read stderr for whichever process generation is newest when the reader
+/// starts.
 async fn pump_stderr_into<R, S>(source: R, ring: Arc<Mutex<StderrRing>>, sink: &mut S)
 where
     R: AsyncReadExt + Unpin,
     S: OutputSink,
 {
-    pump_lines_into(source, Some(&ring), sink, "stderr").await;
+    let generation = lock_ring(&ring).generation();
+    pump_lines_into(source, Some((&ring, generation)), sink, "stderr").await;
 }
 
 async fn pump_lines_into<R, S>(
     mut source: R,
-    ring: Option<&Arc<Mutex<StderrRing>>>,
+    ring: Option<(&Arc<Mutex<StderrRing>>, u64)>,
     sink: &mut S,
     stream_name: &str,
 ) where
     R: AsyncReadExt + Unpin,
     S: OutputSink,
 {
-    if let Some(ring) = ring {
+    if let Some((ring, _)) = ring {
         lock_ring(ring).mark_captured();
     }
 
@@ -450,8 +629,10 @@ async fn pump_lines_into<R, S>(
             Ok(0) => break,
             Ok(n) => n,
             Err(error) => {
-                if let Some(ring) = ring {
-                    lock_ring(ring).mark_incomplete(format!("{stream_name} read failed: {error}"));
+                if let Some((ring, generation)) = ring {
+                    let mut ring = lock_ring(ring);
+                    ring.mark_incomplete(format!("{stream_name} read failed: {error}"));
+                    ring.finish_pump(generation);
                 } else {
                     tracing::warn!(stream = stream_name, error = %error, "child output capture read failed");
                 }
@@ -484,6 +665,9 @@ async fn pump_lines_into<R, S>(
     if !pending.is_empty() {
         emit_line(ring, sink, &pending, false);
     }
+    if let Some((ring, generation)) = ring {
+        lock_ring(ring).finish_pump(generation);
+    }
 }
 
 // Bytes examined by newline searches, summed across a pump. Tests use this to
@@ -515,13 +699,13 @@ fn find_newline(haystack: &[u8]) -> Option<usize> {
 }
 
 fn emit_line<S: OutputSink>(
-    ring: Option<&Arc<Mutex<StderrRing>>>,
+    ring: Option<(&Arc<Mutex<StderrRing>>, u64)>,
     sink: &mut S,
     raw: &[u8],
     terminated: bool,
 ) {
-    if let Some(ring) = ring {
-        lock_ring(ring).push_line(&String::from_utf8_lossy(raw));
+    if let Some((ring, generation)) = ring {
+        lock_ring(ring).push_line_from(generation, &String::from_utf8_lossy(raw));
     }
 
     // Framed and written in ONE call. Two writes would let the other pipe land
@@ -957,8 +1141,24 @@ mod tests {
         ring.push_line("first process said this");
         ring.push_process_start();
         assert!(
-            matches!(ring.entries.back(), Some(TailEntry::ProcessStart)),
+            matches!(ring.entries.back(), Some(Slot::ProcessStart { .. })),
             "a boundary with output before it must be recorded"
+        );
+        ring.push_line("second process said this");
+        assert_eq!(
+            ring.snapshot(None, None).entries,
+            vec![
+                TailEntry::Line {
+                    text: "first process said this".to_string(),
+                    truncated: false
+                },
+                TailEntry::ProcessStart,
+                TailEntry::Line {
+                    text: "second process said this".to_string(),
+                    truncated: false
+                },
+            ],
+            "only the boundary with output before it may be shown"
         );
     }
 
@@ -977,10 +1177,151 @@ mod tests {
         ring.lines = 0;
         ring.bytes = 0;
         ring.push_process_start();
-        assert!(matches!(
-            ring.entries.front(),
-            Some(TailEntry::ProcessStart)
-        ));
+        ring.push_line("survivor");
+        assert_eq!(
+            ring.snapshot(None, None).entries,
+            vec![
+                TailEntry::ProcessStart,
+                TailEntry::Line {
+                    text: "survivor".to_string(),
+                    truncated: false
+                },
+            ]
+        );
+    }
+
+    fn line(text: &str) -> TailEntry {
+        TailEntry::Line {
+            text: text.to_string(),
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn a_late_line_from_a_retired_process_lands_in_that_processs_section() {
+        // The reader of a process that already exited may deliver its last
+        // lines after the next process started. Appending them would put the
+        // crash's own explanation under its successor's boundary.
+        let mut ring = ring(10, 10_000, 128);
+        ring.mark_captured();
+        let old = ring.begin_process();
+        ring.push_line_from(old, "old: booting");
+        ring.retire_pump(old);
+        let new = ring.begin_process();
+        ring.push_line_from(new, "new: booting");
+        ring.push_line_from(old, "old: config error");
+
+        assert_eq!(
+            ring.snapshot(None, None).entries,
+            vec![
+                line("old: booting"),
+                line("old: config error"),
+                TailEntry::ProcessStart,
+                line("new: booting"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_line_from_a_process_that_was_not_retired_is_appended_as_it_arrives() {
+        // A swap runs the incumbent alongside its candidate; until the
+        // supervisor retires it, the incumbent is live and its lines are news.
+        let mut ring = ring(10, 10_000, 128);
+        ring.mark_captured();
+        let incumbent = ring.begin_process();
+        ring.push_line_from(incumbent, "incumbent: before");
+        let candidate = ring.begin_process();
+        ring.push_line_from(candidate, "candidate: booting");
+        ring.push_line_from(incumbent, "incumbent: still serving");
+
+        assert_eq!(
+            ring.snapshot(None, None).entries,
+            vec![
+                line("incumbent: before"),
+                TailEntry::ProcessStart,
+                line("candidate: booting"),
+                line("incumbent: still serving"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_late_line_keeps_its_section_when_the_process_had_printed_nothing_before() {
+        // A process whose reader had delivered nothing when its successor
+        // started has a boundary with nothing after it. Dropping that boundary
+        // as redundant would file the late line under the process before.
+        let mut ring = ring(10, 10_000, 128);
+        ring.mark_captured();
+        let first = ring.begin_process();
+        ring.push_line_from(first, "first: done");
+        ring.finish_pump(first);
+        let old = ring.begin_process();
+        ring.retire_pump(old);
+        let new = ring.begin_process();
+        ring.push_line_from(new, "new: booting");
+        ring.push_line_from(old, "old: config error");
+
+        assert_eq!(
+            ring.snapshot(None, None).entries,
+            vec![
+                line("first: done"),
+                TailEntry::ProcessStart,
+                line("old: config error"),
+                TailEntry::ProcessStart,
+                line("new: booting"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_late_line_whose_section_was_evicted_counts_as_dropped() {
+        let mut ring = ring(2, 10_000, 128);
+        ring.mark_captured();
+        let old = ring.begin_process();
+        ring.push_line_from(old, "old");
+        ring.retire_pump(old);
+        let new = ring.begin_process();
+        for text in ["new 1", "new 2", "new 3"] {
+            ring.push_line_from(new, text);
+        }
+        // The old section and the boundary after it are gone; the late line
+        // belongs in front of everything retained.
+        ring.push_line_from(old, "old, late");
+
+        let snapshot = ring.snapshot(None, None);
+        assert_eq!(snapshot.entries, vec![line("new 2"), line("new 3")]);
+        assert_eq!(snapshot.dropped_lines, 3);
+    }
+
+    #[test]
+    fn a_late_reader_reads_incomplete_until_its_pipe_reaches_eof() {
+        let mut ring = ring(10, 10_000, 128);
+        ring.mark_captured();
+        let old = ring.begin_process();
+        ring.retire_pump(old);
+        ring.mark_pump_late(old, "still open");
+        ring.begin_process();
+        assert_eq!(
+            ring.snapshot(None, None).capture,
+            CaptureState::Incomplete {
+                reason: "still open".to_string()
+            }
+        );
+
+        ring.finish_pump(old);
+        assert_eq!(ring.snapshot(None, None).capture, CaptureState::Captured);
+    }
+
+    #[test]
+    fn silent_restarts_do_not_grow_the_ring() {
+        let mut ring = ring(10, 10_000, 128);
+        ring.mark_captured();
+        ring.push_line("once");
+        for _ in 0..100 {
+            let generation = ring.begin_process();
+            ring.finish_pump(generation);
+        }
+        assert_eq!(ring.entries.len(), 2);
     }
 
     #[tokio::test]

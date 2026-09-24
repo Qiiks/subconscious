@@ -1052,8 +1052,16 @@ async fn stderr_from_before_a_restart_survives_with_a_marked_boundary() {
     );
 }
 
+/// A process that exits while a descendant still holds its stderr pipe.
+///
+/// The restart must not wait on that descendant, the tail must say it is
+/// incomplete while the pipe is open, and what the descendant writes later
+/// belongs to the process that spawned it: it lands in front of the next
+/// process's boundary, never after it. The orphan writes 3s after its parent
+/// exits, far past the supervisor's wait, so a restart observed before the
+/// orphan's line is a restart the held pipe did not delay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_wedged_old_stderr_pump_is_stopped_before_the_next_restart_boundary() {
+async fn a_held_stderr_pipe_marks_the_tail_incomplete_and_its_late_output_stays_with_its_process() {
     let server = TestServer::start().await;
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module = supervisor
@@ -1066,7 +1074,7 @@ async fn a_wedged_old_stderr_pump_is_stopped_before_the_next_restart_boundary() 
                 ("FAKE_AFT_EXIT_CODE".to_string(), "1".to_string()),
                 (
                     "FAKE_AFT_ORPHAN_WRITER_DELAY_MS".to_string(),
-                    "1000".to_string(),
+                    "3000".to_string(),
                 ),
                 (
                     "FAKE_AFT_ORPHAN_WRITER_LINE".to_string(),
@@ -1080,31 +1088,62 @@ async fn a_wedged_old_stderr_pump_is_stopped_before_the_next_restart_boundary() 
         })
         .unwrap();
 
-    let tail = wait_for_tail(&module, Duration::from_secs(5), |tail| {
-        matches!(tail.capture, CaptureState::Incomplete { .. })
-            && tail
-                .entries
-                .iter()
-                .any(|entry| matches!(entry, TailEntry::ProcessStart))
+    let restarted = wait_for_tail(&module, Duration::from_secs(5), |tail| {
+        tail.entries
+            .iter()
+            .any(|entry| matches!(entry, TailEntry::ProcessStart))
     })
     .await;
     assert!(
-        tail.entries
-            .iter()
-            .any(|entry| matches!(entry, TailEntry::Line { text, .. } if text == "old-start"),),
-        "the initial process output was not retained: {:?}",
-        tail.entries
-    );
-
-    sleep(Duration::from_millis(1200)).await;
-    let tail = module.stderr_tail(None, None);
-    assert!(
-        !tail
+        !restarted
             .entries
             .iter()
-            .any(|entry| matches!(entry, TailEntry::Line { text, .. } if text == "old-trailing"),),
-        "old output crossed the restart boundary: {:?}",
-        tail.entries
+            .any(|entry| matches!(entry, TailEntry::Line { text, .. } if text == "old-trailing")),
+        "the restart waited for the descendant holding the pipe: {:?}",
+        restarted.entries
+    );
+    match &restarted.capture {
+        CaptureState::Incomplete { reason } => assert!(
+            reason.contains("had not reached EOF"),
+            "the reason must name the open pipe: {reason}"
+        ),
+        other => panic!("expected Incomplete while a descendant holds the pipe, got {other:?}"),
+    }
+
+    // Both processes spawn an orphan, so each section ends with its own
+    // orphan's line once both pipes close.
+    let settled = wait_for_tail(&module, Duration::from_secs(15), |tail| {
+        matches!(tail.capture, CaptureState::Captured)
+            && tail
+                .entries
+                .iter()
+                .filter(
+                    |entry| matches!(entry, TailEntry::Line { text, .. } if text == "old-trailing"),
+                )
+                .count()
+                == 2
+    })
+    .await;
+    let sections: Vec<Vec<&str>> = settled
+        .entries
+        .split(|entry| matches!(entry, TailEntry::ProcessStart))
+        .map(|section| {
+            section
+                .iter()
+                .filter_map(|entry| match entry {
+                    TailEntry::Line { text, .. } => Some(text.as_str()),
+                    TailEntry::ProcessStart => None,
+                })
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        sections,
+        vec![
+            vec!["old-start", "old-trailing"],
+            vec!["old-start", "old-trailing"]
+        ],
+        "a descendant's late output crossed into its successor's section"
     );
 }
 
