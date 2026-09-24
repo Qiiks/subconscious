@@ -254,14 +254,18 @@ dependencies = [
 
 [[package]]
 name = "ck-bus"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
+ "async-nats",
  "async-trait",
+ "base64",
  "cortexkit-bus-inmemory",
  "cortexkit-bus-naming",
  "cortexkit-bus-nats",
  "cortexkit-bus-trait",
  "cortexkit-store-types",
+ "futures-util",
+ "nkeys",
  "serde_json",
  "sha2",
  "subc-client-rs",
@@ -270,6 +274,7 @@ dependencies = [
  "subc-jsonc",
  "subc-protocol",
  "subc-transport",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
