@@ -3,6 +3,8 @@ import { Buffer } from "node:buffer";
 import { AuthError, authenticateClient } from "./auth.js";
 import {
   DEFAULT_RECONNECT_BACKOFF,
+  SUBC_LAUNCH_NONCE_ENV,
+  SUBC_MODULE_ID_ENV,
   type BindIdentity,
   type ReconnectBackoff,
   type RequestOptions,
@@ -263,6 +265,17 @@ export interface SubcProviderConnectOptions {
    * explicitly to override. Omitted from the wire when empty (non-reserved modules).
    */
   launchNonce?: string;
+  /**
+   * Whether an unexpected connection drop starts a reconnect-and-re-register
+   * cycle (`true`) or ends serving and resolves {@link SubcProvider.closed}
+   * (`false`). Defaults to `false` when the process runs under the daemon's
+   * supervision (both `SUBC_MODULE_ID` and `SUBC_LAUNCH_NONCE` are set and
+   * non-empty in its environment, the pair the daemon injects at spawn), since
+   * the daemon owns a supervised module's restarts and waits for it to exit;
+   * `true` otherwise, so plugins and other self-connecting providers keep
+   * reconnecting. A daemon GOODBYE and `close()` end serving regardless.
+   */
+  reconnectOnDrop?: boolean;
 }
 
 interface NormalizedSubcProviderConnectOptions {
@@ -280,7 +293,9 @@ interface NormalizedSubcProviderConnectOptions {
   sleep: (ms: number) => Promise<void>;
   restoredDebounceMs: number;
   onConnectionState?: (event: ProviderConnectionState) => void | Promise<void>;
+  /** The launch nonce to echo in HELLO, already resolved against the environment. */
   launchNonce?: string;
+  reconnectOnDrop: boolean;
 }
 
 interface OpenedProviderConnection {
@@ -427,7 +442,20 @@ export function jsonProviderHandler<Request = unknown, Response = unknown>(
 }
 
 export class SubcProvider {
-  private readonly closed: Promise<void>;
+  /**
+   * Resolves exactly once, when this provider will serve no more: after the
+   * daemon sends a channel-0 GOODBYE (supervisor restart or stop, daemon
+   * shutdown), after `close()`, and after a connection loss the provider will
+   * not recover from (a drop under `reconnectOnDrop: false`, which is the
+   * default for a supervised module, or a permanent reconnect failure). It
+   * never rejects and stays pending while the provider is reconnecting.
+   *
+   * A supervised module should keep its process alive on this promise and
+   * exit when it resolves, typically `await provider.closed; process.exit(0)`,
+   * so the daemon's restart or shutdown does not wait for its drain deadline.
+   * The SDK never exits the process itself.
+   */
+  readonly closed: Promise<void>;
   private resolveClosed: () => void = () => undefined;
   private closeStarted = false;
   private closedErr: Error | null = null;
@@ -1067,6 +1095,12 @@ export class SubcProvider {
 
   private handleUnexpectedDrop(sock: SubcSocket, generation: number, cause: Error): void {
     if (this.closeStarted || this.sock !== sock || this.generation !== generation) return;
+    if (!this.opts.reconnectOnDrop) {
+      // Serving ends with the connection: resolve `closed` so the module can
+      // exit instead of re-registering behind its supervisor's back.
+      this.failFatal(cause);
+      return;
+    }
     this.cancelRestoredDebounce();
     this.abortGeneration(generation);
     this.generation += 1;
@@ -1299,14 +1333,17 @@ function providerErrorFromFrame(frame: Frame): SubcProviderError {
   }
 }
 
-function launchNonce(opts: SubcProviderConnectOptions): string | undefined {
-  const nonce = opts.launchNonce ?? process.env[SUBC_LAUNCH_NONCE_ENV];
-  return nonce && nonce.length > 0 ? nonce : undefined;
+function nonEmpty(value: string | undefined): string | undefined {
+  return value && value.length > 0 ? value : undefined;
 }
 
-const SUBC_LAUNCH_NONCE_ENV = "SUBC_LAUNCH_NONCE";
-
 function normalizeProviderConnectOptions(opts: SubcProviderConnectOptions): NormalizedSubcProviderConnectOptions {
+  // The environment is read once here. The daemon injects both variables when it
+  // spawns a module; together they mark the process as supervised, and the nonce
+  // is also what HELLO echoes for a reserved module_id.
+  const envModuleId = nonEmpty(process.env[SUBC_MODULE_ID_ENV]);
+  const envLaunchNonce = nonEmpty(process.env[SUBC_LAUNCH_NONCE_ENV]);
+  const supervised = envModuleId !== undefined && envLaunchNonce !== undefined;
   return {
     connectionFile: opts.connectionFile,
     manifest: opts.manifest,
@@ -1321,7 +1358,8 @@ function normalizeProviderConnectOptions(opts: SubcProviderConnectOptions): Norm
     sleep: opts.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
     restoredDebounceMs: opts.restoredDebounceMs ?? DEFAULT_RESTORED_DEBOUNCE_MS,
     onConnectionState: opts.onConnectionState,
-    launchNonce: opts.launchNonce,
+    launchNonce: nonEmpty(opts.launchNonce ?? envLaunchNonce),
+    reconnectOnDrop: opts.reconnectOnDrop ?? !supervised,
   };
 }
 
@@ -1333,7 +1371,7 @@ function normalizedControlOps(controlOps: string[] | null | undefined): string[]
 }
 
 function buildHelloFrame(opts: NormalizedSubcProviderConnectOptions): Frame {
-  const nonce = launchNonce(opts);
+  const nonce = opts.launchNonce;
   return buildFrame(
     FrameType.Hello,
     controlFlags(),

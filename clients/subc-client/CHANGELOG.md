@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.16.0 — 2026-09-24
+
+- Make `SubcProvider.closed` public: a `Promise<void>` that resolves once, when the provider will serve no more. That happens after a channel-0 GOODBYE from the daemon (supervisor restart or stop, daemon shutdown), after `close()`, or after a connection loss the provider will not recover from. It never rejects. A supervised module should `await provider.closed` and then exit (`process.exit(0)`), so a restart no longer waits for the daemon to SIGTERM it at the drain deadline. The SDK itself never exits the process.
+- Add the `reconnectOnDrop` connect option. A supervised provider now ends serving and resolves `closed` when its connection drops, instead of reconnecting and re-registering, because the daemon owns its restarts. A provider counts as supervised when both `SUBC_MODULE_ID` and `SUBC_LAUNCH_NONCE` are set and non-empty. Unsupervised providers keep reconnecting as before. Pass `reconnectOnDrop: true` or `false` to override either default.
+- The provider now reads `SUBC_LAUNCH_NONCE` once, at `connect()`, instead of on every HELLO. Re-registration after a reconnect echoes the same nonce.
+
 ## 0.15.0 — 2026-09-23
 
 - Expose the daemon's machine id on `SubcProvider.machineId`, read from the new optional `machine_id` field of `HELLO_ACK` and refreshed on every re-registration, in the same way as `storage`. It is `undefined` when the daemon predates the machine id or sends a value that is not 32 lowercase hex characters; the client never mints a substitute. The id names a machine and is never an authority. `machineIdFromHelloAck` exposes the same validation.

@@ -942,6 +942,153 @@ describe("SubcProvider managed reconnect", () => {
   });
 });
 
+describe("SubcProvider closed", () => {
+  const SUPERVISED_ENV = { SUBC_MODULE_ID: "closed-provider", SUBC_LAUNCH_NONCE: "nonce-for-closed-test" };
+  const UNSUPERVISED_ENV = { SUBC_MODULE_ID: undefined, SUBC_LAUNCH_NONCE: undefined };
+  // Long enough for a reconnect (first attempt is immediate, backoff is 5 ms) to
+  // reach the fake daemon, so "still one HELLO" really means "no reconnect".
+  const NO_RECONNECT_WINDOW_MS = 150;
+
+  async function connectWith(
+    daemon: ScriptedProviderDaemon,
+    env: Record<string, string | undefined>,
+    reconnectOnDrop?: boolean,
+  ): Promise<SubcProvider> {
+    const dir = trackedTempDir("subc-provider-closed-");
+    const connFile = writeConnectionFile(dir, daemon.port);
+    return await withEnv(env, () =>
+      SubcProvider.connect({
+        connectionFile: connFile,
+        manifest: managementSurfaceManifest({ moduleId: "closed-provider", operations: ["echo"] }),
+        handler: async (_routeChannel, body) => body,
+        reconnectBackoff: RECONNECT_BACKOFF,
+        ...(reconnectOnDrop === undefined ? {} : { reconnectOnDrop }),
+      }),
+    );
+  }
+
+  test("resolves after a channel-0 GOODBYE from the daemon and does not reconnect", async () => {
+    const daemon = await ScriptedProviderDaemon.start();
+    const provider = await connectWith(daemon, UNSUPERVISED_ENV);
+    try {
+      await daemon.waitForHelloCount(1);
+      await daemon.goodbyeLatest();
+      expect(await settlesWithin(provider.closed, 1_000)).toBe(true);
+      await sleepMs(NO_RECONNECT_WINDOW_MS);
+      expect(daemon.helloCount).toBe(1);
+    } finally {
+      await provider.close();
+    }
+  });
+
+  test("resolves after close()", async () => {
+    const daemon = await ScriptedProviderDaemon.start();
+    const provider = await connectWith(daemon, UNSUPERVISED_ENV);
+    expect(await settlesWithin(provider.closed, 50)).toBe(false);
+    await provider.close();
+    expect(await settlesWithin(provider.closed, 1_000)).toBe(true);
+  });
+
+  test("supervised: a socket drop resolves closed and makes no reconnect attempt", async () => {
+    const daemon = await ScriptedProviderDaemon.start();
+    const provider = await connectWith(daemon, SUPERVISED_ENV);
+    try {
+      await daemon.waitForHelloCount(1);
+      daemon.dropLatest();
+      expect(await settlesWithin(provider.closed, 1_000)).toBe(true);
+      await sleepMs(NO_RECONNECT_WINDOW_MS);
+      expect(daemon.helloCount).toBe(1);
+    } finally {
+      await provider.close();
+    }
+  });
+
+  test("unsupervised: a socket drop reconnects and closed stays pending", async () => {
+    const daemon = await ScriptedProviderDaemon.start();
+    const provider = await connectWith(daemon, UNSUPERVISED_ENV);
+    try {
+      daemon.dropLatest();
+      await daemon.waitForHelloCount(2);
+      await waitForCondition(() => provider.currentEpoch() === 2, "provider epoch after re-registration");
+      expect(await settlesWithin(provider.closed, 50)).toBe(false);
+    } finally {
+      await provider.close();
+    }
+  });
+
+  test("reconnectOnDrop: true keeps a supervised provider reconnecting", async () => {
+    const daemon = await ScriptedProviderDaemon.start();
+    const provider = await connectWith(daemon, SUPERVISED_ENV, true);
+    try {
+      daemon.dropLatest();
+      await daemon.waitForHelloCount(2);
+      await waitForCondition(() => provider.currentEpoch() === 2, "provider epoch after re-registration");
+      expect(await settlesWithin(provider.closed, 50)).toBe(false);
+    } finally {
+      await provider.close();
+    }
+  });
+
+  test("reconnectOnDrop: false ends an unsupervised provider on a drop", async () => {
+    const daemon = await ScriptedProviderDaemon.start();
+    const provider = await connectWith(daemon, UNSUPERVISED_ENV, false);
+    try {
+      await daemon.waitForHelloCount(1);
+      daemon.dropLatest();
+      expect(await settlesWithin(provider.closed, 1_000)).toBe(true);
+      await sleepMs(NO_RECONNECT_WINDOW_MS);
+      expect(daemon.helloCount).toBe(1);
+    } finally {
+      await provider.close();
+    }
+  });
+
+  test("only one of the two supervision variables leaves the provider reconnecting", async () => {
+    const daemon = await ScriptedProviderDaemon.start();
+    const provider = await connectWith(daemon, { SUBC_MODULE_ID: undefined, SUBC_LAUNCH_NONCE: "nonce-only" });
+    try {
+      daemon.dropLatest();
+      await daemon.waitForHelloCount(2);
+      expect(await settlesWithin(provider.closed, 50)).toBe(false);
+    } finally {
+      await provider.close();
+    }
+  });
+});
+
+/** Runs `fn` with the given variables set (or unset when undefined), then restores them. */
+async function withEnv<T>(vars: Record<string, string | undefined>, fn: () => Promise<T>): Promise<T> {
+  const saved = new Map<string, string | undefined>();
+  for (const [name, value] of Object.entries(vars)) {
+    saved.set(name, process.env[name]);
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
+  try {
+    return await fn();
+  } finally {
+    for (const [name, value] of saved) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+}
+
+async function settlesWithin(promise: Promise<unknown>, ms: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(false), ms);
+  });
+  try {
+    return await Promise.race([promise.then(() => true), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 async function listenFakeServer(): Promise<{ server: Server; port: number }> {
   const server = createServer();
@@ -1232,6 +1379,18 @@ class ScriptedProviderDaemon {
     await new Promise<void>((resolve) => {
       this.waiters.push({ count, resolve });
     });
+  }
+
+  /** Sends the channel-0 GOODBYE the daemon uses to end a module's serving, then hangs up. */
+  async goodbyeLatest(): Promise<void> {
+    const socket = Array.from(this.sockets).at(-1);
+    if (!socket) throw new Error("no connected provider to send GOODBYE to");
+    await writeFrame(
+      socket,
+      buildFrame(FrameType.Goodbye, CONTROL_FLAGS, 0, 0, 0n, new Uint8Array(0)),
+      Date.now() + 1_000,
+    );
+    socket.end();
   }
 
   dropLatest(): void {
