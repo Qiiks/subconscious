@@ -5992,38 +5992,39 @@ fn send_route_goodbyes(forwarding: &ForwardingTable, released_routes: Vec<Goodby
                 continue;
             }
         };
+        if !released.close_on_delivery_failure() {
+            crate::forwarding::send_module_route_goodbye(
+                &forwarding.counters(),
+                &released.sink,
+                frame,
+                released.module_id.as_deref(),
+                "supervisor drain",
+            );
+            continue;
+        }
         if let Err(err) = released.sink.try_send(frame) {
-            if released.close_on_delivery_failure() {
-                warn!(
-                    target_connection_id = released.connection_id.get(),
-                    route_channel = released.channel,
-                    error = %err,
-                    "supervisor drain route GOODBYE was not delivered to client; closing target connection"
-                );
-                let _ = forwarding.escalate_client_delivery_failure(
-                    released.connection_id,
-                    released.channel,
-                    released.epoch,
-                    CloseReason::new(
-                        "route_goodbye_delivery_failed",
-                        format!(
-                            "failed to enqueue supervisor drain route GOODBYE for channel {}: {err}",
-                            released.channel
-                        ),
+            warn!(
+                target_connection_id = released.connection_id.get(),
+                route_channel = released.channel,
+                error = %err,
+                "supervisor drain route GOODBYE was not delivered to client; closing target connection"
+            );
+            let _ = forwarding.escalate_client_delivery_failure(
+                released.connection_id,
+                released.channel,
+                released.epoch,
+                CloseReason::new(
+                    "route_goodbye_delivery_failed",
+                    format!(
+                        "failed to enqueue supervisor drain route GOODBYE for channel {}: {err}",
+                        released.channel
                     ),
-                    crate::forwarding::UndeliveredFrame {
-                        module_id: released.module_id.as_deref(),
-                        sink: &released.sink,
-                    },
-                );
-            } else {
-                warn!(
-                    target_connection_id = released.connection_id.get(),
-                    route_channel = released.channel,
-                    error = %err,
-                    "supervisor drain route GOODBYE to module dropped under backpressure; not closing shared module connection"
-                );
-            }
+                ),
+                crate::forwarding::UndeliveredFrame {
+                    module_id: released.module_id.as_deref(),
+                    sink: &released.sink,
+                },
+            );
         }
     }
 }

@@ -129,7 +129,23 @@ impl Drop for ConnectedClientGuard {
 /// Lock-free counters for route lifecycle drops and delivery failures.
 #[derive(Debug, Clone, Default)]
 pub struct DaemonCounters {
+    /// Every non-request frame a module sent on a (channel, epoch) the daemon
+    /// holds no bound route for, dropped. Counts both kinds below: orphan
+    /// traffic on a route the daemon released, and frames on a (channel,
+    /// epoch) that was never allocated on that module connection.
     module_frames_dropped_no_route: Arc<AtomicU64>,
+    /// The orphan-traffic part of `module_frames_dropped_no_route`: the daemon
+    /// had allocated that (channel, epoch) on the sending module connection and
+    /// has since released it, so the module is still holding a route the
+    /// daemon closed. `module_frames_dropped_no_route` minus this is the count
+    /// of frames on a (channel, epoch) that never existed on the connection.
+    module_frames_dropped_released_route: Arc<AtomicU64>,
+    module_frames_dropped_released_route_by_module: Arc<Mutex<HashMap<String, u64>>>,
+    /// Route GOODBYEs the daemon enqueued to a module in answer to its frames
+    /// on a (channel, epoch) the daemon holds no route for, telling the module
+    /// to drop the route. Rate-limited per module connection and channel, so
+    /// this counts answers, not orphan frames.
+    module_orphan_route_goodbyes_sent: Arc<AtomicU64>,
     // Per-module maps and the rate window are daemon-lifetime diagnostics only:
     // they deliberately reset on restart instead of becoming durable daemon state.
     module_frames_dropped_no_route_by_module: Arc<Mutex<HashMap<String, u64>>>,
@@ -243,6 +259,23 @@ impl DaemonCounters {
             "module_frames_dropped_no_route_by_module",
             &self.module_frames_dropped_no_route_by_module,
         );
+        snapshot.insert(
+            "module_frames_dropped_released_route".into(),
+            self.module_frames_dropped_released_route
+                .load(Ordering::Relaxed)
+                .into(),
+        );
+        insert_nonempty_counts(
+            &mut snapshot,
+            "module_frames_dropped_released_route_by_module",
+            &self.module_frames_dropped_released_route_by_module,
+        );
+        snapshot.insert(
+            "module_orphan_route_goodbyes_sent".into(),
+            self.module_orphan_route_goodbyes_sent
+                .load(Ordering::Relaxed)
+                .into(),
+        );
         insert_nonempty_counts(
             &mut snapshot,
             "route_open_refused_by_code",
@@ -319,6 +352,25 @@ impl DaemonCounters {
             .lock()
             .expect("drop-rate window mutex poisoned")
             .record(tokio::time::Instant::now());
+    }
+
+    /// Count a dropped module frame whose (channel, epoch) the daemon had
+    /// allocated on that connection and since released. Called in addition to
+    /// [`Self::increment_module_frames_dropped_no_route`], never instead of it.
+    pub(crate) fn increment_module_frames_dropped_released_route(&self, module_id: Option<&str>) {
+        self.module_frames_dropped_released_route
+            .fetch_add(1, Ordering::Relaxed);
+        if let Some(module_id) = module_id {
+            increment_keyed_count(
+                &self.module_frames_dropped_released_route_by_module,
+                module_id,
+            );
+        }
+    }
+
+    pub(crate) fn increment_module_orphan_route_goodbyes_sent(&self) {
+        self.module_orphan_route_goodbyes_sent
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn increment_route_open_refused(&self, code: &'static str) {

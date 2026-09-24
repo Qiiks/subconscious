@@ -4,7 +4,7 @@ use std::{
     fmt,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -475,6 +475,67 @@ impl FrameSink {
     }
 }
 
+/// Minimum time between two route GOODBYEs the daemon sends one module
+/// connection for one channel in answer to the module's frames on a (channel,
+/// epoch) the daemon holds no route for.
+///
+/// A module that missed a GOODBYE keeps sending on that route (a streaming
+/// module, many frames a second), and every one of those frames lands here. One
+/// answer is enough when it arrives, so answering each frame would only flood
+/// the module's egress queue at the moment it is already behind. Five seconds
+/// is long enough for an answer queued behind a deep backlog to reach the module
+/// and take effect before a second is sent, and short enough that an answer
+/// the queue refused is retried by the next orphan frame well within a minute.
+const ORPHAN_ROUTE_GOODBYE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Once one connection has this many remembered channels, entries older than
+/// [`ORPHAN_ROUTE_GOODBYE_INTERVAL`] are pruned before another is added. An
+/// expired entry has no effect on rate limiting, so pruning never changes a
+/// decision; it keeps a module that orphaned many channels long ago from
+/// pinning memory for all of them. The map is bounded in any case by the
+/// 16-bit channel space and is dropped whole when the connection ends.
+const ORPHAN_ROUTE_GOODBYE_PRUNE_AT: usize = 256;
+
+/// When each module connection was last sent an orphan-route GOODBYE, per
+/// channel. Shared by the [`Router`] (which consults it) and every
+/// [`RouterConnection`] (which removes its own entry when the connection ends).
+#[derive(Debug, Default)]
+struct OrphanGoodbyeLimiter {
+    last_sent: Mutex<HashMap<ConnectionId, HashMap<u16, tokio::time::Instant>>>,
+}
+
+impl OrphanGoodbyeLimiter {
+    /// True, and the send recorded, when `channel` on `connection_id` has not
+    /// been answered within the interval.
+    fn claim(&self, connection_id: ConnectionId, channel: u16) -> bool {
+        let now = tokio::time::Instant::now();
+        let mut last_sent = self
+            .last_sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let channels = last_sent.entry(connection_id).or_default();
+        if channels.get(&channel).is_some_and(|sent| {
+            now.saturating_duration_since(*sent) < ORPHAN_ROUTE_GOODBYE_INTERVAL
+        }) {
+            return false;
+        }
+        if channels.len() >= ORPHAN_ROUTE_GOODBYE_PRUNE_AT {
+            channels.retain(|_, sent| {
+                now.saturating_duration_since(*sent) < ORPHAN_ROUTE_GOODBYE_INTERVAL
+            });
+        }
+        channels.insert(channel, now);
+        true
+    }
+
+    fn forget_connection(&self, connection_id: ConnectionId) {
+        self.last_sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&connection_id);
+    }
+}
+
 /// Per-route context shared with backends besides the frame itself.
 #[derive(Debug, Clone)]
 pub struct RouteCtx {
@@ -541,6 +602,7 @@ pub struct Router {
     forward_backend: ForwardBackend,
     counters: DaemonCounters,
     next_connection_id: AtomicU64,
+    orphan_goodbyes: Arc<OrphanGoodbyeLimiter>,
 }
 
 impl Router {
@@ -558,6 +620,7 @@ impl Router {
             counters,
             // ConnectionId::LOCAL is 0; real socket ids start at 1 and never collide.
             next_connection_id: AtomicU64::new(1),
+            orphan_goodbyes: Arc::default(),
         }
     }
 
@@ -604,6 +667,72 @@ impl Router {
         Ok(())
     }
 
+    /// A module sent a non-request frame on a (channel, epoch) the daemon holds
+    /// no route for: most often a route the daemon released whose GOODBYE the
+    /// module never received, so the module still believes it is open and keeps
+    /// sending. Count the drop, and tell the module to let go of exactly that
+    /// (channel, epoch) with a route GOODBYE, at most once per
+    /// [`ORPHAN_ROUTE_GOODBYE_INTERVAL`] per connection and channel.
+    ///
+    /// The answer uses `try_send`: it is a best-effort nudge, and if the queue
+    /// refuses it, the module's next frame on that route after the interval
+    /// asks again. A GOODBYE from the module is not answered, since the module
+    /// is already letting go of the route.
+    fn handle_orphan_module_frame(&self, ctx: &RouteCtx, frame: &Frame) -> Result<(), RouterError> {
+        let channel = frame.header.channel;
+        let epoch = frame.header.epoch;
+        let module_id = self
+            .forwarding
+            .module_id_for_connection(ctx.connection_id)
+            .map_err(RouterError::Forwarding)?;
+        self.counters
+            .increment_module_frames_dropped_no_route(module_id.as_deref());
+        if self
+            .forwarding
+            .module_route_epoch_was_allocated(ctx.connection_id, channel, epoch)
+            .map_err(RouterError::Forwarding)?
+        {
+            self.counters
+                .increment_module_frames_dropped_released_route(module_id.as_deref());
+        }
+        if frame.header.ty == FrameType::Goodbye
+            || !self.orphan_goodbyes.claim(ctx.connection_id, channel)
+        {
+            return Ok(());
+        }
+        let goodbye = Frame::build_with_version(
+            frame.header.ver,
+            FrameType::Goodbye,
+            Flags::new(false, Priority::Passive, false),
+            channel,
+            epoch,
+            0,
+            Vec::new(),
+        )
+        .map_err(RouterError::FrameBuild)?;
+        match ctx.egress.try_send(goodbye) {
+            Ok(()) => {
+                self.counters.increment_module_orphan_route_goodbyes_sent();
+                debug!(
+                    connection_id = ctx.connection_id.get(),
+                    module_id = module_id.as_deref().unwrap_or("unknown"),
+                    channel,
+                    epoch,
+                    "answered module frame on a route the daemon does not hold with a route GOODBYE"
+                );
+            }
+            Err(err) => debug!(
+                connection_id = ctx.connection_id.get(),
+                module_id = module_id.as_deref().unwrap_or("unknown"),
+                channel,
+                epoch,
+                error = %err,
+                "could not enqueue route GOODBYE for module frame on a route the daemon does not hold; the next such frame retries"
+            ),
+        }
+        Ok(())
+    }
+
     pub fn begin_connection(&self) -> RouterConnection {
         let raw = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
         let id = ConnectionId::new(raw);
@@ -613,6 +742,7 @@ impl Router {
             control_handler: Arc::clone(&self.control),
             forwarding: Arc::clone(&self.forwarding),
             close_receiver: Some(close_receiver),
+            orphan_goodbyes: Arc::clone(&self.orphan_goodbyes),
         }
     }
 
@@ -690,7 +820,7 @@ impl Router {
                         ctx.egress.send(error_frame).await?;
                     }
                 } else {
-                    self.record_module_frame_drop(ctx.connection_id)?;
+                    self.handle_orphan_module_frame(ctx, &frame)?;
                 }
                 debug!(
                     connection_id = ctx.connection_id.get(),
@@ -732,7 +862,7 @@ impl Router {
                         ctx.egress.send(error_frame).await?;
                     }
                 } else {
-                    self.record_module_frame_drop(ctx.connection_id)?;
+                    self.handle_orphan_module_frame(ctx, &frame)?;
                 }
                 debug!(
                     connection_id = ctx.connection_id.get(),
@@ -893,6 +1023,7 @@ pub struct RouterConnection {
     control_handler: Arc<ControlHandler>,
     forwarding: Arc<ForwardingTable>,
     close_receiver: Option<ConnectionCloseReceiver>,
+    orphan_goodbyes: Arc<OrphanGoodbyeLimiter>,
 }
 
 impl RouterConnection {
@@ -910,6 +1041,7 @@ impl RouterConnection {
 impl Drop for RouterConnection {
     fn drop(&mut self) {
         self.forwarding.unregister_connection_close(self.id);
+        self.orphan_goodbyes.forget_connection(self.id);
         // GOODBYE (explicit) and connection-drop cleanup both call the same
         // idempotent deregistration path.
         let _ = self.control_handler.cleanup_connection(self.id);
@@ -2499,6 +2631,10 @@ mod tests {
             .await
             .unwrap();
 
+        // No ERROR goes back for a non-request frame. The one reply is the
+        // route GOODBYE telling the module to let go of the released route.
+        let reply = module_egress_rx.try_recv().unwrap();
+        assert_eq!(reply.header.ty, FrameType::Goodbye);
         assert!(module_egress_rx.try_recv().is_err());
         let counters = router.counters.snapshot();
         assert_eq!(counters["module_frames_dropped_no_route"], 1);
@@ -2507,6 +2643,271 @@ mod tests {
             serde_json::json!({ "epoch-router": 1 })
         );
         assert_eq!(counters["module_requests_dropped_stale_route"], 0);
+    }
+
+    /// Drain whatever the module connection's queue holds right now, the way a
+    /// module's reader would before it stalls.
+    fn drain_now(rx: &mut mpsc::Receiver<OutboundFrame>) {
+        while rx.try_recv().is_ok() {}
+    }
+
+    /// A module that stops reading for a moment when a client closes one of
+    /// its routes still learns the route is gone: the GOODBYE its full egress
+    /// queue refused is delivered as soon as it reads again, rather than
+    /// dropped, which would leave the module holding the route for the rest of
+    /// its connection.
+    #[tokio::test]
+    async fn route_goodbye_refused_by_stalled_module_is_delivered_when_it_resumes_reading() {
+        const BUDGET: usize = 4_096;
+        let forwarding = Arc::new(ForwardingTable::default());
+        let control = Arc::new(ControlHandler::with_forwarding(
+            Arc::new(Registry::default()),
+            Arc::clone(&forwarding),
+        ));
+        let router = Router::with_control_handler(control);
+        let module_connection = ConnectionId::new(80);
+        let client_connection = ConnectionId::new(81);
+        let (module_tx, mut module_rx) = mpsc::channel(64);
+        let module_sink = FrameSink::with_byte_budget(module_tx, BUDGET);
+        forwarding
+            .register_module_connection(
+                module_connection,
+                "stalled-provider".into(),
+                2,
+                Concurrency::ModuleManaged,
+                module_sink.clone(),
+            )
+            .unwrap();
+        let (client_tx, mut client_rx) = mpsc::channel(8);
+        let client_sink = FrameSink::new(client_tx);
+        let pending = forwarding
+            .begin_route_bind_relay_for_test(
+                client_connection,
+                client_sink.clone(),
+                1_100,
+                "stalled-provider",
+            )
+            .unwrap();
+        forwarding
+            .complete_pending_relay(
+                module_connection,
+                pending.corr,
+                RouteBindRelayOutcome::Accepted,
+            )
+            .unwrap();
+        let _ = client_rx.recv().await.unwrap();
+        drain_now(&mut module_rx);
+
+        // The module stalls: its queue holds more than the byte budget, so the
+        // queue refuses anything further.
+        module_sink
+            .try_send(stream_frame(9, 1, 0, vec![b'f'; BUDGET]))
+            .unwrap();
+        assert!(module_sink
+            .try_send(stream_frame(9, 1, 1, Vec::new()))
+            .is_err());
+
+        let client_ctx = RouteCtx {
+            connection_id: client_connection,
+            egress: client_sink,
+        };
+        router
+            .route_for_connection(
+                &client_ctx,
+                route_frame(
+                    FrameType::Goodbye,
+                    pending.client_channel,
+                    pending.client_epoch,
+                    1_101,
+                ),
+            )
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(
+            router.counters.snapshot()["goodbye_relay_module_dropped"],
+            0,
+            "a GOODBYE refused by a momentarily full module queue must not be dropped"
+        );
+
+        // The module reads again: the filler comes off, then the GOODBYE.
+        let filler = module_rx.recv().await.unwrap();
+        assert_eq!(filler.header.ty, FrameType::StreamData);
+        drop(filler);
+        let goodbye = tokio::time::timeout(Duration::from_secs(2), module_rx.recv())
+            .await
+            .expect("the refused GOODBYE must be delivered once the module frees room")
+            .unwrap();
+        assert_eq!(goodbye.header.ty, FrameType::Goodbye);
+        assert_eq!(goodbye.header.channel, pending.module_channel);
+        assert_eq!(goodbye.header.epoch, pending.module_epoch);
+        assert_eq!(
+            router.counters.snapshot()["goodbye_relay_module_dropped"],
+            0
+        );
+    }
+
+    /// A module still sending on a route the daemon released is told, with a
+    /// route GOODBYE for exactly the (channel, epoch) it sent on. The same
+    /// happens for a stale epoch on a channel whose route moved on and for a
+    /// channel that never had a route; only the first is counted as traffic on
+    /// a released route.
+    #[tokio::test]
+    async fn module_frame_on_route_the_daemon_does_not_hold_is_answered_with_goodbye() {
+        let (
+            router,
+            _forwarding,
+            client_ctx,
+            mut client_rx,
+            module_ctx,
+            mut module_egress_rx,
+            mut module_rx,
+            pending,
+        ) = dynamic_route_fixture(true);
+        let _ = client_rx.recv().await.unwrap();
+        router
+            .route_for_connection(
+                &client_ctx,
+                route_frame(
+                    FrameType::Goodbye,
+                    pending.client_channel,
+                    pending.client_epoch,
+                    1_200,
+                ),
+            )
+            .await
+            .unwrap();
+        drain_now(&mut module_rx);
+
+        let cases = [
+            // Released route: the daemon allocated this (channel, epoch).
+            (pending.module_channel, pending.module_epoch),
+            // A channel the daemon never allocated on this connection.
+            (pending.module_channel + 1, 1),
+        ];
+        for (channel, epoch) in cases {
+            router
+                .route_for_connection(
+                    &module_ctx,
+                    route_frame(FrameType::StreamData, channel, epoch, 1_201),
+                )
+                .await
+                .unwrap();
+            let reply = module_egress_rx
+                .try_recv()
+                .expect("a frame on a route the daemon does not hold is answered");
+            assert_eq!(reply.header.ty, FrameType::Goodbye);
+            assert_eq!(reply.header.channel, channel);
+            assert_eq!(reply.header.epoch, epoch);
+            assert_eq!(reply.header.corr, 0);
+            assert!(module_egress_rx.try_recv().is_err());
+        }
+
+        // A GOODBYE from the module for a route the daemon already released
+        // is not answered: the module is letting go already.
+        router
+            .route_for_connection(
+                &module_ctx,
+                route_frame(FrameType::Goodbye, pending.module_channel + 2, 1, 0),
+            )
+            .await
+            .unwrap();
+        assert!(module_egress_rx.try_recv().is_err());
+
+        let counters = router.counters.snapshot();
+        assert_eq!(counters["module_frames_dropped_no_route"], 3);
+        assert_eq!(counters["module_frames_dropped_released_route"], 1);
+        assert_eq!(
+            counters["module_frames_dropped_released_route_by_module"],
+            serde_json::json!({ "epoch-router": 1 })
+        );
+        assert_eq!(counters["module_orphan_route_goodbyes_sent"], 2);
+    }
+
+    /// A chatty orphan (a streaming module still producing on a route it
+    /// missed the GOODBYE for) is answered once per interval, not once per
+    /// frame, and answered again once the interval has passed.
+    #[tokio::test(start_paused = true)]
+    async fn burst_of_orphan_module_frames_is_answered_once_per_interval() {
+        let (
+            router,
+            _forwarding,
+            client_ctx,
+            mut client_rx,
+            module_ctx,
+            mut module_egress_rx,
+            mut module_rx,
+            pending,
+        ) = dynamic_route_fixture(true);
+        let _ = client_rx.recv().await.unwrap();
+        router
+            .route_for_connection(
+                &client_ctx,
+                route_frame(
+                    FrameType::Goodbye,
+                    pending.client_channel,
+                    pending.client_epoch,
+                    1_300,
+                ),
+            )
+            .await
+            .unwrap();
+        drain_now(&mut module_rx);
+
+        let send_burst = |corr: u64| {
+            route_frame(
+                FrameType::StreamData,
+                pending.module_channel,
+                pending.module_epoch,
+                corr,
+            )
+        };
+        for corr in 0..20 {
+            router
+                .route_for_connection(&module_ctx, send_burst(corr))
+                .await
+                .unwrap();
+        }
+        let mut replies = 0;
+        while let Ok(reply) = module_egress_rx.try_recv() {
+            assert_eq!(reply.header.ty, FrameType::Goodbye);
+            replies += 1;
+        }
+        assert_eq!(replies, 1, "a burst within the interval gets one GOODBYE");
+
+        tokio::time::advance(ORPHAN_ROUTE_GOODBYE_INTERVAL).await;
+        router
+            .route_for_connection(&module_ctx, send_burst(20))
+            .await
+            .unwrap();
+        let retry = module_egress_rx
+            .try_recv()
+            .expect("the first orphan frame after the interval is answered again");
+        assert_eq!(retry.header.channel, pending.module_channel);
+        assert_eq!(retry.header.epoch, pending.module_epoch);
+
+        let counters = router.counters.snapshot();
+        assert_eq!(counters["module_frames_dropped_no_route"], 21);
+        assert_eq!(counters["module_orphan_route_goodbyes_sent"], 2);
+    }
+
+    /// The rate-limit memory is per connection and goes away with it.
+    #[test]
+    fn orphan_goodbye_rate_limit_state_is_released_with_the_connection() {
+        let router = Router::with_default_self_handler();
+        let connection = router.begin_connection();
+        let id = connection.id();
+        assert!(router.orphan_goodbyes.claim(id, 7));
+        assert!(!router.orphan_goodbyes.claim(id, 7));
+        assert!(router.orphan_goodbyes.claim(id, 8));
+        drop(connection);
+        assert!(router
+            .orphan_goodbyes
+            .last_sent
+            .lock()
+            .unwrap()
+            .get(&id)
+            .is_none());
     }
 
     #[test]

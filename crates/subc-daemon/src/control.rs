@@ -316,7 +316,11 @@ impl RouteBindReservationGuard {
             self.relay_corr,
             RouteBindRelayOutcome::ModuleGone("route.open handler canceled".to_string()),
         ) {
-            send_goodbye_target_best_effort(&target, "canceled route.bind");
+            send_goodbye_target_best_effort(
+                &self.forwarding.counters(),
+                &target,
+                "canceled route.bind",
+            );
         }
         self.armed = false;
     }
@@ -1460,45 +1464,44 @@ impl ControlHandler {
                     continue;
                 }
             };
+            if !released.close_on_delivery_failure() {
+                crate::forwarding::send_module_route_goodbye(
+                    &self.counters,
+                    &released.sink,
+                    frame,
+                    released.module_id.as_deref(),
+                    "client route released",
+                );
+                continue;
+            }
             if let Err(err) = released.sink.try_send(frame) {
-                if released.close_on_delivery_failure() {
-                    warn!(
-                        target_connection_id = released.connection_id.get(),
-                        route_channel = released.channel,
-                        error = %err,
-                        "route GOODBYE was not delivered to client; closing target connection"
-                    );
-                    if self
-                        .forwarding
-                        .escalate_client_delivery_failure(
-                            released.connection_id,
-                            released.channel,
-                            released.epoch,
-                            CloseReason::new(
-                                "route_goodbye_delivery_failed",
-                                format!(
-                                    "failed to enqueue route GOODBYE for channel {}: {err}",
-                                    released.channel
-                                ),
+                warn!(
+                    target_connection_id = released.connection_id.get(),
+                    route_channel = released.channel,
+                    error = %err,
+                    "route GOODBYE was not delivered to client; closing target connection"
+                );
+                if self
+                    .forwarding
+                    .escalate_client_delivery_failure(
+                        released.connection_id,
+                        released.channel,
+                        released.epoch,
+                        CloseReason::new(
+                            "route_goodbye_delivery_failed",
+                            format!(
+                                "failed to enqueue route GOODBYE for channel {}: {err}",
+                                released.channel
                             ),
-                            crate::forwarding::UndeliveredFrame {
-                                module_id: released.module_id.as_deref(),
-                                sink: &released.sink,
-                            },
-                        )
-                        .unwrap_or(false)
-                    {
-                        self.counters.increment_goodbye_relay_client_failed();
-                    }
-                } else {
-                    self.counters
-                        .increment_goodbye_relay_module_dropped(released.module_id.as_deref());
-                    warn!(
-                        target_connection_id = released.connection_id.get(),
-                        route_channel = released.channel,
-                        error = %err,
-                        "route GOODBYE to module dropped under backpressure; not closing shared module connection"
-                    );
+                        ),
+                        crate::forwarding::UndeliveredFrame {
+                            module_id: released.module_id.as_deref(),
+                            sink: &released.sink,
+                        },
+                    )
+                    .unwrap_or(false)
+                {
+                    self.counters.increment_goodbye_relay_client_failed();
                 }
             }
         }
@@ -1541,13 +1544,13 @@ impl ControlHandler {
                 return;
             }
         };
-        if let Err(err) = module_sink.try_send(frame) {
-            warn!(
-                route_channel = module_channel,
-                error = %err,
-                "GOODBYE for abandoned route.bind dropped; module idle reaper will reclaim the binding"
-            );
-        }
+        crate::forwarding::send_module_route_goodbye(
+            &self.counters,
+            module_sink,
+            frame,
+            None,
+            "abandoned route.bind",
+        );
     }
 
     fn handle_hello(
@@ -4731,7 +4734,7 @@ impl ControlHandler {
             }
         };
         if let Some(target) = completion.abandoned.as_ref() {
-            send_goodbye_target_best_effort(target, "late accepted route.bind");
+            send_goodbye_target_best_effort(&self.counters, target, "late accepted route.bind");
         }
         if !completion.settled {
             debug!(
@@ -5299,7 +5302,15 @@ fn control_flags() -> Flags {
     Flags::new(false, Priority::Passive, false)
 }
 
-fn send_goodbye_target_best_effort(target: &GoodbyeTarget, context: &str) {
+/// GOODBYE for a route.bind the daemon gave up on after reserving the module's
+/// channel. The target is the module (a client never saw the route), so this
+/// takes the module path: delivered late rather than dropped when the module's
+/// queue is momentarily full, and never closing its connection.
+fn send_goodbye_target_best_effort(
+    counters: &DaemonCounters,
+    target: &GoodbyeTarget,
+    context: &'static str,
+) {
     let Ok(frame) = Frame::build_with_version(
         target.negotiated_ver,
         FrameType::Goodbye,
@@ -5311,15 +5322,13 @@ fn send_goodbye_target_best_effort(target: &GoodbyeTarget, context: &str) {
     ) else {
         return;
     };
-    if let Err(err) = target.sink.try_send(frame) {
-        warn!(
-            route_channel = target.channel,
-            route_epoch = target.epoch,
-            error = %err,
-            %context,
-            "route GOODBYE dropped under backpressure"
-        );
-    }
+    crate::forwarding::send_module_route_goodbye(
+        counters,
+        &target.sink,
+        frame,
+        target.module_id.as_deref(),
+        context,
+    );
 }
 
 pub(crate) fn send_route_control_pushes(

@@ -97,7 +97,9 @@ pub(crate) enum DataRouteState {
 /// - `Client`: escalate to closing that client connection (a socket close is a
 ///   stronger teardown signal, and a full client egress means it is the slow
 ///   client we would drop anyway).
-/// - `Module`: best-effort DROP, never close. A client-disconnect notifies the
+/// - `Module`: never close; deliver late instead (see
+///   [`send_module_route_goodbye`]), and drop only if the module still has no
+///   room after [`LATE_MODULE_GOODBYE_DEADLINE`]. A client-disconnect notifies the
 ///   SHARED module that one client's route is gone; closing the module on its
 ///   egress backpressure would tear down every co-tenant client (the exact
 ///   cross-tenant blast radius this never-close rule exists to prevent — observed when a
@@ -180,6 +182,101 @@ impl GoodbyeTarget {
     pub(crate) fn close_on_delivery_failure(&self) -> bool {
         matches!(self.kind, GoodbyeTargetKind::Client)
     }
+}
+
+/// How long a route GOODBYE that a module's egress queue refused keeps waiting
+/// for room before it is given up and counted as dropped.
+///
+/// A module that stops reading for a moment (a GC pause, a long synchronous
+/// handler, a reconnect herd it is still working through) should still learn
+/// that the route is gone, because a module that never hears the GOODBYE keeps
+/// the route and keeps sending on it for as long as its connection lives. The
+/// value is the default module drain timeout: the daemon already treats that as
+/// the longest it is reasonable to wait on a module that is busy but alive, and
+/// a module that cannot free 21 bytes of egress in that time is wedged rather
+/// than slow. Resolving each module's own configured drain timeout here would
+/// need a registry lookup on a path that holds only the module's sink.
+pub(crate) const LATE_MODULE_GOODBYE_DEADLINE: Duration = crate::supervise::DEFAULT_DRAIN_TIMEOUT;
+
+/// Send a route GOODBYE to a module without ever closing the module's shared
+/// connection, which would sever every other route it serves.
+///
+/// The frame is enqueued at once when the module's egress queue has room. When
+/// it does not, a detached task waits for room (bounded by
+/// [`LATE_MODULE_GOODBYE_DEADLINE`]) and sends it then. Arriving late is safe:
+/// the daemon has already released the route, and module SDKs tear a route
+/// down only when both the channel AND the epoch match the route installed on
+/// that channel, so a late GOODBYE for a channel since reused at a newer epoch
+/// is ignored. The GOODBYE is counted in `goodbye_relay_module_dropped` only
+/// when the connection is closed or the deadline passes.
+pub(crate) fn send_module_route_goodbye(
+    counters: &DaemonCounters,
+    sink: &FrameSink,
+    frame: Frame,
+    module_id: Option<&str>,
+    context: &'static str,
+) {
+    let channel = frame.header.channel;
+    let epoch = frame.header.epoch;
+    let Err(err) = sink.try_send(frame.clone()) else {
+        return;
+    };
+    // Waiting is pointless once the module's writer is gone, and impossible
+    // outside a Tokio runtime (cleanup that runs from a destructor at shutdown).
+    let runtime = match tokio::runtime::Handle::try_current() {
+        Ok(runtime) if !sink.is_closed() => runtime,
+        _ => {
+            counters.increment_goodbye_relay_module_dropped(module_id);
+            warn!(
+            module_id = module_id.unwrap_or("unknown"),
+            route_channel = channel,
+            route_epoch = epoch,
+            error = %err,
+            context,
+            "route GOODBYE to module dropped: module connection is closed; not closing shared module connection"
+            );
+            return;
+        }
+    };
+    debug!(
+        module_id = module_id.unwrap_or("unknown"),
+        route_channel = channel,
+        route_epoch = epoch,
+        error = %err,
+        context,
+        "module egress queue refused route GOODBYE; delivering it once the module frees room"
+    );
+    let counters = counters.clone();
+    let sink = sink.clone();
+    let module_id = module_id.map(str::to_string);
+    runtime.spawn(async move {
+        let outcome = tokio::time::timeout(LATE_MODULE_GOODBYE_DEADLINE, sink.send(frame)).await;
+        let why = match outcome {
+            Ok(Ok(())) => {
+                debug!(
+                    module_id = module_id.as_deref().unwrap_or("unknown"),
+                    route_channel = channel,
+                    route_epoch = epoch,
+                    context,
+                    "late route GOODBYE delivered to module"
+                );
+                return;
+            }
+            Ok(Err(err)) => err.to_string(),
+            Err(_) => format!(
+                "module egress queue had no room within {LATE_MODULE_GOODBYE_DEADLINE:?}"
+            ),
+        };
+        counters.increment_goodbye_relay_module_dropped(module_id.as_deref());
+        warn!(
+            module_id = module_id.as_deref().unwrap_or("unknown"),
+            route_channel = channel,
+            route_epoch = epoch,
+            error = %why,
+            context,
+            "route GOODBYE to module dropped under backpressure; not closing shared module connection"
+        );
+    });
 }
 
 /// One route currently served by a module endpoint.
@@ -1539,6 +1636,28 @@ impl ForwardingTable {
             .get(&connection_id)
             .and_then(|endpoint| inner.module_id_by_endpoint.get(endpoint))
             .cloned())
+    }
+
+    /// Whether the daemon ever allocated `(channel, epoch)` on this module
+    /// connection. Epochs on a module channel are handed out as 1, 2, 3, ...
+    /// and the last one handed out is remembered until the connection ends, so
+    /// every epoch from 1 up to that one was a real route at some point. Used
+    /// only on the drop path, to tell a module still sending on a route the
+    /// daemon released from one sending on a route that never existed.
+    pub(crate) fn module_route_epoch_was_allocated(
+        &self,
+        connection_id: ConnectionId,
+        channel: u16,
+        epoch: u32,
+    ) -> Result<bool, ForwardingError> {
+        let inner = self.read_inner()?;
+        let Some(endpoint) = inner.endpoint_by_connection.get(&connection_id).copied() else {
+            return Ok(false);
+        };
+        Ok(inner
+            .module_slot_epochs
+            .get(&ModuleRouteKey { endpoint, channel })
+            .is_some_and(|last| epoch != 0 && epoch <= *last))
     }
 
     pub(crate) fn has_live_module_connection(
