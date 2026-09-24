@@ -5,13 +5,14 @@
 # vectors, adapter vendored fixtures, then PR #61's wire vectors). Marking the
 # directories rather than waiting for each suite to adopt byte comparison and
 # rediscover the trap. Parse-based consumers are unaffected either way.
-clients/store/tests/golden/** -text
 clients/subc-client-swift/Tests/SubcClientTests/Fixtures/** -text
 clients/subc-client-swift/Tests/SubcFedTests/Fixtures/** -text
-crates/subc-control/tests/golden/** -text
-crates/subc-core/tests/golden/** -text
-crates/subc-protocol/tests/golden/** -text
-crates/subc-transport/tests/golden/** -text
 docs/team-mode/fixtures/** -text
 crates/agent-token-vectors/vectors/** -text
-crates/subc-core/tests/fixtures/** -text
+# Every crate's and client's golden and fixture directories, including ones
+# added later: the fourth incident was a new crate (ck-bus) whose vendored
+# foundation copy failed its sha256 check on Windows because its directory
+# was not on the list above.
+crates/*/tests/golden/** -text
+crates/*/tests/fixtures/** -text
+clients/*/tests/golden/** -text
